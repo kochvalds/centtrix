@@ -2,4 +2,4 @@
 
 ![CenttrixOS](https://i.postimg.cc/DyJyH8NS/jijiwfdwf.jpg)
 
-website: [click](https://kochvalds.github.io/kochvalds/)
+**website: [click](https://kochvalds.github.io/kochvalds/)**
