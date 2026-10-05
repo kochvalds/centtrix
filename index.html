@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Centtrix OS 3.4</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Figtree:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#070b14;--ink2:#0e1526;--line:#ffffff1c;--txt:#e8ecf6;--dim:#97a1b8;--acc:#5ee0c1;--acc2:#7a8cff;--warm:#ffb86b;
+--h:'Bricolage Grotesque',system-ui,sans-serif;--b:'Figtree',system-ui,sans-serif}
+*{box-sizing:border-box;margin:0}
+html{scroll-behavior:smooth}
+body{background:var(--ink);color:var(--txt);font:17px/1.6 var(--b);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px;position:relative}
+#glow{position:fixed;inset:0;pointer-events:none;z-index:0;background:radial-gradient(420px circle at var(--x,50%) var(--y,30%),#5ee0c11f,transparent 70%)}
+nav{display:flex;justify-content:space-between;align-items:center;padding:22px 0;position:relative;z-index:3}
+nav b{font:800 22px var(--h);letter-spacing:-.02em}
+nav .r{display:flex;align-items:center;gap:22px}
+nav a{color:var(--dim);text-decoration:none;font-size:15px;transition:color .2s}
+nav a:hover{color:var(--txt)}
+.lang{display:flex;background:var(--ink2);border:1px solid var(--line);border-radius:999px;padding:3px}
+.lang button{border:0;background:none;color:var(--dim);font:600 13px var(--b);padding:6px 12px;border-radius:999px;cursor:pointer;transition:.2s}
+.lang button:hover{color:var(--txt)}
+.lang button[aria-pressed=true]{background:var(--acc);color:#04221b}
+.hero{padding:40px 0 30px;text-align:center;position:relative;z-index:1}
+.hero h1{font:800 clamp(44px,8vw,96px)/.98 var(--h);letter-spacing:-.04em;max-width:13ch;margin:0 auto;background:linear-gradient(100deg,#fff 30%,var(--acc),var(--acc2) 70%,#fff);background-size:250% 100%;background-position:var(--hx,0%) 0;-webkit-background-clip:text;background-clip:text;color:transparent;transition:background-position .3s}
+.hero p.sub{color:var(--dim);max-width:56ch;margin:22px auto 30px;font-size:19px}
+.btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:13px 24px;border-radius:999px;font-weight:600;text-decoration:none;border:1px solid var(--line);background:var(--ink2);transition:transform .2s,box-shadow .3s,border-color .2s}
+.btn:hover{border-color:var(--acc);box-shadow:0 10px 30px #5ee0c133}
+.btn.p{background:linear-gradient(180deg,#7ff0d3,#3fc8a8);color:#04221b;border:0}
+.hint{color:var(--dim);font-size:14px;margin-top:22px}
+/* ---- desktop ---- */
+.scr{perspective:1400px;max-width:940px;margin:20px auto 0}
+.screen{--a1:#2fd2b0aa;--a2:#7a5cff99;position:relative;aspect-ratio:4/3;border-radius:14px;overflow:hidden;font:12px/1.4 var(--b);color:#fff;text-align:left;
+background:radial-gradient(60% 70% at 25% 20%,var(--a1),transparent 60%),radial-gradient(70% 80% at 85% 30%,var(--a2),transparent 60%),radial-gradient(80% 60% at 50% 110%,#ff6fae88,transparent 60%),#0b1230;
+box-shadow:0 40px 90px #000a,0 0 0 1px var(--line);transition:transform .25s ease-out;transform:rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg))}
+.bar{position:absolute;top:0;left:0;right:0;height:4.2%;min-height:18px;background:#0b0b0bd9;display:flex;align-items:center;gap:16px;padding:0 14px;font-size:11px;z-index:50}
+.bar span:last-child{margin-left:auto}
+.win{position:absolute;background:#10172bf2;border:1px solid #ffffff26;border-radius:10px;box-shadow:0 20px 50px #0009;overflow:hidden;transition:opacity .25s,transform .3s,box-shadow .2s;display:flex;flex-direction:column}
+.win header{height:26px;flex:none;background:#ffffff14;display:flex;align-items:center;gap:6px;padding:0 10px;font-size:11px;color:#c9d1e6;cursor:grab;touch-action:none;user-select:none}
+.win header:active{cursor:grabbing}
+.win header i{width:9px;height:9px;border-radius:50%;background:#ff6b6b}.win header i+i{background:#ffc247}.win header i+i+i{background:#4ddb7c}
+.win header em{font-style:normal;margin:0 auto}
+.win.min{opacity:0;transform:scale(.8) translateY(40px);pointer-events:none}
+.win.drag{box-shadow:0 30px 70px #000c;transform:scale(1.015)}
+.win pre,.win .pad{font:11px/1.55 ui-monospace,Menlo,monospace;padding:10px 12px;white-space:pre-wrap;color:#cfe;overflow:auto;flex:1}
+.win u{text-decoration:none;color:var(--acc)}.win s{text-decoration:none;color:var(--warm)}
+.tline{padding:0 12px 10px;font:11px ui-monospace,Menlo,monospace;color:#cfe;display:flex;gap:6px}
+.tline input{flex:1;background:none;border:0;color:#fff;font:inherit;outline:0;min-width:0}
+.fl div{padding:3px 6px;border-radius:6px;cursor:pointer;transition:background .15s,padding .15s}
+.fl div:hover{background:#ffffff1c;padding-left:12px}
+.row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.sw{width:18px;height:18px;border-radius:50%;border:2px solid #fff6;cursor:pointer;transition:transform .15s}
+.sw:hover{transform:scale(1.3)}
+.seg button{background:#ffffff14;border:0;color:#cfe;font:11px var(--b);padding:4px 9px;border-radius:6px;cursor:pointer;transition:.15s}
+.seg button:hover,.seg button.on{background:var(--acc);color:#04221b}
+.dock{position:absolute;bottom:2.5%;left:50%;transform:translateX(-50%);display:flex;align-items:flex-end;gap:9px;padding:7px 10px;border-radius:18px;background:#ffffff22;border:1px solid #ffffff30;backdrop-filter:blur(10px);z-index:50}
+.dock .ic{position:relative;cursor:pointer;transform-origin:bottom;transition:transform .12s}
+.dock .ic.open::after{content:"";position:absolute;bottom:-6px;left:50%;width:4px;height:4px;margin-left:-2px;border-radius:50%;background:#fff}
+.ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font:700 14px var(--h);color:#fff;box-shadow:inset 0 1px 0 #fff7,0 2px 5px #0006;user-select:none}
+.ic.glass{background:linear-gradient(180deg,#fff6,#fff0 50%),var(--c)}
+.ic.flat{background:var(--c)}.ic.round{background:var(--c);border-radius:50%}.ic.outline{background:transparent;border:2px solid var(--c);box-shadow:none;color:var(--c)}
+/* ---- story ---- */
+#why{padding:70px 0 40px;position:relative;z-index:1}
+h2{font:700 clamp(30px,4.6vw,52px)/1.05 var(--h);letter-spacing:-.03em;max-width:18ch}
+.story{display:grid;grid-template-columns:1.05fr 1fr;gap:60px;align-items:start;margin-top:10px}
+.stage{position:sticky;top:12vh;height:76vh;border-radius:22px;overflow:hidden;border:1px solid var(--line);
+background:radial-gradient(70% 60% at 20% 15%,#2fd2b044,transparent 60%),radial-gradient(70% 70% at 90% 85%,#7a5cff44,transparent 60%),var(--ink2)}
+.scene{position:absolute;inset:0;display:grid;place-items:center;padding:8%;opacity:0;transform:scale(.97);transition:opacity .5s,transform .6s;pointer-events:none}
+.scene.on{opacity:1;transform:none;pointer-events:auto}
+.cap{position:absolute;bottom:14px;left:0;right:0;text-align:center;color:var(--dim);font-size:13px}
+.steps{padding:12vh 0 20vh}
+.step{min-height:78vh;display:flex;flex-direction:column;justify-content:center;opacity:.3;transition:opacity .4s,transform .3s}
+.step:hover{transform:translateX(8px)}
+.step.on{opacity:1}
+.step h3{font:800 clamp(30px,3.6vw,46px)/1.05 var(--h);letter-spacing:-.03em;margin-bottom:14px}
+.step p{color:var(--dim);max-width:44ch}
+.chain{width:100%;display:grid;gap:10px}
+.chain div{height:46px;border-radius:12px;background:#ffffff0f;border:1px solid var(--line);display:flex;align-items:center;padding:0 16px;font-size:15px;color:var(--dim);transform:translateX(-30px);opacity:0;transition:transform .5s,opacity .5s,border-color .2s,background .2s;cursor:default}
+.scene.on .chain div{transform:none;opacity:1}
+.scene.on .chain div:hover{transform:translateX(14px);border-color:var(--acc);background:#5ee0c122;color:var(--txt);transition-delay:0s}
+.chain div:nth-child(2){transition-delay:.12s}.chain div:nth-child(3){transition-delay:.24s}.chain div:nth-child(4){transition-delay:.36s}.chain div:nth-child(5){transition-delay:.48s}.chain div:nth-child(6){transition-delay:.6s}
+.file{width:min(340px,90%);background:#0a1020;border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:0 30px 60px #0008}
+.file b{font:700 18px var(--h);display:block;margin-bottom:14px}
+.file i{display:block;height:8px;border-radius:4px;margin:7px 0;background:linear-gradient(90deg,var(--acc),var(--acc2));width:var(--w);transform-origin:left;transform:scaleX(0);transition:transform .7s,filter .2s}
+.scene.on .file i{transform:none}
+.scene.on .file i:hover{transform:scaleX(1.12) scaleY(1.6);filter:brightness(1.3);transition-duration:.2s}
+.stack3{position:relative;width:100%;height:100%}
+.stack3 .win{width:62%}
+.stack3 .win:nth-child(1){left:2%;top:8%;height:46%}.stack3 .win:nth-child(2){left:30%;top:30%;height:46%;background:#1a2447f2}.stack3 .win:nth-child(3){left:12%;top:54%;height:36%;background:#143a3af2}
+.stack3 .win:hover{box-shadow:0 30px 60px #000c,0 0 0 1px var(--acc)}
+.icons{display:grid;grid-template-columns:repeat(2,1fr);gap:28px 40px;text-align:center;color:var(--dim);font-size:14px}
+.icons .ic{width:88px;height:88px;border-radius:22px;font-size:34px;margin:0 auto 8px;cursor:pointer;transition:transform .25s cubic-bezier(.3,1.6,.5,1)}
+.icons .ic:hover{transform:translateY(-8px) rotate(-6deg) scale(1.12)}
+.icons .ic:active{transform:scale(.92)}
+.icons .round{border-radius:50%}
+.code{font:14px/1.8 ui-monospace,Menlo,monospace;color:#cfe3ff;background:#0a1020;border:1px solid var(--line);border-radius:16px;padding:22px 26px;width:100%}
+.code s{text-decoration:none;color:var(--warm)}.code u{text-decoration:none;color:var(--acc)}
+.code button{margin-top:10px;background:var(--acc);color:#04221b;border:0;border-radius:8px;padding:7px 16px;font:600 14px var(--b);cursor:pointer;transition:transform .15s}
+.code button:hover{transform:translateY(-2px)}
+#xo{min-height:1.8em;color:#fff}
+.keys{display:flex;gap:18px}
+.keys button{width:96px;height:96px;border-radius:20px;font:800 34px var(--h);color:var(--txt);background:linear-gradient(180deg,#ffffff26,#ffffff0a);border:1px solid #ffffff30;box-shadow:0 8px 0 #0006;cursor:pointer;transition:transform .1s,box-shadow .1s,border-color .2s}
+.keys button:nth-child(2){margin-top:26px}
+.keys button:hover{border-color:var(--acc)}
+.keys button:active{transform:translateY(6px);box-shadow:0 2px 0 #0006}
+.kout{position:absolute;top:14%;left:0;right:0;text-align:center;font:800 clamp(34px,5vw,60px) var(--h);letter-spacing:-.03em}
+.end{padding:20px 0 90px;text-align:center;position:relative;z-index:1}
+.end h2{margin:0 auto 20px}
+footer{border-top:1px solid var(--line);padding:34px 0 50px;color:var(--dim);font-size:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;position:relative;z-index:1}
+@media(max-width:860px){.story{grid-template-columns:1fr;gap:0}.stage{top:70px;height:40vh;z-index:2}.steps{padding-top:4vh}.step{min-height:60vh}.icons .ic{width:56px;height:56px;font-size:22px}.keys button{width:64px;height:64px;font-size:22px}nav .l{display:none}.cap{display:none}}
+@media(hover:none){#glow{display:none}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}html{scroll-behavior:auto}}
+</style>
+<style id="centtrix-v2-style">
+/* ===== Centtrix visual layer — no new content sections ===== */
+:root{
+  --cx-cyan:#62e7ff;
+  --cx-blue:#7a8cff;
+  --cx-purple:#bd7dff;
+  --cx-green:#72f7b8;
+  --cx-bg:#05070c;
+  --cx-glass:rgba(9,13,22,.58);
+  --cx-line:rgba(120,180,255,.12);
+  --cx-shadow:0 24px 80px rgba(0,0,0,.48);
+}
+html{scroll-behavior:smooth}
+body{overflow-x:hidden}
+body::before{
+  content:"";position:fixed;inset:0;z-index:-3;pointer-events:none;
+  background:
+    radial-gradient(circle at 15% 20%,rgba(98,231,255,.10),transparent 27%),
+    radial-gradient(circle at 85% 12%,rgba(189,125,255,.09),transparent 25%),
+    radial-gradient(circle at 50% 90%,rgba(114,247,184,.055),transparent 30%);
+}
+body::after{
+  content:"";position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.035;
+  background:repeating-linear-gradient(0deg,transparent 0 2px,#fff 3px 3px);
+  mix-blend-mode:overlay;
+}
+#cx-asm-bg{
+  position:fixed;inset:-10%;z-index:-2;pointer-events:none;overflow:hidden;
+  opacity:.26;filter:saturate(1.25);
+  transform:perspective(900px) rotateX(7deg) scale(1.06);
+}
+.cx-code-column{
+  position:absolute;top:-18%;white-space:pre;font:500 10px/1.62 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color:rgba(98,231,255,.52);text-shadow:0 0 14px rgba(98,231,255,.18);
+  animation:cx-code-fall linear infinite;
+  mask-image:linear-gradient(to bottom,transparent,black 10%,black 82%,transparent);
+}
+.cx-code-column:nth-child(3n){color:rgba(189,125,255,.40)}
+.cx-code-column:nth-child(5n){color:rgba(114,247,184,.38)}
+@keyframes cx-code-fall{from{transform:translate3d(0,-12%,0)}to{transform:translate3d(0,125%,0)}}
+@media(prefers-reduced-motion:reduce){
+  .cx-code-column{animation:none!important}
+  html{scroll-behavior:auto}
+}
+::selection{background:rgba(98,231,255,.28);color:#fff}
+a,button{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease,background .2s ease,filter .2s ease}
+button:hover,a:hover{filter:brightness(1.12)}
+button:active,a:active{transform:translateY(1px) scale(.99)}
+/* subtle glass treatment for existing cards without changing their content */
+.card,.feature,.window,.terminal,.hero-card,.project-card,.panel,.glass{
+  box-shadow:var(--cx-shadow),0 0 0 1px rgba(255,255,255,.025) inset;
+  backdrop-filter:blur(14px);
+}
+.card:hover,.feature:hover,.project-card:hover{
+  transform:translateY(-4px);
+  box-shadow:0 26px 80px rgba(0,0,0,.52),0 0 35px rgba(98,231,255,.07);
+}
+/* animated borders where the original page has recognizable panels */
+.card,.feature,.project-card,.window,.terminal{
+  position:relative;overflow:hidden;
+}
+.card::before,.feature::before,.project-card::before,.window::before,.terminal::before{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  border-radius:inherit;padding:1px;
+  background:linear-gradient(120deg,transparent 15%,rgba(98,231,255,.18),transparent 42%,rgba(189,125,255,.15),transparent 70%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  background-size:220% 220%;animation:cx-border 8s linear infinite;
+}
+@keyframes cx-border{0%{background-position:0% 50%}100%{background-position:220% 50%}}
+/* cursor glow */
+#cx-cursor{
+  position:fixed;width:260px;height:260px;border-radius:50%;pointer-events:none;z-index:9997;
+  background:radial-gradient(circle,rgba(98,231,255,.10),rgba(98,231,255,.035) 28%,transparent 68%);
+  transform:translate(-50%,-50%);mix-blend-mode:screen;opacity:0;transition:opacity .25s;
+}
+body.cx-ready #cx-cursor{opacity:1}
+/* tiny status beacon, decorative only */
+#cx-beacon{
+  position:fixed;right:18px;bottom:18px;z-index:1000;width:9px;height:9px;border-radius:50%;
+  background:var(--cx-green);box-shadow:0 0 0 5px rgba(114,247,184,.08),0 0 20px rgba(114,247,184,.75);
+  pointer-events:none;animation:cx-pulse 2.2s ease-in-out infinite;
+}
+@keyframes cx-pulse{50%{box-shadow:0 0 0 9px rgba(114,247,184,0),0 0 28px rgba(114,247,184,.9)}}
+/* responsive polish */
+@media(max-width:800px){
+  #cx-asm-bg{opacity:.16;transform:perspective(700px) rotateX(5deg) scale(1.08)}
+  .cx-code-column{font-size:8px;line-height:1.55}
+  #cx-cursor{display:none}
+  #cx-beacon{right:12px;bottom:12px;width:7px;height:7px}
+  .card:hover,.feature:hover,.project-card:hover{transform:none}
+}
+@media(max-width:520px){
+  body::after{opacity:.022}
+  #cx-asm-bg{opacity:.12}
+}
+</style>
+
+</head><body>
+<div id="glow"></div>
+<div class="wrap">
+<nav><b>Centtrix</b><div class="r"><a class="l" href="#why" data-i="nav1"></a><a class="l" href="https://github.com/kochvalds/centtrix" rel="noopener">GitHub</a>
+<div class="lang" role="group" aria-label="Language"><button data-l="en">EN</button><button data-l="ru">RU</button><button data-l="es">ES</button></div></div></nav>
+
+<header class="hero">
+<h1 data-i="h1"></h1>
+<p class="sub" data-i="sub"></p>
+<div class="btns"><a class="btn p" href="#why" data-i="cta1"></a><a class="btn" href="https://github.com/kochvalds/centtrix" rel="noopener" data-i="cta2"></a></div>
+<div class="scr"><div class="screen" id="scr">
+<div class="bar"><b>Centtrix</b><span>Files</span><span>Edit</span><span>View</span><span id="clk">12:41</span></div>
+<div class="win" id="w-term" style="left:6%;top:12%;width:56%;height:46%"><header><i></i><i></i><i></i><em>Terminal</em></header><pre id="tout"></pre><div class="tline"><u>centtrix</u>:/home$<input id="tin" autocomplete="off" spellcheck="false" aria-label="Terminal"></div></div>
+<div class="win" id="w-files" style="left:52%;top:30%;width:42%;height:38%"><header><i></i><i></i><i></i><em>Files</em></header><div class="pad fl"><div>📁 base</div><div>📁 dump</div><div>📁 home</div><div>📄 hello.xep</div><div>📄 notes.txt</div></div></div>
+<div class="win min" id="w-set" style="left:24%;top:38%;width:50%;height:40%"><header><i></i><i></i><i></i><em>Settings</em></header><div class="pad"><div class="row">Accent <span class="sw" style="background:#2fd2b0" data-a="#2fd2b0aa,#7a5cff99"></span><span class="sw" style="background:#ff6fae" data-a="#ff6fae99,#ffb86b88"></span><span class="sw" style="background:#4d8dff" data-a="#4d8dffaa,#2fd2b088"></span><span class="sw" style="background:#a06bff" data-a="#a06bffaa,#ff6fae77"></span></div><div class="row seg">Icons <button data-s="flat">flat</button><button data-s="glass" class="on">glass</button><button data-s="round">round</button><button data-s="outline">outline</button></div></div></div>
+<div class="dock" id="dock"><span class="ic glass open" style="--c:#3b82f6" data-w="w-files">F</span><span class="ic glass open" style="--c:#22c55e" data-w="w-term">T</span><span class="ic glass" style="--c:#8b5cf6" data-w="w-set">S</span></div>
+</div></div>
+<p class="hint" data-i="hint"></p>
+</header>
+</div>
+
+<section id="why"><div class="wrap">
+<h2 data-i="why"></h2>
+<div class="story">
+<div class="stage">
+<div class="scene on"><div class="chain"><div>Boot sector · 16-bit</div><div>Stage 2 · VBE 32 bpp</div><div>Protected mode</div><div>Paging</div><div>Long mode · x86_64</div><div>Centtrix kernel</div></div><p class="cap" data-i="c1"></p></div>
+<div class="scene"><div class="file"><b>centtrix.asm</b><i style="--w:92%"></i><i style="--w:64%"></i><i style="--w:80%"></i><i style="--w:38%"></i><i style="--w:88%"></i><i style="--w:55%"></i><i style="--w:76%"></i><i style="--w:30%"></i><i style="--w:84%"></i><i style="--w:60%"></i></div><p class="cap" data-i="c2"></p></div>
+<div class="scene"><div class="stack3"><div class="win"><header><i></i><i></i><i></i><em>Files</em></header></div><div class="win"><header><i></i><i></i><i></i><em>Paint</em></header></div><div class="win"><header><i></i><i></i><i></i><em>Terminal</em></header></div></div><p class="cap" data-i="c3"></p></div>
+<div class="scene"><div class="icons"><div><span class="ic flat" style="--c:#3b82f6">F</span>flat</div><div><span class="ic glass" style="--c:#3b82f6">F</span>glass</div><div><span class="ic round" style="--c:#3b82f6">F</span>round</div><div><span class="ic outline" style="--c:#3b82f6">F</span>outline</div></div><p class="cap" data-i="c4"></p></div>
+<div class="scene"><div class="code"><s>; hello.xep</s><br>at 10 12<br>add n 1 <s>; n = n + 1</s><br><button id="run">run hello.xep</button><div id="xo"></div></div><p class="cap" data-i="c5"></p></div>
+<div class="scene"><div class="kout" id="kout">Hello</div><div class="keys"><button data-g="Hello">EN</button><button data-g="Привет">RU</button><button data-g="Hola">ES</button></div><p class="cap" data-i="c6"></p></div>
+</div>
+<div class="steps">
+<div class="step on"><h3 data-i="s1h"></h3><p data-i="s1p"></p></div>
+<div class="step"><h3 data-i="s2h"></h3><p data-i="s2p"></p></div>
+<div class="step"><h3 data-i="s3h"></h3><p data-i="s3p"></p></div>
+<div class="step"><h3 data-i="s4h"></h3><p data-i="s4p"></p></div>
+<div class="step"><h3 data-i="s5h"></h3><p data-i="s5p"></p></div>
+<div class="step"><h3 data-i="s6h"></h3><p data-i="s6p"></p></div>
+</div></div></div></section>
+<section class="end"><div class="wrap"><h2 data-i="end"></h2><div class="btns"><a class="btn p" href="https://github.com/kochvalds/centtrix" rel="noopener" data-i="cta2"></a></div></div></section>
+<div class="wrap"><footer><span>Centtrix OS 3.4 · x86_64</span><span><a href="https://github.com/kochvalds/centtrix" rel="noopener">github.com/kochvalds/centtrix</a></span></footer></div>
+
+<script>
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const T={
+en:{nav1:'Why Centtrix',h1:'A whole OS in a single file.',sub:'Centtrix OS 3.4 is a 64-bit operating system written in NASM, with a window manager, transparency, its own file system and its own programming language.',cta1:'Why it is good',cta2:'Code on GitHub',hint:'Try it: drag the windows, click the dock icons, change the accent in Settings, type help in the terminal.',why:'Six reasons to pick Centtrix',
+c1:'Hover over a stage',c2:'Hover over the lines',c3:'Drag the windows',c4:'Click an icon to change its colour',c5:'Press the button',c6:'Press a key',
+s1h:'The full road to 64 bits',s1p:'The system walks the whole way from the boot sector to long mode itself. No borrowed bootloaders, no borrowed kernels.',
+s2h:'The whole OS in one file',s2p:'About 24,600 lines of NASM. One file you can read, change and understand from top to bottom.',
+s3h:'Windows with shadows and transparency',s3p:'Its own compositor redraws only the areas that changed, so the interface stays smooth.',
+s4h:'Beautiful up close',s4p:'Smooth anti-aliased text, wallpapers like Aurora and Rainbow, light and dark themes and four icon styles to choose from.',
+s5h:'Its own language and file system',s5p:'Write XPL scripts in the built-in editor and run them from the terminal. Files live in the CNTX file system.',
+s6h:'Speaks your language',s6p:'English, Russian and Spanish keyboard layouts, switchable right inside the system.',end:'Open and secure'},
+ru:{nav1:'Почему Centtrix',h1:'Целая ОС в одном файле.',sub:'Centtrix OS 3.4 — 64-битная операционная система на NASM с оконным менеджером, прозрачностью, своей файловой системой и своим языком программирования.',cta1:'Чем она хороша',cta2:'Код на GitHub',hint:'Попробуйте: перетащите окна, нажмите иконки в доке, смените цвет в Settings, введите help в терминале.',why:'Шесть причин выбрать Centtrix',
+c1:'Наведите на этап',c2:'Наведите на строки',c3:'Перетащите окна',c4:'Нажмите на иконку, чтобы сменить цвет',c5:'Нажмите на кнопку',c6:'Нажмите на клавишу',
+s1h:'Полный путь до 64 бит',s1p:'Система сама проходит всю дорогу от загрузочного сектора до long mode. Никаких чужих загрузчиков и ядер.',
+s2h:'Вся ОС в одном файле',s2p:'Около 24 600 строк на NASM. Один файл читается, правится и понимается целиком.',
+s3h:'Окна с тенями и прозрачностью',s3p:'Собственный композитор перерисовывает только изменённые области, поэтому интерфейс остаётся плавным.',
+s4h:'Красиво вблизи',s4p:'Сглаженный шрифт, обои вроде Aurora и Rainbow, светлая и тёмная темы и четыре стиля иконок на выбор.',
+s5h:'Свой язык и файловая система',s5p:'Пишите скрипты XPL во встроенном редакторе и запускайте их из терминала. Файлы живут в файловой системе CNTX.',
+s6h:'Говорит на вашем языке',s6p:'Английская, русская и испанская раскладки переключаются прямо в системе.',end:'Открытая и безопасная'},
+es:{nav1:'Por qué Centtrix',h1:'Todo un sistema operativo en un solo archivo.',sub:'Centtrix OS 3.4 es un sistema operativo de 64 bits escrito en NASM, con gestor de ventanas, transparencias, sistema de archivos propio y su propio lenguaje de programación.',cta1:'Por qué es bueno',cta2:'Código en GitHub',hint:'Pruébalo: arrastra las ventanas, pulsa los iconos del dock, cambia el color en Settings, escribe help en la terminal.',why:'Seis razones para elegir Centtrix',
+c1:'Pasa el cursor por una etapa',c2:'Pasa el cursor por las líneas',c3:'Arrastra las ventanas',c4:'Pulsa un icono para cambiar su color',c5:'Pulsa el botón',c6:'Pulsa una tecla',
+s1h:'Todo el camino hasta los 64 bits',s1p:'El sistema recorre solo todo el camino, del sector de arranque al modo largo. Sin cargadores ni núcleos prestados.',
+s2h:'Todo el sistema en un archivo',s2p:'Unas 24 600 líneas de NASM. Un único archivo que se puede leer, modificar y entender de principio a fin.',
+s3h:'Ventanas con sombras y transparencias',s3p:'Su propio compositor redibuja solo las zonas que cambian, así que la interfaz va fluida.',
+s4h:'Precioso de cerca',s4p:'Texto suavizado, fondos como Aurora y Rainbow, temas claro y oscuro y cuatro estilos de iconos a elegir.',
+s5h:'Lenguaje y sistema de archivos propios',s5p:'Escribe scripts XPL en el editor integrado y ejecútalos desde la terminal. Los archivos viven en el sistema CNTX.',
+s6h:'Habla tu idioma',s6p:'Teclados en inglés, ruso y español, que se cambian dentro del propio sistema.',end:'Abierto y seguro'}};
+const titles={en:'Centtrix OS 3.4 — a 64-bit OS in one file',ru:'Centtrix OS 3.4 — 64-битная ОС в одном файле',es:'Centtrix OS 3.4 — un SO de 64 bits en un archivo'};
+function setLang(l){document.documentElement.lang=l;$$('[data-i]').forEach(e=>e.textContent=T[l][e.dataset.i]);
+$$('.lang button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.l===l));document.title=titles[l];try{localStorage.setItem('cx',l)}catch(e){}}
+$$('.lang button').forEach(b=>b.onclick=()=>setLang(b.dataset.l));
+let L='ru';try{L=localStorage.getItem('cx')||''}catch(e){}
+if(!T[L]){const n=(navigator.language||'ru').slice(0,2);L=T[n]?n:'ru'}
+setLang(L);
+
+// cursor glow + gradient headline + magnetic buttons
+addEventListener('pointermove',e=>{const g=$('#glow').style;g.setProperty('--x',e.clientX+'px');g.setProperty('--y',e.clientY+'px');
+$('.hero h1').style.setProperty('--hx',(e.clientX/innerWidth*100)+'%')});
+$$('.btn').forEach(b=>{b.addEventListener('pointermove',e=>{const r=b.getBoundingClientRect();b.style.transform=`translate(${(e.clientX-r.left-r.width/2)*.18}px,${(e.clientY-r.top-r.height/2)*.28}px)`});b.addEventListener('pointerleave',()=>b.style.transform='')});
+
+// desktop tilt
+const scr=$('#scr');
+scr.parentNode.addEventListener('pointermove',e=>{const r=scr.getBoundingClientRect();scr.style.setProperty('--ry',((e.clientX-r.left)/r.width-.5)*6+'deg');scr.style.setProperty('--rx',(.5-(e.clientY-r.top)/r.height)*5+'deg')});
+scr.parentNode.addEventListener('pointerleave',()=>{scr.style.setProperty('--rx','0deg');scr.style.setProperty('--ry','0deg')});
+setInterval(()=>$('#clk').textContent=new Date().toTimeString().slice(0,5),1000);$('#clk').textContent=new Date().toTimeString().slice(0,5);
+
+// draggable windows
+let z=10;
+function drag(w){const h=w.querySelector('header'),P=w.parentNode;
+w.addEventListener('pointerdown',()=>w.style.zIndex=++z);
+h.addEventListener('pointerdown',e=>{e.preventDefault();h.setPointerCapture(e.pointerId);const ox=e.clientX-w.offsetLeft*(P.getBoundingClientRect().width/P.offsetWidth),oy=e.clientY-w.offsetTop*(P.getBoundingClientRect().height/P.offsetHeight),k=P.getBoundingClientRect().width/P.offsetWidth;w.classList.add('drag');
+const mv=ev=>{w.style.left=Math.max(0,Math.min(P.offsetWidth-w.offsetWidth,(ev.clientX-ox)/k))+'px';w.style.top=Math.max(0,Math.min(P.offsetHeight-w.offsetHeight,(ev.clientY-oy)/k))+'px'};
+const up=()=>{w.classList.remove('drag');h.removeEventListener('pointermove',mv);h.removeEventListener('pointerup',up)};h.addEventListener('pointermove',mv);h.addEventListener('pointerup',up)})}
+$$('.screen .win,.stack3 .win').forEach(drag);
+
+// dock: magnify, open/close
+const dock=$('#dock'),ics=$$('#dock .ic');
+dock.addEventListener('pointermove',e=>ics.forEach(i=>{const r=i.getBoundingClientRect(),d=Math.abs(e.clientX-(r.left+r.width/2)),s=1+.8*Math.max(0,1-d/90);i.style.transform=`scale(${s})`}));
+dock.addEventListener('pointerleave',()=>ics.forEach(i=>i.style.transform=''));
+ics.forEach(i=>i.onclick=()=>{const w=document.getElementById(i.dataset.w);const open=w.classList.toggle('min');i.classList.toggle('open',!open);if(!open)w.style.zIndex=++z});
+// settings
+$$('.sw').forEach(s=>s.onclick=()=>{const[a,b]=s.dataset.a.split(',');scr.style.setProperty('--a1',a);scr.style.setProperty('--a2',b)});
+$$('.seg button').forEach(b=>b.onclick=()=>{$$('.seg button').forEach(x=>x.classList.toggle('on',x===b));ics.forEach(i=>{i.classList.remove('flat','glass','round','outline');i.classList.add(b.dataset.s)})});
+// terminal
+const tout=$('#tout'),tin=$('#tin');
+const say=t=>{tout.append(t+'\n');tout.scrollTop=1e5};
+const C={help:'help · ls · run hello.xep · about · date · clear',ls:'settings.cfg  notes.txt  hello.xep',about:'Centtrix OS 3.4 · x86_64 · NASM','run hello.xep':'Welcome to Centtrix!',date:()=>new Date().toString().slice(0,24)};
+tin.addEventListener('keydown',e=>{if(e.key!=='Enter')return;const v=tin.value.trim();tin.value='';if(v==='clear'){tout.textContent='';return}say('centtrix:/home$ '+v);if(v){const r=C[v];say(r?(typeof r==='function'?r():r):'unknown command: '+v)}});
+$('#w-term').addEventListener('click',()=>tin.focus());
+[['ls',400],['run hello.xep',1100]].forEach(([c,t])=>setTimeout(()=>{say('centtrix:/home$ '+c);say(C[c])},t));
+
+// story
+const sc=$$('.scene'),st=$$('.step');
+const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){const i=st.indexOf(e.target);st.forEach((x,j)=>x.classList.toggle('on',j===i));sc.forEach((x,j)=>x.classList.toggle('on',j===i))}}),{rootMargin:'-45% 0px -45% 0px'});
+st.forEach(x=>io.observe(x));
+const pal=['#3b82f6','#22c55e','#f59e0b','#ec4899','#06b6d4','#8b5cf6'];
+$$('.icons .ic').forEach(i=>i.onclick=()=>{const c=pal[(pal.indexOf(i.style.getPropertyValue('--c'))+1)%pal.length];$$('.icons .ic').forEach(x=>x.style.setProperty('--c',c))});
+$('#run').onclick=()=>{$('#xo').textContent='';let n=0;const t='Welcome to Centtrix!';const iv=setInterval(()=>{$('#xo').textContent=t.slice(0,++n);if(n>=t.length)clearInterval(iv)},45)};
+$$('.keys button').forEach(b=>b.onclick=()=>$('#kout').textContent=b.dataset.g);
+</script>
+
+<script id="centtrix-v2-script">
+(() => {
+  const lines = ["    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,170,144,0,0,47,255,176,0,0", "    cmp al, 0xDF", ".l: call ata_write1", "    mov edi, 1", "    pop rdi", "    mov rdi, PWA", "    add r8, SURFS", "    movups xmm4, [ic_acc]", "    dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000", "    pop rdx", "    shr ebx, cl", "    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,63,255,255,254,0,19,51,51,217,0,0,0,8,225,0,0", "    jnz .got", "    mov edx, eax", "    mov eax, 2", "    jae .z", "    mov rdi, M_CARD", "    mov r8d, eax", "    rep movsb", "    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "    jmp .c", "          times 56 db 0", "    jz .go", "    dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFCFFFFFF,0xFF000000,0x48D7D7CE,0x00FFFFFF,0x03F7F4EA,0x00FAF6ED,0x00F9F6EC", "    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "    dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000", "    dec dword [im_sel]", "    PUSHA", "    mov ecx, r14d", "    lea r10d, [r9-1]", "    db 231,0,215,0,12,128,7,242,0,215,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "    mov esi, A_ICON", "    xor ax, ax", "    mov edx, 12", "    dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000", "    mov [br_slot], rax", "    mov dword [dns_got], 0", "    mov [g_uf], rax", "    mov eax, [scr_w]", "    call desk_draw", "    mov rsi, r12", "    jmp .glyph", "c_inv255 dd 0.00392156862", "    cmp eax, E_NONIC", "    shr edx, 4", "    mov byte [rdi], &#x27;:&#x27;", "    mov [rdi], eax", "    db 237,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "    xor r14d, r14d                  ; tx", "    push rdx", "    pop r8", "    mov al, &#x27;&lt;&#x27;", "    call kbc_wait_w", "    jnc .rl", "    mov ecx, WY+14", "    push rcx", "    shl eax, 7", "    db 0,0,0,0,0,0,0,0,0,0,0,0,4,128,11,80,3,0,47,0,47,0,47,0,47,0,47,0,47,0,47,0", "    db 248,42,0,10,72,43,0,7,136,43,0,7,200,43,0,7,8,44,0,7,72,44,0,7,136,44,0,3,168,44,0,7", "    imul eax, eax, 10", "    db 0,0,0,0,0,0,0,0,0,0,0,0,156,11,129,230,46,75,136,208,9,187,158,96,2,253,238,0,5,255,255,32", "    mov dword [dk_n], DK_ITEMS", "    dd 0x00529C1F,0x00529C1F,0x04519B1E,0x0159A622,0x6E66A33A,0xFF000000,0xFB3F7F00,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000", "    jb .r", "text:                               ; rsi=zstr ebx=x ecx=y (mono)", "    db 255,193,0,0,0,0,0,3,255,254,48,0,0,0,0,0,29,255,246,0,0,0,0,0,0,175,255,160,0,0,0,0", "    dw -851,-844,-837,-830,-822,-815,-807,-799,-792,-784,-775,-767,-759,-750,-742,-733", "    lea rsi, [s_m_f1]", "    pop rdi", "    mov ebx, r9d", "    ucomiss xmm1, xmm0", "    lea rsi, [em_https]", "    lea ebx, [r13+64]", ".ed:", "    db 0,0,7,255,251,0,3,255,253,0,0,0,2,255,254,0,6,255,251,0,0,0,0,239,255,32,7,255,249,0,0,0", "    cmp byte [http_class], 1", "    mov ecx, 6", "    cmp al, &#x27;/&#x27;", "    jmp .pcl", "    add rdi, [cur_pitch]", "    db 13,255,48,0,0,2,239,224,143,227,0,0,2,205,32,0,0,0,0,0,13,255,48,0,0,2,239,225,25,64,0,0", "    lea rax, [font_ui]", "    dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000", "    dd 0xFD7F7F7F,0xFF000000,0xDCA07BA0,0x389E4995,0x0297338B,0x029E4C93,0x00C18BB4,0x00BC84B1,0x00AD65A2,0x00963D8B,0x00BC83B0,0x00F5E4E5", "    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "    jae .wd", "    db 0,205,190,16,0,127,234,0,0,47,245,0,0,30,224,0,7,191,112,0,30,233,0,0,0,0,0,0,0,0,0,0", "    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "    sub edx, 2", "    call tnl"];
+  const bg = document.createElement('div');
+  bg.id = 'cx-asm-bg';
+  document.body.prepend(bg);
+
+  const columns = Math.min(18, Math.max(10, Math.floor(window.innerWidth / 105)));
+  for(let i=0;i<columns;i++){
+    const col=document.createElement('div');
+    col.className='cx-code-column';
+    const count=18 + (i%5)*4;
+    const shuffled=[];
+    for(let j=0;j<count;j++) shuffled.push(lines[(i*17+j*7)%lines.length]);
+    col.textContent=shuffled.join('\n');
+    col.style.left=(i*(100/columns) + (Math.random()*3-1.5))+'%';
+    col.style.animationDuration=(26+Math.random()*24)+'s';
+    col.style.animationDelay=(-Math.random()*35)+'s';
+    col.style.opacity=(.38+Math.random()*.55).toFixed(2);
+    bg.appendChild(col);
+  }
+
+  const cursor=document.createElement('div');
+  cursor.id='cx-cursor';
+  document.body.appendChild(cursor);
+  document.body.classList.add('cx-ready');
+
+  let mx=-999,my=-999,cx=-999,cy=-999;
+  window.addEventListener('pointermove',e=>{
+    mx=e.clientX; my=e.clientY;
+  },{passive:true});
+  function raf(){
+    cx += (mx-cx)*.09; cy += (my-cy)*.09;
+    cursor.style.left=cx+'px'; cursor.style.top=cy+'px';
+    requestAnimationFrame(raf);
+  }
+  raf();
+
+  const beacon=document.createElement('div');
+  beacon.id='cx-beacon';
+  document.body.appendChild(beacon);
+
+  // Existing page buttons/links get a subtle magnetic tilt without changing behavior.
+  document.querySelectorAll('button,.btn,.cta,a.card,a.feature,.project-card').forEach(el=>{
+    if(el.closest('#cx-asm-bg')) return;
+    el.addEventListener('pointermove',e=>{
+      if(window.innerWidth<801) return;
+      const r=el.getBoundingClientRect(), x=(e.clientX-r.left)/r.width-.5, y=(e.clientY-r.top)/r.height-.5;
+      el.style.transform=`perspective(500px) rotateX(${(-y*2.2).toFixed(2)}deg) rotateY(${(x*2.2).toFixed(2)}deg) translateY(-2px)`;
+    });
+    el.addEventListener('pointerleave',()=>{el.style.transform='';});
+  });
+
+  // Parallax only on larger screens; keeps mobile smooth.
+  if(matchMedia('(min-width:801px)').matches){
+    window.addEventListener('scroll',()=>{
+      const y=window.scrollY;
+      bg.style.transform=`perspective(900px) rotateX(7deg) translate3d(0,${y*.018}px,0) scale(1.06)`;
+    },{passive:true});
+  }
+
+  // Mobile: close common nav/menu elements when a nav link is tapped, if present.
+  document.querySelectorAll('nav a').forEach(a=>{
+    a.addEventListener('click',()=>{
+      document.body.classList.remove('menu-open','nav-open','open-menu');
+    });
+  });
+})();
+</script>
+
+</body></html>
