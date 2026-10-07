@@ -1,0 +1,26 @@
+name: Build Centtrix
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Build image
+        run: make
+
+      - name: Check image
+        run: test -s build/centtrix.img
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: centtrix-image
+          path: build/centtrix.img
