@@ -1,32 +1,18 @@
-; =============================================================================
-;  CENTTRIX OS 3.5  -  64-bit (x86_64 long mode), one NASM file
-;
-;  build :  nasm -f bin centtrix.asm -o centtrix.img
-;  run   :  qemu-system-x86_64 -drive format=raw,file=centtrix.img -m 256 -rtc base=localtime
-;           (the kernel uses RAM up to ~83 MB, so give QEMU at least -m 96)
-;
-;  boot sector -> stage2 (real mode: VBE 32bpp, resolution from the superblock, A20)
-;              -> protected mode -> paging -> long mode -> kernel
-;  disk  : sector 0 = boot, 1..KSECT = kernel, FS_LBA.. = CNTX filesystem
-;  fs    : /base  /dump  /home   (32 slots of 16 KB)
-;  lang  : XPL, scripts are *.xep (write them in the built-in editor)
-; =============================================================================
-
-KSECT       equ 640                 ; kernel sectors after the boot sector
-FS_LBA      equ 704                 ; filesystem superblock
-VBEI        equ 0x1000              ; VBE controller info (stage2 scratch)
-SBS         equ 0x1400              ; superblock sector copy (stage2 scratch)
-FSBUF       equ 0x200000            ; in-memory filesystem (32 slots * 4096)
-EDBUF       equ 0x280000            ; editor / script buffer
-TBUF        equ 0x290000            ; terminal screen buffer
+KSECT       equ 640                 
+FS_LBA      equ 704                 
+VBEI        equ 0x1000              
+SBS         equ 0x1400              
+FSBUF       equ 0x200000            
+EDBUF       equ 0x280000            
+TBUF        equ 0x290000            
 MISC        equ 0x2A0000
-CMDBUF      equ MISC                ; terminal command line
-PATHB       equ MISC+0x100          ; path scratch
-NAMEB       equ MISC+0x200          ; file-name prompt buffer
-TMPB        equ MISC+0x300          ; text scratch (0x300 bytes)
-CLKB        equ MISC+0x600          ; clock text
-ITEMS       equ MISC+0x800          ; list of slot pointers
-SBBUF       equ MISC+0x1000         ; superblock sector
+CMDBUF      equ MISC                
+PATHB       equ MISC+0x100          
+NAMEB       equ MISC+0x200          
+TMPB        equ MISC+0x300          
+CLKB        equ MISC+0x600          
+ITEMS       equ MISC+0x800          
+SBBUF       equ MISC+0x1000         
 PWA         equ MISC+0x900
 PWB         equ MISC+0x940
 PWC         equ MISC+0x980
