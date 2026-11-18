@@ -1,6 +1,13 @@
 build/
+centtrix.img
+centtrix.new
+centtrix_plus.asm
+selftest.img
 *.img
 *.bin
 *.o
 *.iso
 *.log
+__pycache__/
+*.pyc
+

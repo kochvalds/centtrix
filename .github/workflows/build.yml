@@ -14,13 +14,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nasm
 
       - name: Build image
-        run: make
+        run: ./build.sh
 
       - name: Check image
-        run: test -s build/centtrix.img
+        run: test -s centtrix.img
 
       - name: Upload image
         uses: actions/upload-artifact@v4
         with:
           name: centtrix-image
-          path: build/centtrix.img
+          path: centtrix.img

@@ -1,21 +1,20 @@
 ASM ?= nasm
 QEMU ?= qemu-system-x86_64
-BUILD_DIR := build
-IMAGE := $(BUILD_DIR)/centtrix.img
-SOURCE := src/centtrix.asm
+IMAGE := centtrix.img
 
-.PHONY: all build run clean
+.PHONY: all build run fresh clean
 
 all: build
 
-build: $(IMAGE)
+build:
+	./build.sh
 
-$(IMAGE): $(SOURCE)
-	mkdir -p $(BUILD_DIR)
-	$(ASM) -f bin $(SOURCE) -o $(IMAGE)
+run: build
+	./run.sh
 
-run: $(IMAGE)
-	$(QEMU) -drive format=raw,file=$(IMAGE) -m 256 -rtc base=localtime
+fresh: build
+	./tools/newdisk.sh
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -f $(IMAGE) centtrix.new centtrix_plus.asm build.log selftest.img
+

@@ -1,18 +1,32 @@
-KSECT       equ 640                 
-FS_LBA      equ 704                 
-VBEI        equ 0x1000              
-SBS         equ 0x1400              
-FSBUF       equ 0x200000            
-EDBUF       equ 0x280000            
-TBUF        equ 0x290000            
-MISC        equ 0x2A0000
-CMDBUF      equ MISC                
-PATHB       equ MISC+0x100          
-NAMEB       equ MISC+0x200          
-TMPB        equ MISC+0x300          
-CLKB        equ MISC+0x600          
-ITEMS       equ MISC+0x800          
-SBBUF       equ MISC+0x1000         
+; =============================================================================
+;  CENTTRIX OS 4.0  -  64-bit (x86_64 long mode), one NASM file
+;
+;  build :  nasm -f bin centtrix.asm -o centtrix.img
+;  run   :  qemu-system-x86_64 -drive format=raw,file=centtrix.img -m 256 -rtc base=localtime
+;           (the kernel uses RAM up to ~104 MB, so give QEMU at least -m 128)
+;
+;  boot sector -> stage2 (real mode: VBE 32bpp, resolution from the superblock, A20)
+;              -> protected mode -> paging -> long mode -> kernel
+;  disk  : sector 0 = boot, 1..KSECT = kernel, FS_LBA.. = CNTX filesystem
+;  fs    : /base  /dump  /home   (32 slots of 16 KB)
+;  lang  : XPL, scripts are *.xep (write them in the built-in editor)
+; =============================================================================
+
+KSECT       equ 831                 ; kernel sectors after the boot sector
+FS_LBA      equ 896                 ; filesystem superblock
+VBEI        equ 0x1000              ; VBE controller info (stage2 scratch)
+SBS         equ 0x1400              ; superblock sector copy (stage2 scratch)
+FSBUF       equ 0x200000            ; in-memory filesystem (64 slots * 16 KB)
+EDBUF       equ 0x300000            ; editor / script buffer
+TBUF        equ 0x310000            ; terminal screen buffer
+MISC        equ 0x320000
+CMDBUF      equ MISC                ; terminal command line
+PATHB       equ MISC+0x100          ; path scratch
+NAMEB       equ MISC+0x200          ; file-name prompt buffer
+TMPB        equ MISC+0x300          ; text scratch (0x300 bytes)
+CLKB        equ MISC+0x600          ; clock text
+ITEMS       equ MISC+0x800          ; list of slot pointers
+SBBUF       equ MISC+0x1000         ; superblock sector
 PWA         equ MISC+0x900
 PWB         equ MISC+0x940
 PWC         equ MISC+0x980
@@ -29,7 +43,7 @@ M_DOCK      equ 0x2B00000
 M_TOP       equ 0x2B80000
 M_CARD      equ 0x2C00000
 M_WIN       equ 0x2D00000
-MAXF        equ 32
+MAXF        equ 64
 SLOT        equ 16384
 MAXSZ       equ 16320
 
@@ -86,6 +100,7 @@ K_HOME      equ 0xE5
 K_END       equ 0xE6
 K_PGUP      equ 0xE7
 K_PGDN      equ 0xE8
+K_CLICK     equ 0xE9
 SB_WALL     equ SBBUF+0x60
 SB_LAY2     equ SBBUF+0x64
 SB_RESW     equ SBBUF+0x68
@@ -96,6 +111,14 @@ SB_ACC      equ SBBUF+0x72
 SB_DSZ      equ SBBUF+0x73
 SB_CLK12    equ SBBUF+0x74
 SB_BARST    equ SBBUF+0x75
+SB_PAL      equ SBBUF+0x76
+SB_VOL      equ SBBUF+0x77
+SB_MUTE     equ SBBUF+0x78
+SB_WIFI     equ SBBUF+0x79
+SB_BT       equ SBBUF+0x7A
+SB_BAR      equ SBBUF+0x7B
+SB_BIOS     equ SBBUF+0x7C
+SB_XINIT    equ SBBUF+0x7F
 
 ; =============================================================================
 ;  STAGE 1  -  boot sector (16-bit)
@@ -178,6 +201,7 @@ curmode:  dw 0
 bi_fsok:  dd 0
 fp_lba:   dd 0
 fp_dst:   dd 0
+fp_cl:    dd 0
 modeinfo: times 256 db 0
 
 stage2:
@@ -285,47 +309,40 @@ stage2:
     mov cr0, eax
     jmp dword 0x08:pm32
 
-; fs_preload: superblock -> 0x1FF000, slots -> FSBUF (0x200000), bi_fsok = 1 when everything was read
+; fs_preload: superblock sector -> SBBUF only (dest < 16 MB, safe for every
+;             BIOS INT 15h/87h). The FAT and directory table are loaded by
+;             fs3_ata_load in 64-bit mode. Old CNT2 / virgin disks: fs3_init
+;             formats later.
 fs_preload:
     mov dword [bi_fsok], 0
     mov dword [dap_lba], FS_LBA
     mov word [dap_cnt], 1
     mov word [dap_off], 0
-    mov word [dap_seg], 0x6000
+    mov word [dap_seg], 0x7000
     mov si, dap
     mov dl, [bootdrv]
     mov ah, 0x42
     int 0x13
     jc .fail
-    mov dword [fp_dst], 0x1FF000
+    mov dword [fp_dst], SBBUF
     mov cx, 256
     call ext_copy
     jc .fail
-    mov dword [fp_lba], FS_LBA+1
-    mov dword [fp_dst], 0x200000
-    mov bp, 16
-.l: mov eax, [fp_lba]
-    mov [dap_lba], eax
-    mov word [dap_cnt], 64
-    mov word [dap_off], 0
-    mov word [dap_seg], 0x6000
-    mov si, dap
-    mov dl, [bootdrv]
-    mov ah, 0x42
-    int 0x13
-    jc .fail
-    mov cx, 16384
-    call ext_copy
-    jc .fail
-    add dword [fp_lba], 64
-    add dword [fp_dst], 0x8000
-    dec bp
-    jnz .l
+    ; look at the bounce copy through the 0x7000 segment
+    mov ax, 0x7000
+    mov es, ax
+    cmp dword [es:0x80], 0x46334E43      ; 'CN3F' at SB3_MAGIC
+    mov ax, 0
+    mov es, ax
+    jne .nofs
     mov dword [bi_fsok], 1
 .fail:
     ret
+.nofs:
+    mov dword [bi_fsok], 1
+    ret
 
-; ext_copy: copy cx words from 0x60000 to [fp_dst] with INT 15h AH=87h
+; ext_copy: copy cx words from 0x70000 to [fp_dst] with INT 15h AH=87h
 ext_copy:
     mov eax, [fp_dst]
     mov [x_dl], ax
@@ -342,7 +359,7 @@ ext_copy:
 align 4
 x_tab:   dq 0
          dq 0
-         db 0xFF, 0xFF, 0x00, 0x00, 0x06, 0x93, 0x00, 0x00
+         db 0xFF, 0xFF, 0x00, 0x00, 0x07, 0x93, 0x00, 0x00
          dw 0xFFFF
 x_dl:    dw 0
 x_dm:    db 0
@@ -402,10 +419,139 @@ gdt:
     dq 0x00CF9A000000FFFF           ; 0x08 code32
     dq 0x00CF92000000FFFF           ; 0x10 data
     dq 0x00AF9A000000FFFF           ; 0x18 code64
+    dq 0x00009A000000FFFF           ; 0x20 code16 (BIOS gate)
+    dq 0x000092000000FFFF           ; 0x28 data16
 gdt_end:
 gdtr:
     dw gdt_end - gdt - 1
     dd gdt
+
+; ---- begin bios16.inc
+; =============================================================================
+;  BIOS GATE (final image only, lives in low memory next to the GDT)
+;  The 64-bit kernel calls bios_call (bios.inc): long mode -> 32-bit -> 16-bit
+;  protected -> real mode, runs one  int N  with the registers in the bc_ block,
+;  then returns the same way.  UNTESTED on real CPUs: the native test harness
+;  cannot run mode switches, so it replaces bios_call with a stub.
+; =============================================================================
+align 4
+bc_ax   dw 0                         ; register block (offsets are used by bios.inc)
+bc_bx   dw 0
+bc_cx   dw 0
+bc_dx   dw 0
+bc_si   dw 0
+bc_di   dw 0
+bc_cf   db 0
+bc_int  db 0
+bc_cr0  dd 0
+bc_cr3  dd 0
+bc_cr4  dd 0
+bc_rsp  dq 0
+bc_pic1 db 0
+bc_pic2 db 0
+bc_ridt dw 0x3FF
+        dd 0
+align 8
+bc_dap  times 24 db 0                ; disk address packet (int 13h ext)
+bc_inf  times 64 db 0                ; result buffer (int 13h ah=48h)
+
+[bits 32]
+bc_c32:                              ; entered from long mode through a far return (compat mode)
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov esp, 0x7B00
+    mov eax, cr0
+    and eax, 0x7FFFFFFF              ; paging off (code is identity mapped)
+    mov cr0, eax
+    mov ecx, 0xC0000080
+    rdmsr
+    and eax, 0xFFFFFEFF              ; long mode off
+    wrmsr
+    xor eax, eax
+    mov cr4, eax
+    lgdt [gdtr]
+    jmp 0x20:bc_r16
+
+[bits 16]
+bc_r16:
+    mov ax, 0x28
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, cr0
+    and eax, 0xFFFFFFFE              ; protected mode off
+    mov cr0, eax
+    jmp 0x0000:bc_rm
+bc_rm:
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
+    mov sp, 0x7B00
+    lidt [bc_ridt]
+    mov bx, [bc_bx]
+    mov cx, [bc_cx]
+    mov dx, [bc_dx]
+    mov si, [bc_si]
+    mov di, [bc_di]
+    mov ax, [bc_ax]
+    sti
+bc_int_ins:
+    db 0xCD
+bc_int_op:
+    db 0x13
+    cli
+    push ax
+    xor ax, ax
+    mov ds, ax
+    pop ax
+    mov [bc_ax], ax
+    mov [bc_bx], bx
+    mov [bc_cx], cx
+    mov [bc_dx], dx
+    mov [bc_si], si
+    mov [bc_di], di
+    pushf
+    pop ax
+    and al, 1
+    mov [bc_cf], al
+    cli
+    lgdt [gdtr]
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+    jmp dword 0x08:bc_back32
+
+[bits 32]
+bc_back32:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov esp, 0x7B00
+    mov eax, [bc_cr4]
+    mov cr4, eax
+    mov eax, [bc_cr3]
+    mov cr3, eax
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 0x100
+    wrmsr
+    mov eax, [bc_cr0]
+    mov cr0, eax
+    jmp 0x18:bc_back64
+
+; ---- end bios16.inc
 
 ; =============================================================================
 ;  protected mode -> long mode
@@ -660,7 +806,7 @@ ata_read1:                          ; eax=LBA rdi=dest (advances) ; keeps eax
 
 ata_write1:                         ; eax=LBA rsi=src (advances) ; keeps eax
     cmp byte [ata_ok], 0
-    je .skip
+    je .alt
     push rax
     push rbx
     push rcx
@@ -693,7 +839,7 @@ ata_write1:                         ; eax=LBA rsi=src (advances) ; keeps eax
     test al, 0x80
     jnz .w
     test al, 1
-    jnz .d
+    jnz .to
     test al, 8
     jz .w
     mov dx, 0x1F0
@@ -715,6 +861,13 @@ ata_write1:                         ; eax=LBA rsi=src (advances) ; keeps eax
     pop rbx
     pop rax
 .skip:
+    ret
+.alt:                               ; the ATA ports do not reach the boot medium: BIOS write (experimental)
+    cmp byte [SB_BIOS], 0
+    je .skip
+    cmp dword [bi_fsok], 0
+    je .skip
+    call bw1
     ret
 
 ; ata_probe: with a BIOS-preloaded filesystem, check that the ATA ports lead to the disk we booted from
@@ -755,200 +908,56 @@ ata_probe:
     ret
 
 ; ------------------------------------------------------------- filesystem ----
-; slot (4096 bytes): +0 path (47 chars + NUL) | +48 size dword | +64 data
+; CNT3: the whole layer lives in cntfs.inc; these are thin forwarders that
+; keep the old entry points and calling conventions.
 path_ok:                            ; rsi=path -> ZF=1 if valid
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    xor ebx, ebx
-.d: mov eax, ebx
-    shl eax, 3
-    lea rdx, [dirpfx+rax]
-    xor ecx, ecx
-.c: mov al, [rdx+rcx]
-    cmp al, [rsi+rcx]
-    jne .n
-    inc ecx
-    cmp ecx, 6
-    jb .c
-    call strlen
-    cmp eax, 46
-    ja .bad
-    cmp eax, 7
-    jb .bad
-    xor eax, eax
-    jmp .x
-.n: inc ebx
-    cmp ebx, 3
-    jb .d
-.bad:
-    mov eax, 1
-    test eax, eax
-.x: pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
+    jmp fs3_pathok
 
 fs_find:                            ; rsi=path -> rax=slot or 0
-    push rdi
-    push rcx
-    mov rdi, FSBUF
-    mov ecx, MAXF
-.l: cmp byte [rdi], 0
-    je .n
-    call strcmp
-    je .f
-.n: add rdi, SLOT
-    dec ecx
-    jnz .l
-    xor eax, eax
-    jmp .o
-.f: mov rax, rdi
-.o: pop rcx
-    pop rdi
-    ret
+    jmp fs3_find
 
 parent_ok:                          ; rsi=path -> ZF=1 if parent folder exists
-    push rax
-    push rcx
-    push rdx
-    push rdi
-    push rsi
-    xor edx, edx
-    xor ecx, ecx
-.l: mov al, [rsi+rcx]
-    test al, al
-    jz .e
-    cmp al, '/'
-    jne .n
-    cmp byte [rsi+rcx+1], 0
-    je .n
-    mov edx, ecx
-.n: inc ecx
-    jmp .l
-.e: cmp edx, 5
-    jbe .ok
-    lea ecx, [rdx+1]
-    mov rdi, PARB
-    rep movsb
-    mov byte [rdi], 0
-    mov rsi, PARB
-    call fs_find
-    test rax, rax
-    jz .bad
-.ok:
-    xor eax, eax
-    jmp .o
-.bad:
-    mov eax, 1
-    test eax, eax
-.o: pop rsi
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rax
-    ret
+    jmp fs3_parenok
 
 fs_create:                          ; rsi=path -> rax=slot (existing or new) or 0
-    push rcx
-    push rdi
-    call path_ok
-    jne .fail
-    call parent_ok
-    jne .fail
-    call fs_find
-    test rax, rax
-    jnz .out
-    mov rdi, FSBUF
-    mov ecx, MAXF
-.s: cmp byte [rdi], 0
-    je .got
-    add rdi, SLOT
-    dec ecx
-    jnz .s
-.fail:
-    xor eax, eax
-    jmp .out
-.got:
-    call strcpy
-    mov dword [rdi+48], 0
-    mov rax, rdi
-.out:
-    pop rdi
-    pop rcx
-    ret
+    jmp fs3_create
 
 fs_save:                            ; rax=slot ; keeps rax
-    push rax
-    push rcx
-    push rsi
-    mov rsi, rax
-    sub rax, FSBUF
-    shr rax, 14
-    shl rax, 5
-    add rax, FS_LBA+1
-    mov ecx, 32
-.l: call ata_write1
-    inc eax
-    dec ecx
-    jnz .l
-    pop rsi
-    pop rcx
-    pop rax
-    ret
+    jmp fs3_save
 
 fs_move:                            ; rax=slot rsi=new path
-    push rbx
-    push rdi
-    push rsi
-    push rcx
-    mov rbx, rax
-    call fs_find
-    test rax, rax
-    jz .nd
-    cmp rax, rbx
-    je .nd
-    mov byte [rax], 0
-    call fs_save
-.nd:
-    mov rdi, rbx
-    call strcpy
-    mov rax, rbx
-    call fs_save
-    pop rcx
-    pop rsi
-    pop rdi
-    pop rbx
-    ret
+    jmp fs3_move
 
 fs_mk:                              ; rsi=path rdx=content(zstr) -> rax=slot
     push rbx
-    push rcx
-    push rdi
     push rsi
-    call fs_create
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    call fs3_create
     test rax, rax
-    jz .out
-    mov rbx, rax
-    lea rdi, [rbx+64]
+    jz .o
+    mov r13, rax
     mov rsi, rdx
-    xor ecx, ecx
-.c: mov al, [rsi]
-    test al, al
-    jz .z
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    inc ecx
-    jmp .c
-.z: mov [rbx+48], ecx
-    mov rax, rbx
-.out:
-    pop rsi
+    call strlen
+    mov [r13+48], eax
+    mov rsi, rdx
+    lea rdi, [r13+64]
+    mov ecx, eax
+    rep movsb
+    or word [r13+60], FL_DIRTY
+    mov rax, r13
+    call fs3_save
+    mov rax, r13
+.o:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rdi
-    pop rcx
+    pop rsi
     pop rbx
     ret
 
@@ -979,55 +988,8 @@ mkpath:                             ; ecx=dir(0..2) rsi=name -> rsi=PATHB
     mov rsi, PATHB
     ret
 
-collect:                            ; lists curdir -> f_cnt, ITEMS
-    push rax
-    push rbx
-    push rcx
-    push rsi    push rdi
-    mov dword [f_cnt], 0
-    cmp dword [cd_len], 1
-    jne .d
-    mov dword [f_cnt], 3
-    jmp .out
-.d: mov rbx, FSBUF
-    mov ecx, MAXF
-    mov rdi, ITEMS
-.l: cmp byte [rbx], 0
-    je .n
-    xor eax, eax
-.c: cmp eax, [cd_len]
-    jae .pre
-    mov dl, [curdir+rax]
-    cmp dl, [rbx+rax]
-    jne .n
-    inc eax
-    jmp .c
-.pre:
-    lea rsi, [rbx+rax]
-    cmp byte [rsi], 0
-    je .n
-.s: mov al, [rsi]
-    inc rsi
-    test al, al
-    jz .add
-    cmp al, '/'
-    jne .s
-    cmp byte [rsi], 0
-    jne .n
-.add:
-    mov [rdi], rbx
-    add rdi, 8
-    inc dword [f_cnt]
-.n: add rbx, SLOT
-    dec ecx
-    jnz .l
-.out:
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rbx
-    pop rax
-    ret
+collect:                            ; lists curdir -> f_cnt, ITEMS (stubs in STUBS)
+    jmp fs3_collect
 
 set_curdir:                         ; rsi=zstr dir path (with trailing /)
     push rax
@@ -1111,112 +1073,11 @@ mkpath_cur:                         ; rsi=name -> rsi=PATHB (curdir, or /home/ w
     ret
 
 folder_empty:                       ; rax=folder slot -> ZF=1 if no children
-    push r8
-    push r9
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    mov r9, rax
-    mov rsi, rax
-    call strlen
-    mov edx, eax
-    mov rbx, FSBUF
-    mov ecx, MAXF
-.l: cmp byte [rbx], 0
-    je .n
-    cmp rbx, r9
-    je .n
-    xor edi, edi
-.c: cmp edi, edx
-    jae .full
-    mov r8b, [r9+rdi]
-    cmp r8b, [rbx+rdi]
-    jne .n
-    inc edi
-    jmp .c
-.full:
-    mov eax, 1
-    test eax, eax
-    jmp .o
-.n: add rbx, SLOT
-    dec ecx
-    jnz .l
-    xor eax, eax
-.o: pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop r9
-    pop r8
-    ret
+    jmp fs3_folder_empty
 
 fs_init:
     call ata_probe
-    cmp dword [bi_fsok], 0
-    je .atapath
-    mov rsi, 0x1FF000               ; the BIOS already copied the disk contents to RAM
-    mov rdi, SBBUF
-    mov ecx, 128
-    rep movsd
-    cmp dword [SBBUF], 0x32544E43
-    jne .format
-    ret
-.atapath:
-    mov rdi, SBBUF
-    mov eax, FS_LBA
-    call ata_read1
-    cmp dword [SBBUF], 0x32544E43       ; 'CNT2'
-    jne .format
-    mov rdi, FSBUF
-    mov eax, FS_LBA+1
-    mov ecx, MAXF*32
-.ld:
-    call ata_read1
-    inc eax
-    dec ecx
-    jnz .ld
-    ret
-.format:
-    mov rdi, FSBUF
-    xor eax, eax
-    mov ecx, (MAXF*SLOT)/8
-    rep stosq
-    lea rsi, [p_readme]
-    lea rdx, [d_readme]
-    call fs_mk
-    lea rsi, [p_sys]
-    lea rdx, [d_sys]
-    call fs_mk
-    lea rsi, [p_rainbow]
-    lea rdx, [d_rainbow]
-    call fs_mk
-    lea rsi, [p_hello]
-    lea rdx, [d_hello]
-    call fs_mk
-    lea rsi, [p_notes]
-    lea rdx, [d_notes]
-    call fs_mk
-    ; write all slots
-    mov rax, FSBUF
-    mov ecx, MAXF
-.sv:
-    call fs_save
-    add rax, SLOT
-    dec ecx
-    jnz .sv
-    ; superblock
-    mov rdi, SBBUF
-    xor eax, eax
-    mov ecx, 64
-    rep stosq
-    mov dword [SBBUF], 0x32544E43
-    mov rsi, SBBUF
-    mov eax, FS_LBA
-    call ata_write1
-    ret
+    jmp fs3_init
 
 ; ---------------------------------------------------------------- graphics ---
 ; ---- begin gfx_core.inc
@@ -1982,7 +1843,8 @@ lerp_px:
     xor esi, esi
 .p: cmp esi, 255
     jbe .q
-    mov esi, 255.q: shl esi, cl
+    mov esi, 255
+.q: shl esi, cl
     or edi, esi
     add ecx, 8
     cmp ecx, 32
@@ -2503,7 +2365,10 @@ comp_region:
     call blit_surf
     mov esi, SI_CARD
     call blit_surf
+    cmp byte [cur_skip], 0
+    jne .nocur
     call cursor_draw
+.nocur:
     ; BACK -> screen
     mov ebx, [rg_y0]
 .sc:
@@ -2981,7 +2846,8 @@ wp_gen:                             ; eax = wallpaper index -> fills WALL
     xor edx, edx
     div r8d
     mov r9d, eax
-    imul r9, r9    mov [rbp+8], r9d
+    imul r9, r9
+    mov [rbp+8], r9d
     mov eax, 1
     shl rax, 24
     xor edx, edx
@@ -3239,6 +3105,7 @@ IC_STR  equ 0x8000
 ICS     equ 0x4600000               ; small atlas (sidebar)
 ICS_STR equ 0x2000
 ICS_SZ  equ 28
+DK_MAG  equ 0x4588000               ; magnified hovered dock icon (max 84x84 ARGB)
 GLU     equ 0x4590000               ; unpacked glyph (40*40 bytes)
 IC_N    equ 17
 
@@ -3341,7 +3208,7 @@ mixc:
     ret
 
 ; ---- eax = glyph index, ecx = size, rdi = destination (size*size dwords)
-icon_render:
+icon_render_old:
     push rax
     push rbx
     push rcx
@@ -3949,6 +3816,22 @@ SCR_SAVE equ 0xD00                   ; bytes of MISC swapped per task
 
 ; ---- key queue ---------------------------------------------------------------
 kq_push:                            ; al
+    cmp byte [pm_open], 0
+    je .norm
+    cmp byte [pm_kind], 5
+    jb .norm
+    push rcx
+    movzx ecx, byte [ov_t]
+    mov [ov_ring+rcx], al
+    inc cl
+    and cl, 15
+    cmp cl, [ov_h]
+    je .ovf
+    mov [ov_t], cl
+.ovf:
+    pop rcx
+    ret
+.norm:
     push rbx
     push rcx
     mov ecx, [kq_t]
@@ -3980,7 +3863,8 @@ kq_pop:                             ; -> al (0 = empty)
 
 ; ---- layout id of the active layout (0 en, 1 ru, 2 es) -> eax
 lay_id:
-    xor eax, eax    cmp byte [lay_cur], 0
+    xor eax, eax
+    cmp byte [lay_cur], 0
     je .r
     movzx eax, byte [SB_LAY2]
     and eax, 1
@@ -4006,6 +3890,13 @@ kbd_scan:
     jnz .rel
     test ecx, ecx
     jnz .ext
+    cmp byte [k_super], 0
+    je .nosu
+    cmp bl, 0x2D
+    je .su_x
+    cmp bl, 0x2E
+    je .su_c
+.nosu:
     cmp bl, 0x2A
     je .shon
     cmp bl, 0x36
@@ -4077,7 +3968,10 @@ kbd_scan:
     je .a_d
     jmp .out
 .a_tab:
-    call wm_next_window
+    mov byte [sw_req], 1
+    cmp byte [k_shift], 0
+    je .out
+    mov byte [sw_req], 2
     jmp .out
 .a_q:
     call wm_close_focused
@@ -4088,6 +3982,24 @@ kbd_scan:
 .a_d:
     xor eax, eax
     call focus_set
+    jmp .out
+.suon:
+    mov byte [k_super], 1
+    jmp .out
+.suoff:
+    mov byte [k_super], 0
+    jmp .out
+.su_x:
+    mov byte [su_req], 1
+    jmp .out
+.su_c:
+    mov byte [su_req], 2
+    jmp .out
+.su_up:
+    mov byte [su_req], 3
+    jmp .out
+.su_dn:
+    mov byte [su_req], 4
     jmp .out
 .shon:
     mov byte [k_shift], 1
@@ -4108,6 +4020,17 @@ kbd_scan:
     xor byte [k_caps], 1
     jmp .out
 .ext:
+    cmp bl, 0x5B
+    je .suon
+    cmp bl, 0x5C
+    je .suon
+    cmp byte [k_super], 0
+    je .nosu2
+    cmp bl, 0x48
+    je .su_up
+    cmp bl, 0x50
+    je .su_dn
+.nosu2:
     cmp bl, 0x1D
     je .con
     cmp bl, 0x38
@@ -4171,6 +4094,13 @@ kbd_scan:
     jmp .out
 .rel:
     and bl, 0x7F
+    test ecx, ecx
+    jz .relne
+    cmp bl, 0x5B
+    je .suoff
+    cmp bl, 0x5C
+    je .suoff
+.relne:
     cmp bl, 0x2A
     je .shoff
     cmp bl, 0x36
@@ -4185,6 +4115,7 @@ kbd_scan:
     jmp .tog
 .altoff:
     mov byte [k_alt], 0
+    mov byte [sw_rel], 1
 .tog:
     cmp byte [lay_pend], 0
     je .out
@@ -4498,7 +4429,19 @@ mouse_press:
     pop rbx
     pop rax
     cmp ebx, HDRH
-    jge .out
+    jl .tl
+    sub eax, 8                       ; a click in the window: the app gets K_CLICK + the cell
+    sub ebx, HDRH+8
+    mov [clk_px], eax
+    mov [clk_py], ebx
+    sar eax, 3
+    sar ebx, 4
+    mov [clk_x], eax
+    mov [clk_y], ebx
+    mov al, K_CLICK
+    call kq_push
+    jmp .out
+.tl:
     ; traffic lights
     cmp ebx, 13
     jl .drag
@@ -4979,7 +4922,8 @@ task_boot:
 task_exit:
     mov eax, [task_cur]
     call task_free
-    call yield    jmp $
+    call yield
+    jmp $
 
 task_free:                          ; eax = task index
     push rax
@@ -5265,6 +5209,7 @@ DKPY    equ 36                       ; pill top inside the dock surface
 DKGAP   equ 14
 DKPAD   equ 18
 DK_ITEMS equ 8
+DK_MAGZ equ 16                       ; hover magnification: dock icon grows by this many px
 NAPPS   equ 7
 
 
@@ -5604,6 +5549,14 @@ top_draw:
     mov rsi, CLKB
     call ui_text
     ; layout badge (EN / RU / ES) with an accent underline
+    test byte [SB_BAR], 1
+    jnz .badge
+    mov eax, [tb_cx0]
+    sub eax, 12
+    mov [tb_kx0], eax
+    mov [tb_kx1], eax
+    jmp .ind
+.badge:
     lea rax, [font_uib]
     mov [g_uf], rax
     call lay_id
@@ -5627,6 +5580,8 @@ top_draw:
     mov esi, r12d
     mov edx, 2
     call rect
+.ind:
+    call bar_inds
     POPA
     ret
 
@@ -5723,6 +5678,12 @@ pm_close:
 
 pm_draw:
     PUSHA
+    cmp byte [pm_kind], 5
+    jb .std
+    call ov_draw
+    POPA
+    ret
+.std:
     mov esi, SI_CARD
     mov ebx, [pm_x]
     sub ebx, PMSH
@@ -5873,6 +5834,10 @@ panel_bg:                           ; pm_x/y/w/h, pm_rad ; target already select
 
 ; item under the pointer or -1
 pm_hit:                             ; -> eax
+    cmp byte [pm_kind], 5
+    jb .std0
+    jmp ov_hit
+.std0:
     PUSHA
     mov eax, [mx]
     mov ebx, [my]
@@ -5978,7 +5943,8 @@ open_app_menu:
     ret
 
 ; windows list menu : one entry per running task
-open_win_menu:    PUSHA
+open_win_menu:
+    PUSHA
     lea rdi, [pm_dyn]
     xor r12d, r12d                   ; count
     mov ecx, 1
@@ -6078,6 +6044,18 @@ menu_do:                            ; eax = action
     je .c24
     cmp r12d, 41
     je .c12
+    cmp r12d, 50
+    jb .nlap
+    cmp r12d, 60
+    jb .lapp
+    cmp r12d, 65
+    jb .qact
+    je .snd
+    cmp r12d, 66
+    je .thm
+    cmp r12d, 67
+    je .dsp
+.nlap:
     cmp r12d, 20
     jb .out
     ; focus a window task
@@ -6097,6 +6075,23 @@ menu_do:                            ; eax = action
     lea eax, [r12-20]
     call focus_set
     jmp .out
+.lapp:
+    lea eax, [r12-50]
+    call launch_app
+    jmp .out
+.qact:
+    mov eax, r12d
+    call qp_action
+    jmp .out
+.snd:
+    mov ebx, 9
+    jmp .setspawn
+.thm:
+    mov ebx, 7
+    jmp .setspawn
+.dsp:
+    mov ebx, 3
+    jmp .setspawn
 .c24:
     mov byte [SB_CLK12], 0
     jmp .clkset
@@ -6108,7 +6103,7 @@ menu_do:                            ; eax = action
     call cfg_apply_save
     jmp .out
 .about:
-    mov ebx, 7
+    mov ebx, 10
     jmp .setspawn
 .set:
     xor ebx, ebx
@@ -6241,6 +6236,7 @@ apply_accent:
     ret
 
 cfg_clamp:                          ; keep every stored value in range
+    call ex_clamp
     push rax
     cmp byte [SB_THEME], 1
     jbe .a
@@ -6517,6 +6513,7 @@ set_wallpaper:                      ; eax = index
 ; ================================================================ DOCK =========
 dock_build:
     PUSHA
+    mov dword [dk_mag_idx], -1
     mov esi, SI_DOCK
     cmp dword [dk_w], 0
     je .nw
@@ -6583,10 +6580,40 @@ dock_sig_calc:
     pop rcx
     ret
 
+; render the hovered icon one size larger into DK_MAG
+dock_mag_build:
+    PUSHA
+    mov eax, [dk_hov]
+    test eax, eax
+    js .none
+    mov [dk_mag_idx], eax
+    mov ecx, [dk_isz]
+    add ecx, DK_MAGZ
+    mov [dk_mag_sz], ecx
+    mov edi, DK_MAG
+    call icon_render
+    mov esi, SI_DOCK
+    call gfx_target
+    jmp .o
+.none:
+    mov dword [dk_mag_idx], -1
+.o: POPA
+    ret
+
 dock_draw:
     PUSHA
     mov esi, SI_DOCK
     call gfx_target
+    ; the magnified icon is cached; rebuild it when hover / size / style changed
+    mov eax, [dk_hov]
+    test eax, eax
+    js .nomag
+    cmp eax, [dk_mag_idx]
+    je .nomag
+    call dock_mag_build
+    mov esi, SI_DOCK
+    call gfx_target
+.nomag:
     mov r12d, [dk_isz]
     ; clear
     mov eax, 0xFF000000
@@ -6595,32 +6622,30 @@ dock_draw:
     mov esi, [dk_sw]
     mov edx, [dk_sh]
     call rect
-    ; pill
-    mov eax, 0x50FFFFFF
-    mov r13d, 0x70FFFFFF
+    ; pill : frosted-glass look (translucent gradient, gloss, light rim)
+    mov eax, 0xF4F6FA
+    mov r8d, 0xC9CEDA
+    mov dword [gp_alpha], 150
+    mov dword [gp_gloss], 60
+    mov dword [gp_rim], 170
     cmp byte [SB_THEME], 0
     je .pc
-    mov eax, 0x4A2B2B30
-    mov r13d, 0x70808090
+    mov eax, 0x4A4C5A
+    mov r8d, 0x20222C
+    mov dword [gp_alpha], 170
+    mov dword [gp_gloss], 28
+    mov dword [gp_rim], 90
 .pc:
     mov ebx, [dk_sx]
     mov ecx, [dk_sy]
     add ecx, DKPY
     mov esi, [dk_sw]
     lea edx, [r12+26]
-    mov r9d, 24
-    mov byte [rr_mode], 1
-    push rax
-    mov eax, r13d
-    call rrect
-    pop rax
-    inc ebx
-    inc ecx
-    sub esi, 2
-    sub edx, 2
-    mov r9d, 23
-    call rrect
-    mov byte [rr_mode], 0
+    mov r9d, 26
+    call gl_pill
+    mov dword [gp_alpha], 255
+    mov dword [gp_gloss], 0
+    mov dword [gp_rim], 0
     ; icons
     call dock_sig_calc
     mov r14d, eax
@@ -6636,6 +6661,23 @@ dock_draw:
     add ecx, DKPY+9
     cmp r13d, [dk_hov]
     jne .nl
+    cmp dword [dk_mag_idx], r13d
+    jne .lift
+    ; magnified icon: bottom-aligned and centred on the normal slot
+    mov eax, [dk_mag_sz]
+    sub eax, r12d
+    mov edx, eax
+    shr edx, 1
+    sub ebx, edx
+    sub ecx, eax
+    lea rsi, [DK_MAG]
+    mov eax, [dk_mag_sz]
+    mov edx, eax
+    push rbx
+    call argb_blit
+    pop rbx
+    jmp .drawn
+.lift:
     sub ecx, 10
 .nl:
     mov esi, r13d
@@ -6646,6 +6688,7 @@ dock_draw:
     push rbx
     call argb_blit
     pop rbx
+.drawn:
     ; running dot
     cmp r13d, 7
     jae .nd
@@ -6833,8 +6876,13 @@ shell_step:                         ; one pass of the shell (called from the idl
     movzx eax, al
     cmp eax, [clk_min]
     je .nock
+    call ex_minute
     call top_draw
 .nock:
+    call ex_super
+    call ex_keys
+    call ov_tick
+    call sw_tick
     ; ---- dock launches
     mov eax, [launch_req]
     test eax, eax
@@ -6927,13 +6975,18 @@ top_hit:
     jl .app
     cmp r12d, [tb_wx1]
     jl .win
-    cmp r12d, [tb_kx0]
+    cmp r12d, [tb_ix0]
     jl .none
+    cmp r12d, [tb_kx0]
+    jl .qpn
     cmp r12d, [tb_kx1]
     jl .lay
     cmp r12d, [tb_cx0]
     jl .none
     mov r14d, 4
+    jmp .go
+.qpn:
+    mov r14d, 6
     jmp .go
 .logo:
     mov r14d, 1
@@ -6975,9 +7028,15 @@ top_hit:
     call open_win_menu
     jmp .o
 .a4:
+    cmp r14d, 6
+    jne .a5
+    call open_qpanel
+    jmp .o
+.a5:
     call open_clock_menu
 .o: POPA
     ret
+
 pm_hit_xy:                          ; uses the pressed position (pm_cx, pm_cy) -> eax item or -1
     push rbx
     push rcx
@@ -7003,6 +7062,10 @@ pm_hit_xy:                          ; uses the pressed position (pm_cx, pm_cy) -
     ret
 
 pm_pick:                            ; eax = item index
+    cmp byte [pm_kind], 5
+    jb .std0
+    jmp ov_pick
+.std0:
     PUSHA
     shl eax, 4
     mov eax, [pm_ent+rax+8]
@@ -7133,7 +7196,7 @@ rect_a:
     jz .o
     and r10d, 0xFFFFFF
     mov r12d, esi
-    mov r13d, edx
+    mov ebp, edx
     mov r8d, ebx
     mov r9d, ecx
     call mark_dirty
@@ -7151,7 +7214,7 @@ rect_a:
     dec r14d
     jnz .px
     add rdi, [cur_pitch]
-    dec r13d
+    dec ebp
     jnz .row
 .o: POPA
     ret
@@ -7410,6 +7473,7 @@ lock_end:
     PUSHA
     mov esi, SI_CARD
     call surf_hide
+    call desk_draw
     mov ecx, 2
 .l: mov r8d, ecx
     shl r8d, 7
@@ -7442,7 +7506,7 @@ lg_card:
     mov [lg_sub], rsi
     mov [pm_h], ecx
     mov dword [pm_w], LGW
-    mov dword [pm_rad], 18
+    mov dword [pm_rad], 24
     mov eax, [scr_w]
     sub eax, LGW
     shr eax, 1
@@ -7452,19 +7516,12 @@ lg_card:
     shr eax, 1
     sub eax, 20
     mov [pm_y], eax
-    mov esi, SI_CARD
-    mov ebx, [pm_x]
-    sub ebx, PMSH
-    mov ecx, [pm_y]
-    sub ecx, PMSH
-    mov eax, LGW+2*PMSH
+    mov eax, [pm_x]
+    mov ebx, [pm_y]
+    mov ecx, LGW
     mov edx, [pm_h]
-    add edx, 2*PMSH
-    mov rdi, M_CARD
-    call surf_setup
-    mov esi, SI_CARD
-    call gfx_target
-    call panel_bg
+    mov esi, 24
+    call gl_make
     ; logo
     call logo_ptr64
     mov ebx, [pm_x]
@@ -7505,6 +7562,7 @@ lg_field:
     add r14d, [pm_y]
     mov r15, rsi
     xor ebp, ebp                     ; length
+    mov byte [lg_done], 0
 .draw:
     ; label
     mov dword [g_fg], 0x8E8E93
@@ -7568,6 +7626,8 @@ lg_field:
     call ui_text
     mov rsi, TMPB
     call ui_width
+    cmp byte [lg_done], 0
+    jne .ncaret
     mov ebx, [pm_x]
     lea ebx, [rbx+rax+43]
     mov eax, [th_acc]
@@ -7575,6 +7635,9 @@ lg_field:
     mov esi, 2
     mov edx, 18
     call rect
+.ncaret:
+    cmp byte [lg_done], 0
+    jne .ret
 .key:
     call getkey
     cmp al, 13
@@ -7600,6 +7663,9 @@ lg_field:
     jz .key
     mov byte [r12+rbp], 0
     mov [lg_len], ebp
+    mov byte [lg_done], 1
+    jmp .draw
+.ret:
     POPA
     mov eax, [lg_len]
     ret
@@ -7607,6 +7673,7 @@ lg_field:
 login_screen:
     PUSHA
     call lock_begin
+    call lk_wait
     mov byte [sudo_on], 0
     cmp dword [SBBUF+4], 0x31525355
     je .have
@@ -7976,7 +8043,8 @@ pt_oval:                            ; eax=x0 ebx=y0 ecx=x1 edx=y1
     call pt_stamp
     inc r12d
     cmp r12d, 512
-    jb .l    POPA
+    jb .l
+    POPA
     ret
 
 pt_fill:                            ; eax=x ebx=y  fill with pt_col
@@ -8975,7 +9043,8 @@ st_card:
     mov ebx, r12d
     mov ecx, r13d
     mov esi, r14d
-    mov edx, r15d    mov r9d, 12
+    mov edx, r15d
+    mov r9d, 12
     call rrect
     POPA
     ret
@@ -9045,7 +9114,7 @@ st_walls_build:
 
 ; ---- layout of the whole window --------------------------------------------------------
 st_tab_names:
-    db "General",0,"Appearance",0,"Wallpaper",0,"Display",0,"Keyboard",0,"Monitor",0,"Account",0,"About",0
+    db "General",0,"Appearance",0,"Wallpaper",0,"Display",0,"Keyboard",0,"Monitor",0,"Account",0,"Themes",0,"Top bar",0,"Sound and Network",0,"About",0
 
 st_draw:
     PUSHA
@@ -9068,7 +9137,7 @@ st_draw:
     xor r12d, r12d
     lea r13, [st_tab_names]
 .tb:
-    cmp r12d, 8
+    cmp r12d, 11
     jae .pane
     imul r14d, r12d, 46
     add r14d, STY+14
@@ -9155,7 +9224,19 @@ st_draw:
     je .p5
     cmp eax, 6
     je .p6
+    cmp eax, 7
+    je .p7
+    cmp eax, 8
+    je .p8
+    cmp eax, 9
+    je .p9
     call st_pane_about
+    jmp .done
+.p7: call st_pane_themes
+    jmp .done
+.p8: call st_pane_topbar
+    jmp .done
+.p9: call st_pane_sound
     jmp .done
 .p0: call st_pane_general
     jmp .done
@@ -9974,7 +10055,8 @@ st_pane_account:
     mov ebx, PY0+76
     mov ecx, 250
     mov edx, 38
-    lea rsi, [s_u_pw]    xor edi, edi
+    lea rsi, [s_u_pw]
+    xor edi, edi
     mov r8d, A_PASS
     xor r9d, r9d
     call st_opt
@@ -10103,12 +10185,18 @@ st_act:                             ; esi=act edi=val
     je .logt
     cmp r12d, A_PASS
     je .pass
-    jmp .o
+    cmp r12d, A_PAL
+    jb .o
+    mov esi, r12d
+    mov edi, r13d
+    call ex_act
+    jmp .redraw
 .tab:
     mov [st_tab], r13d
     jmp .redraw
 .theme:
     mov [SB_THEME], r13b
+    mov [SB_PAL], r13b
     call st_changed_look
     jmp .redraw
 .acc:
@@ -10173,6 +10261,8 @@ st_act:                             ; esi=act edi=val
     jmp .o
 .reset:
     mov byte [SB_THEME], 0
+    mov byte [SB_PAL], 0
+    mov byte [SB_BAR], 0x1F
     mov byte [SB_ACC], 0
     mov byte [SB_LOGO], 0
     mov byte [SB_ICST], 0
@@ -10226,7 +10316,7 @@ app_edit_file:                      ; rax = slot
 ; ================================================================ THE APP ====
 app_settings:
     mov [st_tab], eax
-    cmp dword [st_tab], 8
+    cmp dword [st_tab], 11
     jb .ok
     mov dword [st_tab], 0
 .ok:
@@ -10252,7 +10342,7 @@ app_settings:
     cmp al, K_DN
     jne .k2
     mov eax, [st_tab]
-    cmp eax, 7
+    cmp eax, 10
     jae .loop
     inc eax
     mov [st_tab], eax
@@ -10973,7 +11063,8 @@ csum_acc:                           ; rsi = data, ecx = bytes, edx = running sum
 .w: movzx eax, word [rsi]
     add edx, eax
     add rsi, 2
-    dec ecx    jnz .w
+    dec ecx
+    jnz .w
 .odd:
     test ebx, 1
     jz .d
@@ -11972,7 +12063,8 @@ url_parse:
     jae .bad
     or al, 0                        ; keep as typed
     mov [rdi+rcx], al
-    inc ecx    inc rsi
+    inc ecx
+    inc rsi
     jmp .hl
 .he:
     test ecx, ecx
@@ -12163,7 +12255,10 @@ http_build_req:                     ; -> ecx = length, text at N_REQ
     push rax
     mov rdi, N_REQ
     lea rsi, [s_hget]
-    call sappend
+    cmp byte [http_post], 0
+    je .m
+    lea rsi, [s_hpost]
+.m: call sappend
     lea rsi, [net_path]
     call sappend
     lea rsi, [s_hhost]
@@ -12182,8 +12277,22 @@ http_build_req:                     ; -> ecx = length, text at N_REQ
     movzx eax, word [net_port]
     call u2s
 .np:
+    cmp byte [http_post], 0
+    jne .post
     lea rsi, [s_htail]
     call sappend
+    jmp .done
+.post:
+    lea rsi, [s_htailp]
+    call sappend
+    mov rsi, [http_body]
+    call strlen
+    call u2s
+    lea rsi, [s_crlf2]
+    call sappend
+    mov rsi, [http_body]
+    call sappend
+.done:
     mov rcx, rdi
     sub rcx, N_REQ
     pop rax
@@ -12258,6 +12367,7 @@ http_parse:
     mov byte [http_loc], 0
     mov byte [http_chunked], 0
     mov byte [http_class], 1
+    mov byte [http_cs], 0
     mov r12d, [tc_rlen]
     cmp r12d, 12
     jb .bad
@@ -12312,6 +12422,18 @@ http_parse:
     lea rdi, [h_ct]
     call hdr_is
     jne .t1
+    mov byte [http_cs], 0
+    lea rdi, [w_1251]
+    call line_has
+    jne .n1251
+    mov byte [http_cs], 1
+    jmp .ncs
+.n1251:
+    lea rdi, [w_8859n]
+    call line_has
+    jne .ncs
+    mov byte [http_cs], 2
+.ncs:
     lea rdi, [w_html]
     call line_has
     je .ishtml
@@ -12911,6 +13033,7 @@ http_fetch:
     cmp eax, 308
     jne .okk
 .redir:
+    mov byte [http_post], 0
     cmp byte [http_loc], 0
     je .okk
     inc dword [http_redirs]
@@ -12971,7 +13094,8 @@ net_errmsg:
     lea rsi, [em_url]
     ret
 .7: cmp eax, E_REDIR
-    jne .8    lea rsi, [em_redir]
+    jne .8
+    lea rsi, [em_redir]
     ret
 .8: cmp eax, E_LINK
     jne .9
@@ -13970,7 +14094,8 @@ TS_XS     equ TS+0x720              ; ladder swap state (dq)
     call %1
 %endmacro
 
-fe_add:                             ; rdi = a + b (rsi, rdx)    mov r8, [rsi]
+fe_add:                             ; rdi = a + b (rsi, rdx)
+    mov r8, [rsi]
     add r8, [rdx]
     mov r9, [rsi+8]
     adc r9, [rdx+8]
@@ -14969,7 +15094,8 @@ tls_hs_input:
     lea ecx, [rcx+4]
     call sha_upd
     pop rbx
-    pop rcx.nohash:
+    pop rcx
+.nohash:
     lea rsi, [rbx+4]
     mov eax, r12d
     push rcx
@@ -15256,79 +15382,380 @@ tls_errtext:                        ; -> rsi = message for E_TLS
 TS_MSG    equ TS+0x14800
 
 ; ---- end tls_proto.inc
-; ---- begin browser.inc
+; ---- begin htmldata.inc
+; HTML renderer: state variables and character tables
+misc_str:
+ms_dash  db "-", 0
+ms_dd    db "--", 0
+ms_sq    db "'", 0
+ms_dq    db 34, 0
+ms_star  db "*", 0
+ms_ell   db "...", 0
+ms_c     db "(c)", 0
+ms_r     db "(R)", 0
+ms_la    db "<<", 0
+ms_ra    db ">>", 0
+ms_dot   db ".", 0
+ms_rarr  db "->", 0
+ms_larr  db "<-", 0
+ms_eur   db "EUR", 0
+ms_tm    db "(TM)", 0
+ms_deg   db "deg", 0
+ms_pm    db "+-", 0
+ms_half  db "1/2", 0
+ms_x     db "x", 0
+ms_gbp   db "GBP", 0
+
+; ---- end htmldata.inc
+; ---- begin html1.inc
 ; =============================================================================
-;  BROWSER: address bar, local pages and plain-http pages, a text-cell renderer
-;  for real HTML (script/style skipped, entities, UTF-8, links, tables as text)
+;  HTML renderer, part 1: cell planes, text flow, character mapping, entities
+;  The page is laid out on a grid of 8x16 cells (COLS-2 columns).  Every cell has
+;  a character, an item number (link / form control), a text colour, a background
+;  colour and style flags.  Colours are 0x01RRGGBB (bit 24 = "set"); 0 = default.
 ; =============================================================================
-BRC     equ 0x4900000               ; page character cells
-BRA     equ 0x4960000               ; page attribute cells (0 text, 1 bold/heading, 3 dim, 8+n link n)
-BRL     equ 0x49C0000               ; link targets: 240 * 128
+BRC     equ 0x4900000               ; characters
+BRA     equ 0x4960000               ; item number + 8 (0 = none)
+BRL     equ 0x49C0000               ; item data: 240 * 128
 BRH     equ 0x49C8000               ; history: 16 * 512
+BRF     equ 0x4D00000               ; text colour dwords
+BRB     equ 0x4E80000               ; background colour dwords
+BRX     equ 0x5000000               ; style flags
+BRS     equ 0x5080000               ; scratch area for the renderer
+BR_STK  equ BRS                     ; style frames: 64 bytes * BR_NFR
+BR_RUL  equ BRS+0x2000              ; css rules: 64 bytes * BR_NRUL
+BR_CEL  equ BRS+0x8000              ; table cells: 48 bytes * BR_NCEL
+BR_ROW  equ BRS+0x18000             ; table rows: 16 bytes * BR_NROW
+BR_COL  equ BRS+0x1C000             ; column data per nesting level (0x400 each)
+BR_ITM  equ BRS+0x1D000             ; item info: 16 bytes * 240
+BR_FRM  equ BRS+0x1E000             ; forms: 144 bytes * 16
+BR_ANC  equ BRS+0x1F000             ; anchors: 24 bytes * 128
+BR_Q    equ BRS+0x20000             ; form query string (4 KB)
+BR_OPT  equ BRS+0x21000             ; select options pool (8 KB)
+BR_TMP  equ BRS+0x24000             ; scratch text (4 KB)
 BR_MAXR equ 3000
 BRVIS   equ 32
 BR_HN   equ 16
 BR_NLK  equ 240
+BR_NFR  equ 120
+BR_NRUL equ 256
+BR_NCEL equ 1000
+BR_NROW equ 600
+BR_NANC equ 128
 
-%macro TG 2
-    mov rdx, %1
-    cmp rax, rdx
-    je %2
-%endmacro
+; tag flags
+TF_BLK    equ 0x00001
+TF_GAP    equ 0x00002
+TF_VOID   equ 0x00004
+TF_BOLD   equ 0x00008
+TF_UL     equ 0x00010
+TF_BIG    equ 0x00020
+TF_CTR    equ 0x00040
+TF_IND4   equ 0x00080
+TF_LIST   equ 0x00100
+TF_SELF   equ 0x00200
+TF_SCOPE  equ 0x00400
+TF_PRE    equ 0x00800
+TF_CODE   equ 0x01000
+TF_STRIKE equ 0x02000
+TF_MARK   equ 0x04000
+TF_HID    equ 0x08000
+TF_LINK   equ 0x10000
+; special handlers
+S_NONE    equ 0
+S_SKIP    equ 1
+S_STYLE   equ 2
+S_TITLE   equ 3
+S_TABLE   equ 4
+S_A       equ 5
+S_IMG     equ 6
+S_INPUT   equ 7
+S_BUTTON  equ 8
+S_TEXTAREA equ 9
+S_FORM    equ 10
+S_BR      equ 11
+S_HR      equ 12
+S_LI      equ 13
+S_LIST    equ 14
+S_BODY    equ 15
+S_META    equ 16
+S_FONT    equ 17
+S_CELL    equ 18
+S_SELECT  equ 19
+S_OL      equ 20
+; cell flags (BRX)
+FX_BOLD   equ 0x01
+FX_UL     equ 0x02
+FX_STR    equ 0x04
+FX_CODE   equ 0x08
+FX_CTL    equ 0x10
+FX_BIG    equ 0x20
+FX_RT     equ 0x40
+FX_LO     equ 0x80
+; colours
+BC_SET    equ 0x1000000
+BC_LINK   equ 0x2000000             ; "default link colour" marker
+; line-drawing characters
+BL_H      equ 1
+BL_V      equ 2
+BL_TL     equ 3
+BL_TR     equ 4
+BL_BL     equ 5
+BL_BR     equ 6
+BL_LT     equ 7
+BL_RT     equ 8
+BL_TT     equ 14
+BL_BT     equ 15
+BL_X      equ 16
 
-app_browser:
+; ------------------------------------------------------------- line breaks ----
+; br_linefin: finishes the current line: text alignment inside [x0,x1) and the
+; background colour of the enclosing block
+br_linefin:
     PUSHA
-    lea rsi, [p_www_idx]
-    lea rdi, [br_loc]
-    call strcpy
-    call br_run
-    POPA
-    ret
-
-browser_open:                       ; rax = file slot of a page (called from Files)
-    PUSHA
-    mov rsi, rax
-    lea rdi, [br_loc]
-    call strcpy
-    call br_run
-    POPA
-    ret
-
-; ------------------------------------------------------------- cell helpers --
-br_nl:
-    mov dword [br_col], 0
-    cmp dword [br_row], BR_MAXR-1
+    mov ebx, [br_row]
+    mov r12d, [br_lineh]
+    mov r13d, [br_x0]
+    mov r14d, [br_x1]
+    movzx eax, byte [br_al]
+    test eax, eax
+    jz .bg
+    imul edi, ebx, COLS
+    mov ecx, r14d
+.fe:
+    cmp ecx, r13d
+    jbe .bg
+    lea edx, [rdi+rcx-1]
+    cmp byte [BRC+rdx], ' '
+    jne .got
+    test byte [BRX+rdx], FX_CTL
+    jnz .got
+    dec ecx
+    jmp .fe
+.got:
+    mov esi, ecx
+    sub esi, r13d                   ; used length
+    mov eax, r14d
+    sub eax, r13d
+    sub eax, esi                    ; free columns
+    jle .bg
+    cmp byte [br_al], 2
+    je .sh
+    shr eax, 1
+.sh:
+    test eax, eax
+    jz .bg
+    xor ebp, ebp
+.rw:
+    cmp ebp, r12d
+    jae .bg
+    lea edx, [rbx+rbp]
+    call br_shiftrow                ; edx = row, eax = shift, esi = length, r13d = x0
+    inc ebp
+    jmp .rw
+.bg:
+    mov eax, [br_bbg]
+    test eax, eax
+    jz .o
+    xor ebp, ebp
+.br:
+    cmp ebp, r12d
     jae .o
-    inc dword [br_row]
+    lea edx, [rbx+rbp]
+    imul edx, COLS
+    add edx, r13d
+    mov ecx, r14d
+    sub ecx, r13d
+    jle .nr
+.bc:
+    cmp dword [BRB+rdx*4], 0
+    jne .bn
+    mov [BRB+rdx*4], eax
+.bn:
+    inc edx
+    dec ecx
+    jnz .bc
+.nr:
+    inc ebp
+    jmp .br
+.o: POPA
+    ret
+
+; br_shiftrow: edx = row, eax = shift (columns), esi = length, r13d = first column
+br_shiftrow:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+    push r8
+    push r9
+    imul edx, COLS
+    add edx, r13d                   ; index of the first cell
+    mov r8d, eax
+    mov ecx, esi
+.l: dec ecx
+    js .clr
+    lea ebx, [rdx+rcx]              ; source
+    lea edi, [rbx+r8]               ; destination
+    mov al, [BRC+rbx]
+    mov [BRC+rdi], al
+    mov al, [BRA+rbx]
+    mov [BRA+rdi], al
+    mov al, [BRX+rbx]
+    mov [BRX+rdi], al
+    mov r9d, [BRF+rbx*4]
+    mov [BRF+rdi*4], r9d
+    mov r9d, [BRB+rbx*4]
+    mov [BRB+rdi*4], r9d
+    jmp .l
+.clr:
+    mov ecx, r8d
+    cmp ecx, esi
+    jbe .c1
+    mov ecx, esi
+.c1:
+    ; the vacated cells at the start (at most min(shift,len) of them)
+    mov ecx, r8d
+    cmp ecx, esi
+    jb .c2
+    mov ecx, esi
+.c2:
+    xor ebx, ebx
+.cl:
+    cmp ebx, ecx
+    jae .d
+    lea edi, [rdx+rbx]
+    mov byte [BRC+rdi], ' '
+    mov byte [BRA+rdi], 0
+    mov byte [BRX+rdi], 0
+    mov dword [BRF+rdi*4], 0
+    mov dword [BRB+rdi*4], 0
+    inc ebx
+    jmp .cl
+.d: pop r9
+    pop r8
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+br_nl:
+    cmp dword [br_hid], 0
+    jne .o
+    call br_linefin
+    mov eax, [br_row]
+    add eax, [br_lineh]
+    cmp eax, BR_MAXR-6
+    jbe .ok
+    mov eax, BR_MAXR-6
+.ok:
+    mov [br_row], eax
+    mov dword [br_lineh], 1
+    mov eax, [br_x0]
+    mov [br_col], eax
 .o: ret
 
 br_nl_if:
-    cmp dword [br_col], 0
+    mov eax, [br_col]
+    cmp eax, [br_x0]
     je .o
     call br_nl
 .o: ret
 
-br_put:                             ; al = char
+; br_wcell: ebx = cell index, al = char, dl = style flags -> writes all planes
+br_wcell:
+    push rdx
+    mov [BRC+rbx], al
+    mov [BRX+rbx], dl
+    mov dl, [br_lk]
+    mov [BRA+rbx], dl
+    mov edx, [br_fg]
+    mov [BRF+rbx*4], edx
+    mov edx, [br_bg]
+    mov [BRB+rbx*4], edx
+    pop rdx
+    ret
+
+; br_gapnow: a pending paragraph gap becomes a blank row (only at the start of a line)
+br_gapnow:
+    cmp byte [br_gap], 0
+    je .o
+    mov byte [br_gap], 0
+    push rax
+    mov eax, [br_col]
+    cmp eax, [br_x0]
+    jne .d
+    mov eax, [br_row]
+    cmp eax, [br_rtop]
+    jbe .d
+    call br_nl
+.d: pop rax
+.o: ret
+
+; br_put: al = character; writes one cell (two by two for big text)
+br_put:
     push rbx
     push rcx
-    cmp dword [br_col], COLS-2
-    jb .ok
+    push rdx
+    cmp dword [br_hid], 0
+    jne .out
+    call br_gapnow
+.w1:
+    mov ecx, 1
+    test byte [br_fl], FX_BIG
+    jz .w2
+    mov ecx, 2
+.w2:
+    mov edx, [br_col]
+    add edx, ecx
+    cmp edx, [br_x1]
+    jbe .fit
+    mov edx, [br_col]
+    cmp edx, [br_x0]
+    je .fit
     push rax
     call br_nl
     pop rax
-.ok:
+    jmp .w1
+.fit:
+    mov edx, [br_col]
+    add edx, ecx
+    cmp edx, COLS-2
+    ja .out
     mov ebx, [br_row]
-    cmp ebx, BR_MAXR-1
-    jae .out
     imul ebx, COLS
     add ebx, [br_col]
-    mov [BRC+rbx], al
-    mov cl, [br_att]
-    mov [BRA+rbx], cl
-    inc dword [br_col]
+    movzx edx, byte [br_fl]
+    call br_wcell
+    cmp ecx, 2
+    jne .adv
+    mov dword [br_lineh], 2
+    or dl, FX_RT
+    inc ebx
+    call br_wcell
+    or dl, FX_LO
+    add ebx, COLS
+    call br_wcell
+    and dl, ~FX_RT
+    dec ebx
+    call br_wcell
+.adv:
+    add [br_col], ecx
 .out:
+    pop rdx
     pop rcx
     pop rbx
+    ret
+
+; br_putfx: al = char, dl = extra style flags ORed in (controls, lines)
+br_putfx:
+    push rdx
+    or [br_fl], dl
+    call br_put
+    pop rdx
+    not dl
+    and [br_fl], dl
     ret
 
 ; br_emit: al = visible or blank character; collapses blanks, wraps words, fills pre and title
@@ -15339,6 +15766,8 @@ br_emit:
     push rsi
     cmp byte [br_ttl], 0
     jne .ttl
+    cmp dword [br_hid], 0
+    jne .o
     cmp byte [br_pre], 0
     jne .pre
     cmp al, ' '
@@ -15349,28 +15778,54 @@ br_emit:
     cmp byte [br_pend], 0
     je .emit
     mov byte [br_pend], 0
-    cmp dword [br_col], 0
+    mov edx, [br_col]
+    cmp edx, [br_x0]
     je .emit
     push rax
     mov rdx, [br_rp]
+    mov rsi, [br_end]
     xor ecx, ecx
 .wl:
-    cmp rdx, [br_end]
+    cmp rdx, rsi
     jae .we
-    mov bl, [rdx]
+    movzx ebx, byte [rdx]
     cmp bl, ' '
     jbe .we
     cmp bl, '<'
     je .we
-    inc ecx
     inc rdx
+    cmp bl, '&'
+    jne .w1
+    mov eax, 10
+.ws:
+    cmp rdx, rsi
+    jae .w1
+    cmp byte [rdx], ';'
+    je .wsd
+    cmp byte [rdx], ' '
+    jbe .w1
+    inc rdx
+    dec eax
+    jnz .ws
+    jmp .w1
+.wsd:
+    inc rdx
+.w1:
+    and bl, 0xC0
+    cmp bl, 0x80
+    je .wl                          ; UTF-8 continuation byte: not a new character
+    inc ecx
     jmp .wl
 .we:
-    inc ecx
+    add ecx, 2                      ; the blank and the current character
+    test byte [br_fl], FX_BIG
+    jz .w2
+    add ecx, ecx
+.w2:
     add ecx, [br_col]
-    cmp ecx, COLS-3
+    cmp ecx, [br_x1]
     pop rax
-    jae .wrap
+    ja .wrap
     push rax
     mov al, ' '
     call br_put
@@ -15424,7 +15879,37 @@ br_emits:                           ; rsi = zstr
     pop rsi
     ret
 
-; br_cp: eax = unicode code point -> emits an ASCII approximation
+; ------------------------------------------------------------ characters ------
+; br_cpmap: eax = unicode -> eax = code page byte, or 0 when there is no glyph for it
+br_cpmap:
+    push rdx
+    cmp eax, 0x410
+    jb .t
+    cmp eax, 0x42F
+    ja .l
+    lea eax, [rax-0x410+128]
+    jmp .r
+.l: cmp eax, 0x44F
+    ja .t
+    cmp eax, 0x430
+    jb .t
+    lea eax, [rax-0x430+160]
+    jmp .r
+.t: lea rdx, [cpm_tab]
+.n: cmp word [rdx], 0
+    je .no
+    cmp ax, [rdx]
+    je .f
+    add rdx, 4
+    jmp .n
+.f: movzx eax, word [rdx+2]
+    jmp .r
+.no:
+    xor eax, eax
+.r: pop rdx
+    ret
+
+; br_cp: eax = unicode code point -> emits a character (or an ASCII approximation)
 br_cp:
     push rax
     push rbx
@@ -15444,40 +15929,22 @@ br_cp:
     call br_emit
     jmp .o
 .n1:
+    mov ebx, eax
+    call br_cpmap
+    test eax, eax
+    jz .nm
+    call br_emit
+    jmp .o
+.nm:
+    mov eax, ebx
     cmp eax, 0xC0
     jb .misc
     cmp eax, 0x100
-    jae .big
+    jae .misc
     lea rbx, [lat1_tab]
     mov al, [rbx+rax-0xC0]
     call br_emit
     jmp .o
-.big:
-    cmp eax, 0x401
-    je .yoU
-    cmp eax, 0x451
-    je .yoL
-    cmp eax, 0x410
-    jb .misc
-    cmp eax, 0x44F
-    ja .misc
-    sub eax, 0x410
-    lea rbx, [cyr_tab]
-    mov eax, [rbx+rax*4]
-.cy:
-    test al, al
-    jz .o
-    push rax
-    call br_emit
-    pop rax
-    shr eax, 8
-    jmp .cy
-.yoU:
-    mov eax, 'Yo'
-    jmp .cy
-.yoL:
-    mov eax, 'yo'
-    jmp .cy
 .misc:
     lea rbx, [misc_tab]
 .m: cmp word [rbx], 0
@@ -15496,6 +15963,50 @@ br_cp:
 .o: pop rsi
     pop rbx
     pop rax
+    ret
+
+; br_u8cp: rsi -> utf-8 sequence; returns al = code page byte (or '?'), rsi advanced
+br_u8cp:
+    push rbx
+    push rcx
+    movzx eax, byte [rsi]
+    inc rsi
+    cmp eax, 0x80
+    jb .r
+    cmp eax, 0xC0
+    jb .q
+    mov ebx, eax
+    mov ecx, 1
+    and eax, 0x1F
+    cmp bl, 0xE0
+    jb .l
+    mov ecx, 2
+    and eax, 0x0F
+    cmp bl, 0xF0
+    jb .l
+    mov ecx, 3
+    and eax, 0x07
+.l: movzx ebx, byte [rsi]
+    mov edx, ebx
+    and edx, 0xC0
+    cmp edx, 0x80
+    jne .e
+    shl eax, 6
+    and ebx, 0x3F
+    or eax, ebx
+    inc rsi
+    dec ecx
+    jnz .l
+.e: cmp eax, 0xA0
+    jne .m
+    mov al, ' '
+    jmp .r
+.m: call br_cpmap
+    test eax, eax
+    jnz .r
+.q: mov al, '?'
+.r: pop rcx
+    pop rbx
     ret
 
 ; br_entity: rsi just behind '&'; emits the character and moves rsi, or emits '&' alone
@@ -15601,6 +16112,7 @@ br_entity:
     pop rax
     ret
 
+; ------------------------------------------------------------ text search -----
 ; br_find: rsi = start, rdi = lower-case needle -> rsi = match (or the end of the page)
 br_find:
     push rax
@@ -15646,7 +16158,7 @@ br_attr:
     inc rsi
     jmp .sk
 .nm:
-    mov rbx, rdi                    ; compare the attribute name
+    mov rbx, rdi
     mov rdx, rsi
 .cn:
     mov al, [rbx]
@@ -15663,9 +16175,19 @@ br_attr:
     mov al, [rdx]
     cmp al, '='
     je .val
+    cmp al, ' '
+    jbe .bare
+    cmp al, '/'
+    je .bare
+    cmp al, '>'
+    je .bare
     jmp .other
+.bare:                              ; attribute without a value (disabled, checked ...)
+    xor ecx, ecx
+    mov rdx, rsi
+    xor eax, eax
+    jmp .r
 .other:
-    ; skip this attribute (name, optional =value)
 .on:
     cmp rsi, r8
     jae .no
@@ -15734,7 +16256,7 @@ br_attr:
 .vz:
     mov rcx, rsi
     sub rcx, rdx
-    xor eax, eax                    ; ZF=1
+    xor eax, eax
     jmp .r
 .no:
     xor ecx, ecx
@@ -15745,7 +16267,1965 @@ br_attr:
     pop rax
     ret
 
-; ------------------------------------------------------------- render -------
+; ----------------------------------------------------------- style frames -----
+; frame (64 bytes): +0 tag, +8 fg, +12 bg, +16 block bg, +20 flags, +21 align, +22 pre, +23 title,
+;                   +24 x0, +28 x1, +32 hidden, +36 list counter, +40 list kind, +41 item, +42 form,
+;                   +43 border, +44 tag flags
+; br_fr_push: rax = tag, edx = tag flags -> CF=1 when the stack is full
+br_fr_push:
+    push rcx
+    push rdi
+    mov ecx, [br_sp]
+    cmp ecx, BR_NFR
+    jae .full
+    imul ecx, ecx, 64
+    lea rdi, [BR_STK+rcx]
+    mov [rdi], rax
+    mov ecx, [br_fg]
+    mov [rdi+8], ecx
+    mov ecx, [br_bg]
+    mov [rdi+12], ecx
+    mov ecx, [br_bbg]
+    mov [rdi+16], ecx
+    mov cl, [br_fl]
+    mov [rdi+20], cl
+    mov cl, [br_al]
+    mov [rdi+21], cl
+    mov cl, [br_pre]
+    mov [rdi+22], cl
+    mov cl, [br_ttl]
+    mov [rdi+23], cl
+    mov ecx, [br_x0]
+    mov [rdi+24], ecx
+    mov ecx, [br_x1]
+    mov [rdi+28], ecx
+    mov ecx, [br_hid]
+    mov [rdi+32], ecx
+    mov ecx, [br_lctr]
+    mov [rdi+36], ecx
+    mov cl, [br_lkind]
+    mov [rdi+40], cl
+    mov cl, [br_lk]
+    mov [rdi+41], cl
+    mov cl, [br_form]
+    mov [rdi+42], cl
+    mov cl, [br_bord]
+    mov [rdi+43], cl
+    mov [rdi+44], edx
+    mov ecx, [el_bloom]
+    mov [rdi+48], ecx
+    mov ecx, [el_idh]
+    mov [rdi+52], ecx
+    inc dword [br_sp]
+    clc
+    jmp .o
+.full:
+    stc
+.o: pop rdi
+    pop rcx
+    ret
+
+; br_fr_pop: ecx = frame index; restores the state saved in it and drops it and everything above
+br_fr_pop:
+    push rax
+    push rdx
+    push rdi
+    mov [br_sp], ecx
+    imul ecx, ecx, 64
+    lea rdi, [BR_STK+rcx]
+    mov eax, [rdi+8]
+    mov [br_fg], eax
+    mov eax, [rdi+12]
+    mov [br_bg], eax
+    mov eax, [rdi+16]
+    mov [br_bbg], eax
+    mov al, [rdi+20]
+    mov [br_fl], al
+    mov al, [rdi+21]
+    mov [br_al], al
+    mov al, [rdi+22]
+    mov [br_pre], al
+    mov al, [rdi+23]
+    mov [br_ttl], al
+    mov eax, [rdi+32]
+    mov [br_hid], eax
+    test dword [rdi+44], TF_LIST
+    jz .nl
+    mov eax, [rdi+36]
+    mov [br_lctr], eax
+.nl:
+    mov al, [rdi+40]
+    mov [br_lkind], al
+    mov al, [rdi+41]
+    mov [br_lk], al
+    mov al, [rdi+42]
+    mov [br_form], al
+    mov al, [rdi+43]
+    mov [br_bord], al
+    mov edx, [br_x0]                ; the column follows the left margin when it was at the margin
+    mov eax, [rdi+24]
+    cmp [br_col], edx
+    jne .nc
+    mov [br_col], eax
+.nc:
+    mov [br_x0], eax
+    mov eax, [rdi+28]
+    mov [br_x1], eax
+    pop rdi
+    pop rdx
+    pop rax
+    ret
+
+; br_setx0: eax = new left margin (the column moves with it when it is at the margin)
+br_setx0:
+    push rdx
+    mov edx, [br_x0]
+    cmp [br_col], edx
+    jne .n
+    mov [br_col], eax
+.n: mov [br_x0], eax
+    pop rdx
+    ret
+
+; ---- end html1.inc
+; ---- begin html2.inc
+; =============================================================================
+;  HTML renderer, part 2: CSS (colours, declarations, style sheets, selectors)
+;  Supported: tag, .class, #id selectors (also .a.b, tag.class), descendant (a b)
+;  and child (a > b) combinators, comma lists.  Pseudo classes / attribute
+;  selectors / @media are skipped.  Properties: color, background(-color),
+;  font-weight, font-size (big or normal), text-decoration, text-align, display,
+;  visibility, padding-left, margin-left, width, border, list-style.
+; =============================================================================
+
+; decl (32 bytes): +0 fg, +4 bg, +8 set flags, +12 clear flags, +16 align, +17 display none,
+;                  +18 border (1 on, 2 off), +19 indent+1, +20 width, +24 list-style none
+; rule (96 bytes): +0 count, +1 comb1, +2 comb2, +4 specificity, +8 comp0, +24 comp1, +40 comp2, +56 decl
+;   compound (16): +0 tag, +8 req1, +12 req2     (req: 0 none, else hash|bit31 for an id)
+
+; ----------------------------------------------------------------- colours ----
+css_hex:                            ; al -> eax = 0..15, or -1
+    movzx eax, al
+    cmp al, '0'
+    jb .no
+    cmp al, '9'
+    jbe .d
+    or al, 0x20
+    cmp al, 'a'
+    jb .no
+    cmp al, 'f'
+    ja .no
+    sub eax, 'a'-10
+    ret
+.d: sub eax, '0'
+    ret
+.no:
+    mov eax, -1
+    ret
+
+; css_color: rsi = text, ecx = length -> eax = BC_SET|rgb, or 0 when it is not a colour
+css_color:
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    push rcx
+    push r8
+    push r9
+.sp:
+    test ecx, ecx
+    jz .no
+    cmp byte [rsi], ' '
+    ja .go
+    inc rsi
+    dec ecx
+    jmp .sp
+.go:
+    cmp byte [rsi+rcx-1], ' '
+    ja .t2
+    dec ecx
+    jnz .go
+    jmp .no
+.t2:
+    cmp byte [rsi], '#'
+    je .hex
+    mov eax, [rsi]
+    or eax, 0x20202020
+    and eax, 0x00FFFFFF
+    cmp eax, 0x626772               ; "rgb"
+    je .rgb
+    jmp .named
+.hex:
+    inc rsi
+    dec ecx
+    xor ebx, ebx                    ; value
+    xor edx, edx                    ; digits
+    mov r8d, ecx
+.hl:
+    test ecx, ecx
+    jz .hd
+    mov al, [rsi]
+    call css_hex
+    test eax, eax
+    js .no
+    shl ebx, 4
+    or ebx, eax
+    inc rsi
+    dec ecx
+    inc edx
+    jmp .hl
+.hd:
+    cmp edx, 3
+    je .h3
+    cmp edx, 4
+    je .h4
+    cmp edx, 6
+    je .h6
+    cmp edx, 8
+    je .h8
+    jmp .no
+.h4:
+    shr ebx, 4                      ; drop the alpha digit
+.h3:
+    mov eax, ebx
+    and eax, 0xF
+    mov edx, eax
+    shl eax, 4
+    or eax, edx                     ; b
+    mov r9d, eax
+    mov eax, ebx
+    shr eax, 4
+    and eax, 0xF
+    mov edx, eax
+    shl eax, 4
+    or eax, edx                     ; g
+    shl eax, 8
+    or r9d, eax
+    mov eax, ebx
+    shr eax, 8
+    and eax, 0xF
+    mov edx, eax
+    shl eax, 4
+    or eax, edx                     ; r
+    shl eax, 16
+    or eax, r9d
+    jmp .set
+.h8:
+    shr ebx, 8
+.h6:
+    mov eax, ebx
+    jmp .set
+.rgb:
+    xor ebx, ebx
+    xor r8d, r8d                    ; component count
+.rl:
+    test ecx, ecx
+    jz .rd
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .rs
+    xor edx, edx
+.rn:
+    test ecx, ecx
+    jz .rv
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .rv
+    imul edx, 10
+    add edx, eax
+    inc rsi
+    dec ecx
+    jmp .rn
+.rv:
+    test ecx, ecx
+    jz .rq
+    cmp byte [rsi], '.'
+    jne .rp
+.rf:
+    inc rsi
+    dec ecx
+    jz .rq
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 9
+    jbe .rf
+.rp:
+    test ecx, ecx
+    jz .rq
+    cmp byte [rsi], '%'
+    jne .rq
+    imul edx, 255
+    mov eax, edx
+    xor edx, edx
+    mov r9d, 100
+    div r9d
+    mov edx, eax
+    inc rsi
+    dec ecx
+.rq:
+    cmp edx, 255
+    jbe .rc
+    mov edx, 255
+.rc:
+    cmp r8d, 3
+    jae .rs
+    shl ebx, 8
+    or ebx, edx
+    inc r8d
+.rs:
+    test ecx, ecx
+    jz .rd
+    inc rsi
+    dec ecx
+    jmp .rl
+.rd:
+    cmp r8d, 3
+    jne .no
+    mov eax, ebx
+    jmp .set
+.named:
+    lea rdi, [css_names]
+.nl:
+    cmp byte [rdi], 0
+    je .no
+    mov rdx, rdi
+    xor ebx, ebx
+.nc:
+    mov al, [rdx]
+    test al, al
+    jz .ne
+    cmp ebx, ecx
+    jae .nx
+    mov ah, [rsi+rbx]
+    or ah, 0x20
+    cmp al, ah
+    jne .nx
+    inc rdx
+    inc ebx
+    jmp .nc
+.ne:
+    cmp ebx, ecx
+    jne .nx
+    mov eax, [rdx+1]
+    jmp .set
+.nx:
+.sk:
+    cmp byte [rdi], 0
+    je .sk2
+    inc rdi
+    jmp .sk
+.sk2:
+    add rdi, 5
+    jmp .nl
+.set:
+    and eax, 0xFFFFFF
+    or eax, BC_SET
+    jmp .r
+.no:
+    xor eax, eax
+.r: pop r9
+    pop r8
+    pop rcx
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    ret
+
+; css_num: rsi = text, ecx = length -> eax = value*100, edx = unit (0 none 1 px 2 em 3 % 4 pt 5 other),
+;          rsi/ecx advanced; CF=1 when there is no number
+css_num:
+    push rbx
+    push r8
+    push r9
+.sp:
+    test ecx, ecx
+    jz .no
+    cmp byte [rsi], ' '
+    ja .a
+    inc rsi
+    dec ecx
+    jmp .sp
+.a: xor r8d, r8d                    ; sign
+    cmp byte [rsi], '-'
+    jne .b
+    mov r8d, 1
+    inc rsi
+    dec ecx
+    jz .no
+    jmp .c
+.b: cmp byte [rsi], '+'
+    jne .c
+    inc rsi
+    dec ecx
+    jz .no
+.c: xor eax, eax
+    xor ebx, ebx                    ; digits seen
+.d: test ecx, ecx
+    jz .e
+    movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .e
+    imul eax, 10
+    add eax, edx
+    cmp eax, 100000
+    jb .d1
+    mov eax, 100000
+.d1:
+    inc ebx
+    inc rsi
+    dec ecx
+    jmp .d
+.e: imul eax, 100
+    test ecx, ecx
+    jz .f
+    cmp byte [rsi], '.'
+    jne .f
+    inc rsi
+    dec ecx
+    mov r9d, 10                     ; weight of the next decimal digit
+.g: test ecx, ecx
+    jz .f
+    movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .f
+    imul edx, r9d
+    add eax, edx
+    cmp r9d, 10
+    jne .g1
+    mov r9d, 1
+    jmp .g2
+.g1:
+    xor r9d, r9d
+.g2:
+    inc ebx
+    inc rsi
+    dec ecx
+    jmp .g
+.f: test ebx, ebx
+    jz .no
+    test r8d, r8d
+    jz .u
+    neg eax
+.u: xor edx, edx
+    test ecx, ecx
+    jz .ok
+    cmp byte [rsi], '%'
+    jne .u1
+    mov edx, 3
+    inc rsi
+    dec ecx
+    jmp .ok
+.u1:
+    movzx ebx, byte [rsi]
+    or bl, 0x20
+    cmp bl, 'a'
+    jb .ok
+    cmp bl, 'z'
+    ja .ok
+    xor r8d, r8d                    ; letters packed little-endian (first letter lowest)
+    xor r9d, r9d                    ; count
+.u2:
+    test ecx, ecx
+    jz .u3
+    movzx ebx, byte [rsi]
+    or bl, 0x20
+    cmp bl, 'a'
+    jb .u3
+    cmp bl, 'z'
+    ja .u3
+    cmp r9d, 3
+    jae .u2n
+    mov r10d, r9d
+    shl r10d, 3
+    push rcx
+    mov ecx, r10d
+    shl ebx, cl
+    pop rcx
+    or r8d, ebx
+.u2n:
+    inc r9d
+    inc rsi
+    dec ecx
+    jmp .u2
+.u3:
+    mov edx, 5
+    cmp r8d, 0x7870                 ; "px"
+    jne .u4
+    mov edx, 1
+    jmp .ok
+.u4:
+    cmp r8d, 0x6D65                 ; "em"
+    jne .u5
+    mov edx, 2
+    jmp .ok
+.u5:
+    cmp r8d, 0x6D6572               ; "rem"
+    jne .u6
+    mov edx, 2
+    jmp .ok
+.u6:
+    cmp r8d, 0x7470                 ; "pt"
+    jne .ok
+    mov edx, 4
+.ok:
+    clc
+    jmp .r
+.no:
+    stc
+.r: pop r9
+    pop r8
+    pop rbx
+    ret
+
+; css_px: eax = value*100, edx = unit -> eax = pixels
+css_px:
+    cmp edx, 2
+    je .em
+    cmp edx, 4
+    je .pt
+    cmp edx, 3
+    je .pc
+    cdq
+    mov ecx, 100
+    idiv ecx
+    ret
+.em:
+    imul eax, 16
+    cdq
+    mov ecx, 100
+    idiv ecx
+    ret
+.pt:
+    imul eax, 4
+    cdq
+    mov ecx, 300
+    idiv ecx
+    ret
+.pc:
+    imul eax, 16
+    cdq
+    mov ecx, 10000
+    idiv ecx
+    ret
+
+; css_word: rsi = text, ecx = length, rdi = lower-case word -> ZF=1 when the word occurs in the text
+css_word:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+.s: test ecx, ecx
+    jz .no
+    mov rbx, rsi
+    mov rdx, rdi
+.c: mov al, [rdx]
+    test al, al
+    jz .yes
+    mov ah, [rbx]
+    or ah, 0x20
+    cmp al, ah
+    jne .n
+    inc rbx
+    inc rdx
+    jmp .c
+.n: inc rsi
+    dec ecx
+    jmp .s
+.yes:
+    xor eax, eax
+    jmp .r
+.no:
+    or eax, 1
+.r: pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------ declarations ----
+; css_decls: rsi = text, ecx = length, rdi = decl (zeroed by the caller)
+css_decls:
+    PUSHA
+    mov r8, rdi
+    mov r9, rsi
+    lea r10, [rsi+rcx]
+.next:
+    cmp r9, r10
+    jae .done
+    mov al, [r9]
+    cmp al, ' '
+    jbe .skip1
+    cmp al, ';'
+    je .skip1
+    jmp .prop
+.skip1:
+    inc r9
+    jmp .next
+.prop:
+    mov r11, r9                     ; property name
+.pn:
+    cmp r9, r10
+    jae .done
+    mov al, [r9]
+    cmp al, ':'
+    je .colon
+    cmp al, ';'
+    je .next
+    inc r9
+    jmp .pn
+.colon:
+    mov r12, r9                     ; end of the name
+    inc r9
+    mov r13, r9                     ; value start
+    xor edx, edx                    ; parenthesis depth
+    xor eax, eax                    ; quote
+.vn:
+    cmp r9, r10
+    jae .ve
+    movzx ebx, byte [r9]
+    test al, al
+    jz .vq0
+    cmp bl, al
+    jne .vn1
+    xor eax, eax
+    jmp .vn1
+.vq0:
+    cmp bl, '"'
+    je .vq
+    cmp bl, 39
+    je .vq
+    cmp bl, '('
+    jne .v1
+    inc edx
+    jmp .vn1
+.v1:
+    cmp bl, ')'
+    jne .v2
+    test edx, edx
+    jz .vn1
+    dec edx
+    jmp .vn1
+.v2:
+    cmp bl, ';'
+    jne .vn1
+    test edx, edx
+    jz .ve
+    jmp .vn1
+.vq:
+    mov eax, ebx
+.vn1:
+    inc r9
+    jmp .vn
+.ve:
+    mov r14, r9                     ; value end
+    ; trim the name
+.tn:
+    cmp r12, r11
+    jbe .nm
+    cmp byte [r12-1], ' '
+    ja .nm
+    dec r12
+    jmp .tn
+.nm:
+    ; cut "!important"
+    mov rsi, r13
+    mov rcx, r14
+    sub rcx, r13
+.im:
+    test rcx, rcx
+    jz .im2
+    cmp byte [rsi+rcx-1], '!'
+    je .imf
+    dec rcx
+    jmp .im
+.imf:
+    dec rcx
+    mov r14, r13
+    add r14, rcx
+    jmp .im2
+.im2:
+    mov rsi, r11
+    mov rcx, r12
+    sub rcx, r11
+    call css_prop                   ; -> eax = property id
+    test eax, eax
+    jz .next
+    mov rsi, r13
+    mov rcx, r14
+    sub rcx, r13
+    mov rdi, r8
+    call css_setprop
+    jmp .next
+.done:
+    POPA
+    ret
+
+; css_prop: rsi = name, rcx = length -> eax = property id (0 unknown)
+css_prop:
+    push rbx
+    push rdx
+    push rdi
+    lea rdi, [css_props]
+.l: cmp byte [rdi], 0
+    je .no
+    mov rdx, rdi
+    xor ebx, ebx
+.c: mov al, [rdx]
+    test al, al
+    jz .e
+    cmp ebx, ecx
+    jae .n
+    mov ah, [rsi+rbx]
+    or ah, 0x20
+    cmp al, ah
+    jne .n
+    inc rdx
+    inc ebx
+    jmp .c
+.e: cmp ebx, ecx
+    jne .n
+    movzx eax, byte [rdx+1]
+    jmp .r
+.n:
+.s: cmp byte [rdi], 0
+    je .s2
+    inc rdi
+    jmp .s
+.s2:
+    add rdi, 2
+    jmp .l
+.no:
+    xor eax, eax
+.r: pop rdi
+    pop rdx
+    pop rbx
+    ret
+
+; css_setprop: eax = property id, rsi = value, ecx = length, rdi = decl
+css_setprop:
+    PUSHA
+    mov r8, rdi
+    mov r9d, eax
+    cmp eax, 1
+    je .color
+    cmp eax, 2
+    je .bgc
+    cmp eax, 3
+    je .bg
+    cmp eax, 4
+    je .weight
+    cmp eax, 5
+    je .deco
+    cmp eax, 6
+    je .align
+    cmp eax, 7
+    je .disp
+    cmp eax, 8
+    je .vis
+    cmp eax, 9
+    je .size
+    cmp eax, 10
+    je .ind
+    cmp eax, 11
+    je .ind
+    cmp eax, 12
+    je .width
+    cmp eax, 13
+    je .border
+    cmp eax, 14
+    je .list
+    cmp eax, 15
+    je .font
+    jmp .o
+.color:
+    call css_color
+    test eax, eax
+    jz .o
+    mov [r8], eax
+    jmp .o
+.bgc:
+    call css_color
+    test eax, eax
+    jz .o
+    mov [r8+4], eax
+    jmp .o
+.bg:                                ; shorthand: the first token that is a colour
+    mov r10, rsi
+    lea r11, [rsi+rcx]
+.bt:
+    cmp r10, r11
+    jae .o
+    cmp byte [r10], ' '
+    ja .bs
+    inc r10
+    jmp .bt
+.bs:
+    mov rsi, r10
+    xor edx, edx                    ; paren depth
+.bk:
+    cmp r10, r11
+    jae .bd
+    mov al, [r10]
+    cmp al, '('
+    jne .b1
+    inc edx
+    jmp .b3
+.b1:
+    cmp al, ')'
+    jne .b2
+    test edx, edx
+    jz .b3
+    dec edx
+    jmp .b3
+.b2:
+    cmp al, ' '
+    ja .b3
+    test edx, edx
+    jz .bd
+.b3:
+    inc r10
+    jmp .bk
+.bd:
+    mov rcx, r10
+    sub rcx, rsi
+    call css_color
+    test eax, eax
+    jz .bt
+    mov [r8+4], eax
+    jmp .o
+.weight:
+    lea rdi, [cw_bold]
+    call css_word
+    jz .wb
+    lea rdi, [cw_bolder]
+    call css_word
+    jz .wb
+    lea rdi, [cw_normal]
+    call css_word
+    jz .wn
+    lea rdi, [cw_lighter]
+    call css_word
+    jz .wn
+    call css_num
+    jc .o
+    cmp eax, 60000
+    jae .wb
+.wn:
+    or dword [r8+12], FX_BOLD
+    and dword [r8+8], ~FX_BOLD
+    jmp .o
+.wb:
+    or dword [r8+8], FX_BOLD
+    and dword [r8+12], ~FX_BOLD
+    jmp .o
+.deco:
+    lea rdi, [cw_underl]
+    call css_word
+    jnz .d1
+    or dword [r8+8], FX_UL
+    and dword [r8+12], ~FX_UL
+.d1:
+    lea rdi, [cw_linet]
+    call css_word
+    jnz .d2
+    or dword [r8+8], FX_STR
+    and dword [r8+12], ~FX_STR
+.d2:
+    lea rdi, [cw_none]
+    call css_word
+    jnz .o
+    or dword [r8+12], FX_UL|FX_STR
+    and dword [r8+8], ~(FX_UL|FX_STR)
+    jmp .o
+.align:
+    lea rdi, [cw_center]
+    call css_word
+    jnz .a1
+    mov byte [r8+16], 2
+    jmp .o
+.a1:
+    lea rdi, [cw_right]
+    call css_word
+    jnz .a2
+    mov byte [r8+16], 3
+    jmp .o
+.a2:
+    lea rdi, [cw_left]
+    call css_word
+    jnz .a3
+    mov byte [r8+16], 1
+    jmp .o
+.a3:
+    lea rdi, [cw_start]
+    call css_word
+    jnz .a4
+    mov byte [r8+16], 1
+    jmp .o
+.a4:
+    lea rdi, [cw_justify]
+    call css_word
+    jnz .o
+    mov byte [r8+16], 1
+    jmp .o
+.disp:
+    lea rdi, [cw_none]
+    call css_word
+    jnz .o
+    mov byte [r8+17], 1
+    jmp .o
+.vis:
+    lea rdi, [cw_hidden]
+    call css_word
+    jnz .o
+    mov byte [r8+17], 1
+    jmp .o
+.size:
+    lea rdi, [cw_xxl]
+    call css_word
+    jz .big
+    lea rdi, [cw_xl]
+    call css_word
+    jz .big
+    lea rdi, [cw_medium]
+    call css_word
+    jz .nbig
+    lea rdi, [cw_small]
+    call css_word
+    jz .nbig
+    lea rdi, [cw_large]
+    call css_word
+    jz .o
+    call css_num
+    jc .o
+    cmp edx, 3
+    jne .sz1
+    imul eax, 16                    ; percent of 16 px
+    cdq
+    push rcx
+    mov ecx, 10000
+    idiv ecx
+    pop rcx
+    jmp .sz2
+.sz1:
+    call css_px
+.sz2:
+    cmp eax, 22
+    jae .big
+.nbig:
+    or dword [r8+12], FX_BIG
+    and dword [r8+8], ~FX_BIG
+    jmp .o
+.big:
+    or dword [r8+8], FX_BIG
+    and dword [r8+12], ~FX_BIG
+    jmp .o
+.ind:
+    call css_num
+    jc .o
+    cmp edx, 3
+    je .o
+    call css_px
+    test eax, eax
+    js .o
+    shr eax, 3                      ; pixels -> columns
+    movzx edx, byte [r8+19]
+    test edx, edx
+    jz .i1
+    dec edx
+.i1:
+    add eax, edx
+    cmp eax, 40
+    jbe .i2
+    mov eax, 40
+.i2:
+    inc eax
+    mov [r8+19], al
+    jmp .o
+.width:
+    call css_num
+    jc .o
+    cmp edx, 3
+    je .wp
+    call css_px
+    shr eax, 3
+    or eax, 0x40000000
+    mov [r8+20], eax
+    jmp .o
+.wp:
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    cmp eax, 100
+    jbe .wp1
+    mov eax, 100
+.wp1:
+    or eax, 0x80000000
+    mov [r8+20], eax
+    jmp .o
+.border:
+    lea rdi, [cw_none]
+    call css_word
+    jz .bo
+    lea rdi, [cw_hidden]
+    call css_word
+    jz .bo
+    call css_num
+    jc .bon
+    test eax, eax
+    jz .bo
+.bon:
+    mov byte [r8+18], 1
+    jmp .o
+.bo:
+    mov byte [r8+18], 2
+    jmp .o
+.list:
+    lea rdi, [cw_none]
+    call css_word
+    jnz .o
+    mov byte [r8+24], 1
+    jmp .o
+.font:                              ; shorthand: only "bold" is taken from it
+    lea rdi, [cw_bold]
+    call css_word
+    jnz .o
+    or dword [r8+8], FX_BOLD
+    jmp .o
+.o: POPA
+    ret
+
+; css_apply: rdi = decl, edx = 1 when the element is a block -> changes the current style
+css_apply:
+    push rax
+    push rcx
+    mov eax, [rdi]
+    test eax, eax
+    jz .a
+    mov [br_fg], eax
+.a: mov eax, [rdi+4]
+    test eax, eax
+    jz .b
+    test edx, edx
+    jz .inl
+    mov [br_bbg], eax
+    jmp .b
+.inl:
+    mov [br_bg], eax
+.b: movzx eax, byte [br_fl]
+    mov ecx, [rdi+12]
+    not ecx
+    and eax, ecx
+    or eax, [rdi+8]
+    mov [br_fl], al
+    movzx eax, byte [rdi+16]
+    test eax, eax
+    jz .c
+    dec eax
+    mov [br_al], al
+.c: cmp byte [rdi+17], 0
+    je .d
+    inc dword [br_hid]
+.d: movzx eax, byte [rdi+18]
+    cmp eax, 1
+    jne .e1
+    mov byte [br_bord], 1
+    jmp .e0
+.e1:
+    cmp eax, 2
+    jne .e0
+    mov byte [br_bord], 0
+.e0:
+    movzx eax, byte [rdi+19]
+    test edx, edx
+    jz .f
+    test eax, eax
+    jz .f
+    dec eax
+    mov [br_eind], eax
+    mov dword [br_eindset], 1
+.f: mov eax, [rdi+20]
+    test eax, eax
+    jz .g
+    mov [br_ewidth], eax
+.g: cmp byte [rdi+24], 0
+    je .h
+    mov byte [br_lkind], 3
+.h: pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------ style sheets ----
+BR_RIX  equ BRS+0x1B000             ; rule order (indexes sorted by specificity)
+
+; css_hash: rsi = text, ecx = length -> eax = hash (never 0, bit 31 clear)
+css_hash:
+    push rcx
+    push rdx
+    push rsi
+    mov eax, 5381
+.l: test ecx, ecx
+    jz .d
+    movzx edx, byte [rsi]
+    imul eax, 33
+    add eax, edx
+    inc rsi
+    dec ecx
+    jmp .l
+.d: and eax, 0x7FFFFFFF
+    or eax, 0x100
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; css_sheet: rsi = css text, ecx = length -> rules are added to the table
+css_sheet:
+    PUSHA
+    mov r9, rsi
+    lea r10, [rsi+rcx]
+.top:
+    cmp r9, r10
+    jae .done
+    mov al, [r9]
+    cmp al, ' '
+    jbe .nx
+    lea rdx, [r9+1]
+    cmp rdx, r10
+    jae .nc
+    cmp word [r9], '/*'
+    jne .nc
+    add r9, 2
+.cm:
+    lea rdx, [r9+1]
+    cmp rdx, r10
+    jae .done
+    cmp word [r9], '*/'
+    je .cme
+    inc r9
+    jmp .cm
+.cme:
+    add r9, 2
+    jmp .top
+.nc:
+    cmp al, '<'                     ; <!-- and --> around old style blocks
+    jne .h2
+    lea rdx, [r9+4]
+    cmp rdx, r10
+    ja .h2
+    cmp dword [r9], '<!--'
+    jne .h2
+    add r9, 4
+    jmp .top
+.h2:
+    cmp al, '-'
+    jne .h3
+    lea rdx, [r9+3]
+    cmp rdx, r10
+    ja .h3
+    cmp word [r9], '--'
+    jne .h3
+    cmp byte [r9+2], '>'
+    jne .h3
+    add r9, 3
+    jmp .top
+.h3:
+    cmp al, '@'
+    je .at
+    mov r11, r9                     ; selector start
+.sn:
+    cmp r9, r10
+    jae .done
+    cmp byte [r9], '{'
+    je .br
+    inc r9
+    jmp .sn
+.br:
+    mov r12, r9                     ; '{'
+    inc r9
+    mov edx, 1
+.bn:
+    cmp r9, r10
+    jae .be
+    mov al, [r9]
+    cmp al, '{'
+    jne .b1
+    inc edx
+    jmp .b2
+.b1:
+    cmp al, '}'
+    jne .b2
+    dec edx
+    jz .be
+.b2:
+    inc r9
+    jmp .bn
+.be:
+    mov r14, r9                     ; '}' or end
+    cmp r9, r10
+    jae .b3
+    inc r9
+.b3:
+    push r9
+    lea rdi, [BR_TMP]
+    xor eax, eax
+    mov ecx, 8
+    rep stosd
+    lea rdi, [BR_TMP]
+    lea rsi, [r12+1]
+    mov rcx, r14
+    sub rcx, rsi
+    jbe .skipr
+    call css_decls
+    lea rsi, [BR_TMP]               ; any effect at all?
+    xor eax, eax
+    mov ecx, 8
+.ef:
+    or eax, [rsi]
+    add rsi, 4
+    dec ecx
+    jnz .ef
+    test eax, eax
+    jz .skipr
+    mov rsi, r11                    ; split the selector list at ','
+.sl:
+    cmp rsi, r12
+    jae .skipr
+    mov rdi, rsi
+.sc:
+    cmp rdi, r12
+    jae .se
+    cmp byte [rdi], ','
+    je .se
+    inc rdi
+    jmp .sc
+.se:
+    mov rcx, rdi
+    sub rcx, rsi
+    push rdi
+    call css_addrule
+    pop rdi
+    lea rsi, [rdi+1]
+    jmp .sl
+.skipr:
+    pop r9
+    jmp .top
+.at:
+    inc r9
+.an:
+    cmp r9, r10
+    jae .done
+    mov al, [r9]
+    cmp al, ';'
+    je .ae
+    cmp al, '{'
+    je .ab
+    inc r9
+    jmp .an
+.ae:
+    inc r9
+    jmp .top
+.ab:
+    xor edx, edx
+.abl:
+    cmp r9, r10
+    jae .done
+    mov al, [r9]
+    inc r9
+    cmp al, '{'
+    jne .ab1
+    inc edx
+    jmp .abl
+.ab1:
+    cmp al, '}'
+    jne .abl
+    dec edx
+    jnz .abl
+    jmp .top
+.nx:
+    inc r9
+    jmp .top
+.done:
+    POPA
+    ret
+
+; css_addrule: rsi = selector text, rcx = length, BR_TMP = declarations
+css_addrule:
+    PUSHA
+    mov r9, rsi
+    lea r10, [rsi+rcx]
+    mov eax, [br_nrul]
+    cmp eax, BR_NRUL
+    jae .o
+    lea rdi, [BR_TMP+0x40]
+    xor eax, eax
+    mov ecx, 12
+    rep stosd
+    xor r11d, r11d                  ; compound count
+    xor r13d, r13d                  ; specificity
+.cl:
+    cmp r9, r10
+    jae .cdone
+    cmp byte [r9], ' '
+    ja .cs
+    inc r9
+    jmp .cl
+.cs:
+    cmp r11d, 3
+    jae .bad
+    mov eax, r11d
+    shl eax, 4
+    lea rdi, [BR_TMP+0x40+rax]      ; this compound
+    mov al, [r9]
+    cmp al, '*'
+    jne .tg
+    inc r9
+    jmp .cr
+.tg:
+    xor ecx, ecx
+.tl:
+    cmp r9, r10
+    jae .tdone
+    mov al, [r9]
+    cmp al, '-'
+    je .tok
+    cmp al, '_'
+    je .tok
+    cmp al, '0'
+    jb .tdone
+    cmp al, '9'
+    jbe .tok
+    or al, 0x20
+    cmp al, 'a'
+    jb .tdone
+    cmp al, 'z'
+    ja .tdone
+.tok:
+    mov al, [r9]
+    or al, 0x20
+    cmp ecx, 7
+    jae .ts
+    mov [rdi+rcx], al
+    inc ecx
+.ts:
+    inc r9
+    jmp .tl
+.tdone:
+    test ecx, ecx
+    jz .cr
+    inc r13d                        ; a tag adds 1
+.cr:                                ; classes and ids
+    cmp r9, r10
+    jae .cend
+    mov al, [r9]
+    cmp al, '.'
+    je .cls
+    cmp al, '#'
+    je .idd
+    jmp .cend
+.cls:
+    inc r9
+    mov rsi, r9
+.cn:
+    cmp r9, r10
+    jae .ce
+    mov al, [r9]
+    cmp al, '-'
+    je .cn1
+    cmp al, '_'
+    je .cn1
+    cmp al, '0'
+    jb .ce
+    cmp al, '9'
+    jbe .cn1
+    mov ah, al
+    or ah, 0x20
+    cmp ah, 'a'
+    jb .ce
+    cmp ah, 'z'
+    ja .ce
+.cn1:
+    inc r9
+    jmp .cn
+.ce:
+    mov rcx, r9
+    sub rcx, rsi
+    jz .bad
+    call css_hash
+    add r13d, 10
+    jmp .req
+.idd:
+    inc r9
+    mov rsi, r9
+.in:
+    cmp r9, r10
+    jae .ie
+    mov al, [r9]
+    cmp al, '-'
+    je .in1
+    cmp al, '_'
+    je .in1
+    cmp al, '0'
+    jb .ie
+    cmp al, '9'
+    jbe .in1
+    mov ah, al
+    or ah, 0x20
+    cmp ah, 'a'
+    jb .ie
+    cmp ah, 'z'
+    ja .ie
+.in1:
+    inc r9
+    jmp .in
+.ie:
+    mov rcx, r9
+    sub rcx, rsi
+    jz .bad
+    call css_hash
+    or eax, 0x80000000
+    add r13d, 100
+.req:
+    cmp dword [rdi+8], 0
+    jne .r2
+    mov [rdi+8], eax
+    jmp .cr
+.r2:
+    cmp dword [rdi+12], 0
+    jne .bad
+    mov [rdi+12], eax
+    jmp .cr
+.cend:
+    inc r11d
+.cw:
+    cmp r9, r10
+    jae .cdone
+    cmp byte [r9], ' '
+    ja .cc
+    inc r9
+    jmp .cw
+.cc:
+    mov al, [r9]
+    cmp al, '>'
+    je .child
+    cmp al, '*'
+    je .nextd
+    cmp al, '.'
+    je .nextd
+    cmp al, '#'
+    je .nextd
+    cmp al, '-'
+    je .nextd
+    cmp al, '_'
+    je .nextd
+    cmp al, '0'
+    jb .bad
+    cmp al, '9'
+    jbe .nextd
+    or al, 0x20
+    cmp al, 'a'
+    jb .bad
+    cmp al, 'z'
+    ja .bad
+.nextd:                             ; descendant combinator (a blank separated the compounds)
+    cmp byte [r9-1], ' '
+    ja .bad
+    mov eax, r11d
+    mov byte [BR_TMP+0x6F+rax], ' '
+    jmp .cl
+.child:
+    inc r9
+    mov eax, r11d
+    mov byte [BR_TMP+0x6F+rax], '>'
+    jmp .cl
+.cdone:
+    test r11d, r11d
+    jz .o
+    mov eax, [br_nrul]
+    imul eax, eax, 96
+    lea rdi, [BR_RUL+rax]
+    push rdi
+    xor eax, eax
+    mov ecx, 24
+    rep stosd
+    pop rdi
+    mov [rdi], r11b
+    mov eax, r11d
+    dec eax
+    shl eax, 4                      ; the subject is the last compound
+    mov rdx, [BR_TMP+0x40+rax]
+    mov [rdi+8], rdx
+    mov rdx, [BR_TMP+0x40+rax+8]
+    mov [rdi+16], rdx
+    cmp r11d, 2
+    jb .st
+    mov eax, r11d
+    sub eax, 2
+    mov dl, [BR_TMP+0x70+rax]       ; combinator between compound n-2 and n-1
+    mov [rdi+1], dl
+    shl eax, 4
+    mov rdx, [BR_TMP+0x40+rax]
+    mov [rdi+24], rdx
+    mov rdx, [BR_TMP+0x40+rax+8]
+    mov [rdi+32], rdx
+    cmp r11d, 3
+    jb .st
+    mov dl, [BR_TMP+0x70]           ; combinator between compound 0 and 1
+    mov [rdi+2], dl
+    mov rdx, [BR_TMP+0x40]
+    mov [rdi+40], rdx
+    mov rdx, [BR_TMP+0x48]
+    mov [rdi+48], rdx
+.st:
+    mov [rdi+4], r13d
+    mov rdx, [BR_TMP]
+    mov [rdi+56], rdx
+    mov rdx, [BR_TMP+8]
+    mov [rdi+64], rdx
+    mov rdx, [BR_TMP+16]
+    mov [rdi+72], rdx
+    mov rdx, [BR_TMP+24]
+    mov [rdi+80], rdx
+    mov ecx, [br_nrul]              ; keep the order list sorted by specificity (stable)
+.ins:
+    test ecx, ecx
+    jz .put
+    movzx eax, word [BR_RIX+rcx*2-2]
+    imul eax, eax, 96
+    mov edx, [BR_RUL+rax+4]
+    cmp edx, r13d
+    jbe .put
+    movzx eax, word [BR_RIX+rcx*2-2]
+    mov [BR_RIX+rcx*2], ax
+    dec ecx
+    jmp .ins
+.put:
+    mov eax, [br_nrul]
+    mov [BR_RIX+rcx*2], ax
+    inc dword [br_nrul]
+    jmp .o
+.bad:
+.o: POPA
+    ret
+
+; ------------------------------------------------------- element matching ----
+; css_el_prep: rsi = just behind the tag name, r8 = end of tag -> el_idh, el_ncls, el_cls, el_bloom
+css_el_prep:
+    PUSHA
+    mov r12, rsi
+    mov dword [el_idh], 0
+    mov dword [el_ncls], 0
+    mov dword [el_bloom], 0
+    lea rdi, [n_id]
+    call br_attr
+    jnz .cls
+    test ecx, ecx
+    jz .cls
+    mov rsi, rdx
+    call css_hash
+    or eax, 0x80000000
+    mov [el_idh], eax
+.cls:
+    mov rsi, r12
+    lea rdi, [n_class]
+    call br_attr
+    jnz .o
+    mov rsi, rdx
+    lea r9, [rdx+rcx]
+.tk:
+    cmp rsi, r9
+    jae .o
+    cmp byte [rsi], ' '
+    ja .t1
+    inc rsi
+    jmp .tk
+.t1:
+    mov rdx, rsi
+.t2:
+    cmp rsi, r9
+    jae .t3
+    cmp byte [rsi], ' '
+    jbe .t3
+    inc rsi
+    jmp .t2
+.t3:
+    mov rcx, rsi
+    sub rcx, rdx
+    push rsi
+    mov rsi, rdx
+    call css_hash
+    pop rsi
+    mov ecx, [el_ncls]
+    cmp ecx, 8
+    jae .tk
+    mov [el_cls+rcx*4], eax
+    inc dword [el_ncls]
+    mov ecx, eax
+    and ecx, 31
+    bts dword [el_bloom], ecx
+    jmp .tk
+.o: POPA
+    ret
+
+; css_has: eax = requirement -> ZF=1 when the current element satisfies it
+css_has_el:
+    push rcx
+    test eax, eax
+    jz .yes
+    test eax, 0x80000000
+    jz .cl
+    cmp eax, [el_idh]
+    je .yes
+    jmp .no
+.cl:
+    xor ecx, ecx
+.l: cmp ecx, [el_ncls]
+    jae .no
+    cmp eax, [el_cls+rcx*4]
+    je .yes
+    inc ecx
+    jmp .l
+.yes:
+    xor ecx, ecx                    ; ZF=1
+    jmp .r
+.no:
+    or ecx, 1
+.r: pop rcx
+    ret
+
+; css_has_fr: eax = requirement, rdi = frame -> ZF=1 when the open element satisfies it
+css_has_fr:
+    push rcx
+    test eax, eax
+    jz .yes
+    test eax, 0x80000000
+    jz .cl
+    cmp eax, [rdi+52]
+    je .yes
+    jmp .no
+.cl:
+    mov ecx, eax
+    and ecx, 31
+    bt dword [rdi+48], ecx
+    jc .yes
+.no:
+    or ecx, 1
+    jmp .r
+.yes:
+    xor ecx, ecx
+.r: pop rcx
+    ret
+
+; css_comp_fr: rdx = compound, rdi = frame -> ZF=1 on a match
+css_comp_fr:
+    push rax
+    mov rax, [rdx]
+    test rax, rax
+    jz .t
+    cmp rax, [rdi]
+    jne .no
+.t: mov eax, [rdx+8]
+    call css_has_fr
+    jnz .no
+    mov eax, [rdx+12]
+    call css_has_fr
+    jnz .no
+    xor eax, eax
+    jmp .r
+.no:
+    or eax, 1
+.r: pop rax
+    ret
+
+; css_match: rdi = rule, [br_tg] = element name -> ZF=1 when the rule applies to the element being opened
+css_match:
+    PUSHA
+    mov rax, [rdi+8]
+    test rax, rax
+    jz .t1
+    cmp rax, [br_tg]
+    jne .no
+.t1:
+    mov eax, [rdi+16]
+    call css_has_el
+    jnz .no
+    mov eax, [rdi+20]
+    call css_has_el
+    jnz .no
+    movzx r9d, byte [rdi]
+    cmp r9d, 2
+    jb .yes
+    mov r10d, [br_sp]
+    sub r10d, 2                     ; the parent frame (the top one is the element itself)
+    lea rdx, [rdi+24]
+    movzx r11d, byte [rdi+1]
+    call .anc
+    jnz .no
+    cmp r9d, 3
+    jb .yes
+    lea rdx, [rdi+40]
+    movzx r11d, byte [rdi+2]
+    call .anc
+    jnz .no
+.yes:
+    xor eax, eax
+    jmp .r
+.no:
+    or eax, 1
+.r: POPA
+    ret
+; .anc: rdx = compound, r11b = combinator, r10d = frame index to start at -> ZF=1 found (r10d moves below it)
+.anc:
+    push rdi
+    mov rbx, rdi
+.al:
+    test r10d, r10d
+    js .anf
+    mov eax, r10d
+    imul eax, eax, 64
+    lea rdi, [BR_STK+rax]
+    call css_comp_fr
+    jz .ay
+    cmp r11b, '>'
+    je .anf
+    dec r10d
+    jmp .al
+.ay:
+    dec r10d
+    xor eax, eax
+    pop rdi
+    ret
+.anf:
+    or eax, 1
+    pop rdi
+    ret
+
+; css_apply_all: edx = 1 for block elements -> applies every matching rule in order of specificity
+css_apply_all:
+    PUSHA
+    mov r13d, edx
+    xor r12d, r12d
+.l: cmp r12d, [br_nrul]
+    jae .o
+    movzx eax, word [BR_RIX+r12*2]
+    imul eax, eax, 96
+    lea rdi, [BR_RUL+rax]
+    call css_match
+    jnz .n
+    lea rdi, [rdi+56]
+    mov edx, r13d
+    call css_apply
+.n: inc r12d
+    jmp .l
+.o: POPA
+    ret
+
+; ----------------------------------------------------------------- tables -----
+css_names:
+    db "black", 0
+    dd 0x000000
+    db "silver", 0
+    dd 0xC0C0C0
+    db "gray", 0
+    dd 0x808080
+    db "grey", 0
+    dd 0x808080
+    db "white", 0
+    dd 0xFFFFFF
+    db "maroon", 0
+    dd 0x800000
+    db "red", 0
+    dd 0xFF0000
+    db "purple", 0
+    dd 0x800080
+    db "fuchsia", 0
+    dd 0xFF00FF
+    db "magenta", 0
+    dd 0xFF00FF
+    db "green", 0
+    dd 0x008000
+    db "lime", 0
+    dd 0x00FF00
+    db "olive", 0
+    dd 0x808000
+    db "yellow", 0
+    dd 0xFFFF00
+    db "navy", 0
+    dd 0x000080
+    db "blue", 0
+    dd 0x0000FF
+    db "teal", 0
+    dd 0x008080
+    db "aqua", 0
+    dd 0x00FFFF
+    db "cyan", 0
+    dd 0x00FFFF
+    db "orange", 0
+    dd 0xFFA500
+    db "pink", 0
+    dd 0xFFC0CB
+    db "brown", 0
+    dd 0xA52A2A
+    db "gold", 0
+    dd 0xFFD700
+    db "darkgray", 0
+    dd 0xA9A9A9
+    db "darkgrey", 0
+    dd 0xA9A9A9
+    db "lightgray", 0
+    dd 0xD3D3D3
+    db "lightgrey", 0
+    dd 0xD3D3D3
+    db "dimgray", 0
+    dd 0x696969
+    db "dimgrey", 0
+    dd 0x696969
+    db "whitesmoke", 0
+    dd 0xF5F5F5
+    db "gainsboro", 0
+    dd 0xDCDCDC
+    db "darkblue", 0
+    dd 0x00008B
+    db "darkred", 0
+    dd 0x8B0000
+    db "darkgreen", 0
+    dd 0x006400
+    db "lightblue", 0
+    dd 0xADD8E6
+    db "skyblue", 0
+    dd 0x87CEEB
+    db "steelblue", 0
+    dd 0x4682B4
+    db "royalblue", 0
+    dd 0x4169E1
+    db "crimson", 0
+    dd 0xDC143C
+    db "tomato", 0
+    dd 0xFF6347
+    db "coral", 0
+    dd 0xFF7F50
+    db "salmon", 0
+    dd 0xFA8072
+    db "khaki", 0
+    dd 0xF0E68C
+    db "ivory", 0
+    dd 0xFFFFF0
+    db "beige", 0
+    dd 0xF5F5DC
+    db "lavender", 0
+    dd 0xE6E6FA
+    db "indigo", 0
+    dd 0x4B0082
+    db "violet", 0
+    dd 0xEE82EE
+    db "orchid", 0
+    dd 0xDA70D6
+    db "tan", 0
+    dd 0xD2B48C
+    db "chocolate", 0
+    dd 0xD2691E
+    db "firebrick", 0
+    dd 0xB22222
+    db "lightyellow", 0
+    dd 0xFFFFE0
+    db "lightgreen", 0
+    dd 0x90EE90
+    db "limegreen", 0
+    dd 0x32CD32
+    db "seagreen", 0
+    dd 0x2E8B57
+    db "forestgreen", 0
+    dd 0x228B22
+    db "darkorange", 0
+    dd 0xFF8C00
+    db "deepskyblue", 0
+    dd 0x00BFFF
+    db "dodgerblue", 0
+    dd 0x1E90FF
+    db "slategray", 0
+    dd 0x708090
+    db "slategrey", 0
+    dd 0x708090
+    db "lightsteelblue", 0
+    dd 0xB0C4DE
+    db "midnightblue", 0
+    dd 0x191970
+    db "aliceblue", 0
+    dd 0xF0F8FF
+    db "snow", 0
+    dd 0xFFFAFA
+    db "honeydew", 0
+    dd 0xF0FFF0
+    db "mintcream", 0
+    dd 0xF5FFFA
+    db "azure", 0
+    dd 0xF0FFFF
+    db "linen", 0
+    dd 0xFAF0E6
+    db "oldlace", 0
+    dd 0xFDF5E6
+    db "cornsilk", 0
+    dd 0xFFF8DC
+    db "wheat", 0
+    dd 0xF5DEB3
+    db "peru", 0
+    dd 0xCD853F
+    db "sienna", 0
+    dd 0xA0522D
+    db "darkgoldenrod", 0
+    dd 0xB8860B
+    db "mediumblue", 0
+    dd 0x0000CD
+    db "darkcyan", 0
+    dd 0x008B8B
+    db "darkmagenta", 0
+    dd 0x8B008B
+    db "darkviolet", 0
+    dd 0x9400D3
+    db "hotpink", 0
+    dd 0xFF69B4
+    db "deeppink", 0
+    dd 0xFF1493
+    db "turquoise", 0
+    dd 0x40E0D0
+    db "plum", 0
+    dd 0xDDA0DD
+    db "rebeccapurple", 0
+    dd 0x663399
+    db 0
+css_props:
+    db "color", 0, 1
+    db "background-color", 0, 2
+    db "background", 0, 3
+    db "font-weight", 0, 4
+    db "text-decoration", 0, 5
+    db "text-decoration-line", 0, 5
+    db "text-align", 0, 6
+    db "display", 0, 7
+    db "visibility", 0, 8
+    db "font-size", 0, 9
+    db "padding-left", 0, 10
+    db "margin-left", 0, 11
+    db "width", 0, 12
+    db "border", 0, 13
+    db "list-style", 0, 14
+    db "list-style-type", 0, 14
+    db "font", 0, 15
+    db 0
+
+; ---- end html2.inc
+; ---- begin html3.inc
+; =============================================================================
+;  HTML renderer, part 3: the tag walker
+;  br_walk renders the HTML between rsi and r9 into the cell grid.  It is
+;  re-entered for the contents of table cells.
+; =============================================================================
 br_clear:
     push rax
     push rcx
@@ -15758,6 +18238,15 @@ br_clear:
     mov ecx, BR_MAXR*COLS
     xor eax, eax
     rep stosb
+    mov rdi, BRX
+    mov ecx, BR_MAXR*COLS
+    rep stosb
+    mov rdi, BRF
+    mov ecx, BR_MAXR*COLS
+    rep stosd
+    mov rdi, BRB
+    mov ecx, BR_MAXR*COLS
+    rep stosd
     mov dword [br_rows], 1
     mov dword [br_nlk], 0
     mov byte [br_title], 0
@@ -15766,20 +18255,52 @@ br_clear:
     pop rax
     ret
 
+; br_render: renders the page in the file slot [br_slot]
 br_render:
     PUSHA
     call br_clear
-    mov dword [br_row], 0
-    mov dword [br_col], 0
-    mov dword [br_nlk], 0
-    mov dword [br_tl], 0
+    xor eax, eax
+    mov [br_row], eax
+    mov [br_col], eax
+    mov [br_x0], eax
+    mov [br_rtop], eax
+    mov [br_tl], eax
+    mov [br_sp], eax
+    mov [br_nrul], eax
+    mov [br_fbase], eax
+    mov [br_hid], eax
+    mov [br_lctr], eax
+    mov [br_fg], eax
+    mov [br_bg], eax
+    mov [br_bbg], eax
+    mov [br_nanc], eax
+    mov [br_nfrm], eax
+    mov [br_tbd], eax
+    mov dword [br_optp], 0
+    mov dword [br_x1], COLS-2
+    mov dword [br_lineh], 1
     mov dword [br_rows], 1
-    mov byte [br_att], 0
+    mov dword [br_nlk], 0
+    mov dword [br_ctop], 0
+    mov byte [br_fl], 0
+    mov byte [br_al], 0
     mov byte [br_pend], 0
     mov byte [br_pre], 0
     mov byte [br_ttl], 0
     mov byte [br_plain], 0
+    mov byte [br_gap], 0
+    mov byte [br_lkind], 0
+    mov byte [br_lk], 0
+    mov byte [br_form], 0xFF
+    mov byte [br_bord], 0
     mov byte [br_title], 0
+    mov al, [br_csin]
+    mov [br_cs], al
+    mov dword [br_pbg], 0
+    mov rax, BR_CEL
+    mov [br_tbp], rax
+    mov rax, BR_ROW
+    mov [br_rbp], rax
     mov rsi, [br_slot]
     call ext4
     mov rsi, [br_slot]
@@ -15787,14 +18308,30 @@ br_render:
     lea rsi, [rsi+64]
     lea r9, [rsi+rcx]
     mov [br_end], r9
+    mov edx, 1                      ; 1 = html
     cmp eax, 0x6D74682E             ; ".htm"
-    je .lp
+    je .h
     cmp eax, 0x6C6D7468             ; "html"
-    je .lp
+    je .h
     mov byte [br_pre], 1
     mov byte [br_plain], 1
+    xor edx, edx
+.h: cmp byte [br_isweb], 0
+    je .go
+    mov dword [br_pbg], BC_SET|0xFFFFFF
+.go:
+    call br_walk
+    call br_nl_if
+    mov eax, [br_row]
+    inc eax
+    mov [br_rows], eax
+    POPA
+    ret
+
+; br_walk: rsi = start, r9 = limit
+br_walk:
+    PUSHA
 .lp:
-    mov r9, [br_end]
     cmp rsi, r9
     jae .done
     movzx eax, byte [rsi]
@@ -15808,13 +18345,20 @@ br_render:
     je .ent
 .chr:
     cmp al, 0x80
-    jae .utf
+    jae .hi
     call br_emit
     jmp .lp
 .ent:
     call br_entity
     jmp .lp
-.utf:
+.hi:
+    cmp byte [br_cs], 2
+    jne .h0
+    call br_cp                      ; ISO-8859-1: the byte is the Unicode value
+    jmp .lp
+.h0:
+    cmp byte [br_cs], 0
+    jne .cs1251
     cmp al, 0xC0
     jb .lp                          ; stray continuation byte
     mov ebx, eax
@@ -15846,22 +18390,78 @@ br_render:
     mov [br_rp], rsi
     call br_cp
     jmp .lp
+.cs1251:                            ; windows-1251: 0xC0.. maps straight onto the code page
+    cmp al, 0xC0
+    jb .c1
+    sub al, 0x40
+    call br_emit
+    jmp .lp
+.c1:
+    mov dl, 192
+    cmp al, 0xA8
+    je .c2
+    mov dl, 193
+    cmp al, 0xB8
+    je .c2
+    mov dl, 127
+    cmp al, 0x95
+    je .c2
+    mov dl, '-'
+    cmp al, 0x96
+    je .c2
+    cmp al, 0x97
+    je .c2
+    mov dl, 34
+    cmp al, 0xAB
+    je .c2
+    cmp al, 0xBB
+    je .c2
+    mov dl, ' '
+    cmp al, 0xA0
+    je .c2
+    mov dl, 210
+    cmp al, 0x85
+    je .c2
+    mov dl, '?'
+.c2:
+    mov al, dl
+    call br_emit
+    jmp .lp
+
 ; ---- tags
 .tag:
     cmp rsi, r9
     jae .done
-    cmp byte [rsi], '!'
-    jne .t1
+    movzx eax, byte [rsi]
+    cmp al, '!'
+    je .bang
+    cmp al, '?'
+    je .skipgt0
+    cmp al, '/'
+    je .tg1
+    mov dl, al
+    or dl, 0x20
+    cmp dl, 'a'
+    jb .lt                          ; "a < b": a literal '<'
+    cmp dl, 'z'
+    ja .lt
+    jmp .tg1
+.lt:
+    mov al, '<'
+    call br_emit
+    jmp .lp
+.bang:
     cmp word [rsi+1], '--'
-    jne .skipgt
+    jne .skipgt0
     lea rsi, [rsi+3]
     lea rdi, [n_cmt]
     call br_find
     add rsi, 3
     jmp .lp
-.t1:
-    cmp byte [rsi], '?'
-    je .skipgt
+.skipgt0:
+    mov r8, rsi
+    jmp .skipgt2
+.tg1:
     xor ebx, ebx                    ; closing flag
     cmp byte [rsi], '/'
     jne .t2
@@ -15889,7 +18489,7 @@ br_render:
     inc rsi
     jmp .tn
 .te:
-    mov r8, rsi                     ; find the real end of the tag (quotes may hide a '>')
+    mov r8, rsi                     ; the real end of the tag (quotes may hide a '>')
     xor edx, edx
 .fe:
     cmp r8, r9
@@ -15914,109 +18514,228 @@ br_render:
     inc r8
     jmp .fe
 .fd:
+    ; ---- look the tag up
     mov rax, [br_tg]
+    lea r10, [tag_tab]
+.lk:
+    mov rdx, [r10]
+    test rdx, rdx
+    jz .unk
+    cmp rdx, rax
+    je .lf
+    add r10, 16
+    jmp .lk
+.unk:
+    lea r10, [tag_unknown]
+.lf:
+    mov r11d, [r10+8]
+    mov r12d, [r10+12]
     test ebx, ebx
     jnz .closing
-    TG 'script', .sk_script
-    TG 'style', .sk_style
-    TG 'noscrip', .sk_noscript
-    TG 'svg', .sk_svg
-    TG 'templat', .sk_tpl
-    TG 'h1', .hd
-    TG 'h2', .hd
-    TG 'h3', .hd
-    TG 'h4', .hd
-    TG 'h5', .hd
-    TG 'h6', .hd
-    TG 'b', .bold
-    TG 'strong', .bold
-    TG 'th', .th
-    TG 'td', .td
-    TG 'p', .pb
-    TG 'div', .pb
-    TG 'section', .pb
-    TG 'article', .pb
-    TG 'header', .pb
-    TG 'footer', .pb
-    TG 'nav', .pb
-    TG 'main', .pb
-    TG 'aside', .pb
-    TG 'form', .pb
-    TG 'ul', .pb
-    TG 'ol', .pb
-    TG 'dl', .pb
-    TG 'table', .pb
-    TG 'tr', .pb
-    TG 'blockqu', .pb
-    TG 'figure', .pb
-    TG 'center', .pb
-    TG 'br', .brk
-    TG 'li', .li
-    TG 'dt', .pb
-    TG 'dd', .dd
-    TG 'a', .an
-    TG 'img', .img
-    TG 'hr', .hr
-    TG 'pre', .prs
-    TG 'title', .tts
+    ; ---------------------------------------------------------- opening tag
+    cmp r12d, S_SKIP
+    je .skipblk
+    cmp r12d, S_STYLE
+    je .style
+    cmp r12d, S_TABLE
+    je .table
+    test r11d, TF_SELF
+    jz .nsf
+    call br_autoclose
+.nsf:
+    test r11d, TF_BLK
+    jz .nblk
+    call br_nl_if
+    test r11d, TF_GAP
+    jz .nblk
+    test r11d, TF_LIST
+    jz .gap1
+    cmp byte [br_lkind], 0
+    jne .nblk                       ; a list inside a list gets no blank line
+.gap1:
+    mov byte [br_gap], 1
+.nblk:
+    call br_open_style              ; pushes a frame and applies the styles
+    jc .tdone
+    mov r13d, [br_sp]
+    dec r13d                        ; this element's frame
+    mov r14d, 1                     ; 1 = the frame is dropped again right away
+    test r11d, TF_VOID
+    jnz .sp
+    cmp byte [r8-1], '/'
+    je .sp
+    xor r14d, r14d
+.sp:
+    cmp r12d, S_NONE
+    je .spd
+    cmp r12d, S_BR
+    je .sbr
+    cmp r12d, S_HR
+    je .shr
+    cmp r12d, S_LI
+    je .sli
+    cmp r12d, S_LIST
+    je .slist
+    cmp r12d, S_OL
+    je .sol
+    cmp r12d, S_A
+    je .sa
+    cmp r12d, S_IMG
+    je .simg
+    cmp r12d, S_BODY
+    je .sbody
+    cmp r12d, S_TITLE
+    je .stitle
+    cmp r12d, S_META
+    je .smeta
+    cmp r12d, S_CELL
+    je .scell
+    cmp r12d, S_FORM
+    je .sform
+    cmp r12d, S_INPUT
+    je .sinput
+    cmp r12d, S_BUTTON
+    je .sbutton
+    cmp r12d, S_TEXTAREA
+    je .stext
+    cmp r12d, S_SELECT
+    je .ssel
+    cmp r12d, S_FONT
+    je .sfont
+    jmp .spd
+.sbr:
+    call br_nl
+    jmp .spd
+.shr:
+    call br_sp_hr
+    jmp .spd
+.sli:
+    call br_sp_li
+    jmp .spd
+.slist:
+    xor eax, eax
+    call br_sp_list
+    jmp .spd
+.sol:
+    mov eax, 1
+    call br_sp_list
+    jmp .spd
+.sa:
+    call br_sp_a
+    jmp .spd
+.simg:
+    call br_sp_img
+    jmp .spd
+.sbody:
+    call br_sp_body
+    jmp .spd
+.stitle:
+    mov dword [br_tl], 0
+    mov byte [br_title], 0
+    mov byte [br_ttl], 1
+    jmp .spd
+.smeta:
+    call br_sp_meta
+    jmp .spd
+.scell:
+    call br_cellsep
+    jmp .spd
+.sform:
+    call br_sp_form
+    jmp .spd
+.sinput:
+    call br_sp_input
+    jmp .spd
+.sbutton:
+    call br_sp_button               ; may move rsi/r8 behind </button>
+    jmp .spd
+.stext:
+    call br_sp_textarea
+    jmp .spd
+.ssel:
+    call br_sp_select
+    jmp .spd
+.sfont:
+    call br_sp_font
+.spd:
+    test r14d, r14d
+    jz .tdone
+    mov ecx, r13d                   ; void element: back to the state before it
+    call br_fr_pop
     jmp .tdone
+; ---------------------------------------------------------- closing tag
 .closing:
-    TG 'h1', .hc
-    TG 'h2', .hc
-    TG 'h3', .hc
-    TG 'h4', .hc
-    TG 'h5', .hc
-    TG 'h6', .hc
-    TG 'b', .att0
-    TG 'strong', .att0    TG 'th', .att0
-    TG 'p', .pc
-    TG 'ul', .pc
-    TG 'ol', .pc
-    TG 'dl', .pc
-    TG 'table', .pc
-    TG 'blockqu', .pc
-    TG 'div', .nlif
-    TG 'section', .nlif
-    TG 'article', .nlif
-    TG 'header', .nlif
-    TG 'footer', .nlif
-    TG 'nav', .nlif
-    TG 'main', .nlif
-    TG 'aside', .nlif
-    TG 'form', .nlif
-    TG 'tr', .nlif
-    TG 'li', .nlif
-    TG 'dd', .nlif
-    TG 'figure', .nlif
-    TG 'a', .ac
-    TG 'pre', .prc
-    TG 'title', .ttc
+    mov ecx, [br_sp]
+.cf:
+    dec ecx
+    cmp ecx, [br_fbase]
+    jl .tdone                       ; no such open element
+    mov edx, ecx
+    imul edx, edx, 64
+    cmp [BR_STK+rdx], rax
+    jne .cf
+    test r11d, TF_BLK
+    jz .cp
+    push rcx
+    call br_nl_if
+    pop rcx
+.cp:
+    call br_fr_pop
+    test r11d, TF_GAP
+    jz .tdone
+    test r11d, TF_LIST
+    jz .gap2
+    cmp byte [br_lkind], 0
+    jne .tdone
+.gap2:
+    mov byte [br_gap], 1
     jmp .tdone
-.sk_script:
-    lea rdi, [n_script]
-    jmp .skblk
-.sk_style:
-    lea rdi, [n_style]
-    jmp .skblk
-.sk_noscript:
-    lea rdi, [n_noscript]
-    jmp .skblk
-.sk_svg:
-    lea rdi, [n_svg]
-    jmp .skblk
-.sk_tpl:
-    lea rdi, [n_tpl]
-.skblk:
+; ---------------------------------------------------------- skipped content
+.skipblk:
+    lea rdi, [BR_TMP+0x100]         ; needle "</name"
+    mov word [rdi], '</'
+    mov rax, [br_tg]
+    mov [rdi+2], rax
+    mov byte [rdi+10], 0
     mov rsi, r8
     call br_find
     mov r8, rsi
     cmp r8, r9
     jae .done
     jmp .skipgt2
-.skipgt:
+.select:
+    ; (select lists are not supported yet: skipped)
+    lea rdi, [BR_TMP+0x100]
+    mov dword [rdi], '</se'
+    mov dword [rdi+4], 'lect'
+    mov byte [rdi+8], 0
+    mov rsi, r8
+    call br_find
     mov r8, rsi
+    cmp r8, r9
+    jae .done
+    jmp .skipgt2
+.style:
+    lea rdi, [n_style]
+    lea rsi, [r8+1]
+    mov r14, rsi                    ; css start
+    call br_find
+    mov rcx, rsi
+    sub rcx, r14
+    jbe .sty
+    push rsi
+    mov rsi, r14
+    call css_sheet
+    pop rsi
+.sty:
+    mov r8, rsi
+    cmp r8, r9
+    jae .done
+    jmp .skipgt2
+.table:
+    call br_sp_table                ; lays the table out; r8 = end of the table's closing tag
+    jmp .tdone
 .skipgt2:
-    ; move rsi to just behind the next '>'
     mov rsi, r8
 .sg:
     cmp rsi, r9
@@ -16028,150 +18747,476 @@ br_render:
 .sg1:
     inc rsi
     jmp .lp
-.hd:
-    call br_nl_if
-    mov byte [br_att], 1
-    jmp .tdone
-.bold:
-    cmp byte [br_att], 8
-    jae .tdone
-    mov byte [br_att], 1
-    jmp .tdone
-.th:
-    call br_cellsep
-    mov byte [br_att], 1
-    jmp .tdone
-.td:
-    call br_cellsep
-    jmp .tdone
-.pb:
-    call br_nl_if
-    jmp .tdone
-.brk:
-    call br_nl
-    jmp .tdone
-.li:
-    call br_nl_if
-    mov al, '*'
-    call br_put
-    mov byte [br_pend], 0
-    mov al, ' '
-    call br_put
-    jmp .tdone
-.dd:
-    call br_nl_if
-    mov al, ' '
-    call br_put
-    call br_put
-    mov byte [br_pend], 0
-    jmp .tdone
-.hr:
-    call br_nl_if
-    mov byte [br_att], 3
-    mov ecx, 60
-.hl:
-    mov al, '-'
-    call br_put
-    dec ecx
-    jnz .hl
-    mov byte [br_att], 0
-    call br_nl
-    jmp .tdone
-.prs:
-    call br_nl_if
-    mov byte [br_pre], 1
-    mov byte [br_att], 3
-    jmp .tdone
-.tts:
-    mov byte [br_ttl], 1
-    jmp .tdone
-.hc:
-    mov byte [br_att], 0
-    call br_nl_if
-    call br_nl
-    jmp .tdone
-.att0:
-    cmp byte [br_att], 8
-    jae .tdone
-    mov byte [br_att], 0
-    jmp .tdone
-.pc:
-    call br_nl_if
-    call br_nl
-    jmp .tdone
-.ac:
-    mov byte [br_att], 0
-    jmp .tdone
-.prc:
-    mov byte [br_pre], 0
-    mov byte [br_att], 0
-    call br_nl_if
-    jmp .tdone
-.ttc:
-    mov byte [br_ttl], 0
-    jmp .tdone
-.nlif:
-    call br_nl_if
-    jmp .tdone
-.img:
-    lea rdi, [n_alt]
-    call br_attr
-    jne .tdone
-    test ecx, ecx
-    jz .tdone
-    cmp ecx, 40
-    jbe .al
-    mov ecx, 40
-.al:
-    mov al, '['
-    call br_emit
-    mov rsi, rdx
-.ac2:
-    lodsb
-    call br_emit
-    dec ecx
-    jnz .ac2
-    mov al, ']'
-    call br_emit
-    jmp .tdone
-.an:
-    mov ecx, [br_nlk]
-    cmp ecx, BR_NLK
-    jae .tdone
-    lea rdi, [n_href]
-    call br_attr
-    jne .tdone
-    test ecx, ecx
-    jz .tdone
-    mov eax, [br_nlk]
-    shl eax, 7
-    lea rdi, [BRL+rax]
-    cmp ecx, 126
-    jbe .hc2
-    mov ecx, 126
-.hc2:
-    mov rsi, rdx
-    rep movsb
-    mov byte [rdi], 0
-    mov eax, [br_nlk]
-    add eax, 8
-    mov [br_att], al
-    inc dword [br_nlk]
 .tdone:
     mov rsi, r8
     cmp rsi, r9
-    jae .lp
+    jae .done
     inc rsi
     jmp .lp
 .done:
-    mov eax, [br_row]
-    inc eax
-    mov [br_rows], eax
     POPA
     ret
 
-br_cellsep:                         ; blanks between table cells
-    cmp dword [br_col], 0
+; br_autoclose: rax = tag -> closes an open element with the same name (list items, paragraphs ...)
+br_autoclose:
+    PUSHA
+    mov r12, rax
+    mov ecx, [br_sp]
+    mov r13d, 8
+.l: dec ecx
+    cmp ecx, [br_fbase]
+    jl .o
+    dec r13d
+    js .o
+    mov edx, ecx
+    imul edx, edx, 64
+    cmp [BR_STK+rdx], r12
+    je .f
+    test dword [BR_STK+rdx+44], TF_SCOPE
+    jnz .o
+    jmp .l
+.f: mov r14d, ecx
+    test dword [BR_STK+rdx+44], TF_BLK
+    jz .p
+    call br_nl_if
+.p: mov ecx, r14d
+    call br_fr_pop
+.o: POPA
+    ret
+
+; br_open_style: rsi = just behind the tag name, r8 = end of the tag, r11d = tag flags
+;   pushes a frame and applies user agent styles, attributes and css; CF=1 when the stack is full
+br_open_style:
+    PUSHA
+    mov r13, rsi
+    call css_el_prep
+    mov rax, [br_tg]
+    mov edx, r11d
+    call br_fr_push
+    jc .full
+    mov dword [br_ewidth], 0
+    mov dword [br_eindset], 0
+    ; element ids are anchors
+    mov eax, [el_idh]
+    test eax, eax
+    jz .ua
+    cmp dword [br_peek], 0
+    jne .ua
+    call br_anchor
+.ua:
+    test r11d, TF_BOLD
+    jz .u1
+    or byte [br_fl], FX_BOLD
+.u1:
+    test r11d, TF_UL
+    jz .u2
+    or byte [br_fl], FX_UL
+.u2:
+    test r11d, TF_STRIKE
+    jz .u3
+    or byte [br_fl], FX_STR
+.u3:
+    test r11d, TF_BIG
+    jz .u4
+    or byte [br_fl], FX_BIG
+.u4:
+    test r11d, TF_CTR
+    jz .u5
+    mov byte [br_al], 1
+.u5:
+    test r11d, TF_HID
+    jz .u6
+    inc dword [br_hid]
+.u6:
+    test r11d, TF_PRE
+    jz .u7
+    mov byte [br_pre], 1
+.u7:
+    test r11d, TF_CODE
+    jz .u8
+    or byte [br_fl], FX_CODE
+    cmp byte [br_isweb], 0
+    je .u8
+    test r11d, TF_PRE
+    jz .u7b
+    mov dword [br_bbg], BC_SET|0xF1F3F4
+    jmp .u8
+.u7b:
+    mov dword [br_bg], BC_SET|0xECEFF1
+.u8:
+    test r11d, TF_MARK
+    jz .u9
+    mov dword [br_bg], BC_SET|0xFFF59D
+.u9:
+    test r11d, TF_IND4
+    jz .u10
+    mov eax, [br_x0]
+    add eax, 4
+    lea edx, [rax+8]
+    cmp edx, [br_x1]
+    jae .u10
+    call br_setx0
+.u10:
+    test r11d, TF_LINK
+    jz .hints
+    mov rsi, r13
+    lea rdi, [n_href]
+    call br_attr
+    jnz .hints
+    or byte [br_fl], FX_UL
+    cmp byte [br_isweb], 0
+    je .hints
+    mov dword [br_fg], BC_LINK
+.hints:
+    mov rsi, r13
+    call br_hints
+    ; css rules, then the style attribute
+    xor edx, edx
+    test r11d, TF_BLK
+    jnz .blk
+    cmp r12d, S_CELL
+    jne .rules
+.blk:
+    mov edx, 1
+.rules:
+    mov [br_isblk], edx
+    call css_apply_all
+    mov rsi, r13
+    lea rdi, [n_styleattr]
+    call br_attr
+    jnz .ind
+    test ecx, ecx
+    jz .ind
+    mov rsi, rdx
+    lea rdi, [BR_TMP]
+    xor eax, eax
+    push rcx
+    mov ecx, 8
+    rep stosd
+    pop rcx
+    lea rdi, [BR_TMP]
+    call css_decls
+    lea rdi, [BR_TMP]
+    mov edx, [br_isblk]
+    call css_apply
+.ind:
+    ; margin / padding on blocks
+    cmp dword [br_eindset], 0
+    je .ok
+    test dword [br_isblk], 1
+    jz .ok
+    mov eax, [br_x0]
+    add eax, [br_eind]
+    lea edx, [rax+8]
+    cmp edx, [br_x1]
+    jae .ok
+    call br_setx0
+.ok:
+    clc
+    jmp .o
+.full:
+    stc
+.o: POPA
+    ret
+
+; br_hints: rsi = just behind the tag name, r8 = end of tag: presentational attributes
+br_hints:
+    PUSHA
+    mov r13, rsi
+    lea rdi, [n_bgcolor]
+    call br_attr
+    jnz .al
+    mov rsi, rdx
+    call css_color
+    test eax, eax
+    jz .al
+    test r11d, TF_BLK
+    jnz .bb
+    cmp r12d, S_CELL
+    je .bb
+    cmp r12d, S_BODY
+    je .bb
+    mov [br_bg], eax
+    jmp .al
+.bb:
+    mov [br_bbg], eax
+.al:
+    mov rsi, r13
+    lea rdi, [n_align]
+    call br_attr
+    jnz .tx
+    test ecx, ecx
+    jz .tx
+    mov al, [rdx]
+    or al, 0x20
+    cmp al, 'c'
+    jne .a1
+    mov byte [br_al], 1
+    jmp .tx
+.a1:
+    cmp al, 'r'
+    jne .a2
+    mov byte [br_al], 2
+    jmp .tx
+.a2:
+    cmp al, 'l'
+    jne .tx
+    mov byte [br_al], 0
+.tx:
+    cmp r12d, S_BODY
+    jne .wd
+    mov rsi, r13
+    lea rdi, [n_text]
+    call br_attr
+    jnz .wd
+    mov rsi, rdx
+    call css_color
+    test eax, eax
+    jz .wd
+    mov [br_fg], eax
+.wd:
+    mov rsi, r13
+    lea rdi, [n_width]
+    call br_attr
+    jnz .hd
+    test ecx, ecx
+    jz .hd
+    mov rsi, rdx
+    call css_num
+    jc .hd
+    cmp edx, 3
+    je .wpc
+    call css_px
+    shr eax, 3
+    or eax, 0x40000000
+    mov [br_ewidth], eax
+    jmp .hd
+.wpc:
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    cmp eax, 100
+    jbe .wp1
+    mov eax, 100
+.wp1:
+    or eax, 0x80000000
+    mov [br_ewidth], eax
+.hd:
+    mov rsi, r13
+    lea rdi, [n_hidden]
+    call br_attr
+    jnz .o
+    inc dword [br_hid]
+.o: POPA
+    ret
+
+; ------------------------------------------------------------ special tags -----
+br_sp_font:
+    PUSHA
+    mov r13, rsi
+    mov rsi, r13
+    lea rdi, [n_color]
+    call br_attr
+    jnz .o
+    mov rsi, rdx
+    call css_color
+    test eax, eax
+    jz .o
+    mov [br_fg], eax
+.o: POPA
+    ret
+
+br_sp_body:
+    PUSHA
+    mov dword [br_hid], 0           ; an unclosed <head> must not hide the page
+    mov eax, [br_bbg]
+    test eax, eax
+    jz .o
+    mov [br_pbg], eax
+    mov dword [br_bbg], 0
+.o: POPA
+    ret
+
+br_sp_meta:
+    PUSHA
+    mov r13, rsi
+    mov rsi, r13
+    lea rdi, [n_charset]
+    call br_attr
+    jnz .ct
+    mov rsi, rdx
+    call br_is1251
+    jmp .o
+.ct:
+    mov rsi, r13
+    lea rdi, [n_content]
+    call br_attr
+    jnz .o
+    mov rsi, rdx
+    call br_is1251
+.o: POPA
+    ret
+
+; br_is1251: rsi = text, ecx = length -> sets br_cs when it names windows-1251
+br_is1251:
+    PUSHA
+    lea rdi, [w_utf8]
+    call css_word
+    jnz .nu
+    mov byte [br_cs], 0
+    jmp .o
+.nu:
+    lea rdi, [w_cp1251]
+    call css_word
+    jz .y
+    lea rdi, [w_cp1251b]
+    call css_word
+    jz .y
+    lea rdi, [w_8859]
+    call css_word
+    jz .l1
+    lea rdi, [w_latin1]
+    call css_word
+    jnz .o
+.l1:
+    mov byte [br_cs], 2
+    jmp .o
+.y: mov byte [br_cs], 1
+.o: POPA
+    ret
+
+br_sp_hr:
+    PUSHA
+    call br_gapnow
+    mov eax, [br_x0]
+    mov [br_col], eax
+    cmp byte [br_isweb], 0
+    je .th
+    mov dword [br_fg], BC_SET|0xBDC1C6
+    jmp .go
+.th:
+    mov dword [br_fg], BC_SET|0x808080
+.go:
+    mov ecx, [br_x1]
+    sub ecx, [br_x0]
+    jle .nl
+.l: mov al, BL_H
+    call br_put
+    dec ecx
+    jnz .l
+.nl:
+    call br_nl
+    POPA
+    ret
+
+; br_sp_list: eax = 0 for ul, 1 for ol
+br_sp_list:
+    PUSHA
+    mov r13, rsi
+    cmp byte [br_lkind], 3
+    je .k3
+    inc eax
+    mov [br_lkind], al
+.k3:
+    mov dword [br_lctr], 0
+    test eax, eax
+    jz .ind
+    cmp byte [br_lkind], 2
+    jne .ind
+    mov rsi, r13
+    lea rdi, [n_start]
+    call br_attr
+    jnz .ind
+    mov rsi, rdx
+    call br_num
+    dec eax
+    mov [br_lctr], eax
+.ind:
+    cmp byte [br_lkind], 3
+    je .o
+    mov eax, 3
+    cmp byte [br_lkind], 2
+    jne .i1
+    inc eax
+.i1:
+    add eax, [br_x0]
+    lea edx, [rax+8]
+    cmp edx, [br_x1]
+    jae .o
+    call br_setx0
+.o: POPA
+    ret
+
+; br_num: rsi = text -> eax = unsigned decimal value
+br_num:
+    xor eax, eax
+.l: movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .d
+    imul eax, 10
+    add eax, edx
+    inc rsi
+    jmp .l
+.d: ret
+
+br_sp_li:
+    PUSHA
+    call br_gapnow
+    mov eax, [br_x0]
+    mov [br_col], eax
+    movzx ecx, byte [br_lkind]
+    cmp ecx, 3
+    je .o
+    test ecx, ecx
+    jz .orph
+    sub eax, 2
+    js .o
+    cmp ecx, 2
+    je .num
+    mov [br_col], eax
+    mov al, 127                     ; bullet
+    call br_put
+    jmp .reset
+.num:
+    inc dword [br_lctr]
+    mov eax, [br_lctr]
+    lea rdi, [BR_TMP+0x200]
+    call u2s
+    mov byte [rdi], '.'
+    mov byte [rdi+1], 0
+    lea rsi, [BR_TMP+0x200]
+    call strlen
+    mov ecx, eax
+    mov eax, [br_x0]
+    dec eax                         ; the number ends one column before the text
+    sub eax, ecx
+    jns .n1
+    xor eax, eax
+.n1:
+    mov [br_col], eax
+.nl:
+    lodsb
+    test al, al
+    jz .reset
+    call br_put
+    jmp .nl
+.orph:
+    mov al, 127
+    call br_put
+    mov al, ' '
+    call br_put
+    jmp .o
+.reset:
+    mov eax, [br_x0]
+    mov [br_col], eax
+.o: mov byte [br_pend], 0
+    POPA
+    ret
+
+br_cellsep:                         ; blanks between stray table cells
+    mov eax, [br_col]
+    cmp eax, [br_x0]
     je .o
     push rax
     mov al, ' '
@@ -16181,7 +19226,3142 @@ br_cellsep:                         ; blanks between table cells
 .o: mov byte [br_pend], 0
     ret
 
-; ------------------------------------------------------------- loading ------
+; br_sp_a: a link (href) or an anchor (name)
+br_sp_a:
+    PUSHA
+    mov r13, rsi
+    mov rsi, r13
+    lea rdi, [n_name]
+    call br_attr
+    jnz .href
+    test ecx, ecx
+    jz .href
+    mov rsi, rdx
+    call css_hash
+    or eax, 0x80000000
+    call br_anchor
+.href:
+    mov rsi, r13
+    lea rdi, [n_href]
+    call br_attr
+    jnz .o
+    test ecx, ecx
+    jz .o
+    mov r12, rdx
+    mov r14d, ecx
+    xor eax, eax                    ; item type 0 = link
+    call br_item_new
+    js .o
+    mov r15d, eax
+    shl eax, 7
+    lea rdi, [BRL+rax]
+    mov rsi, r12
+    mov ecx, r14d
+    cmp ecx, 126
+    jbe .c
+    mov ecx, 126
+.c: rep movsb
+    mov byte [rdi], 0
+    cmp dword [br_hid], 0           ; two links side by side get a blank between them
+    jne .nsp
+    mov eax, [br_col]
+    cmp eax, [br_x0]
+    jbe .nsp
+    imul edx, [br_row], COLS
+    add edx, eax
+    cmp byte [BRA+rdx-1], 8
+    jb .nsp
+    mov byte [br_pend], 1
+.nsp:
+    lea eax, [r15+8]
+    mov [br_lk], al
+.o: POPA
+    ret
+
+; br_item_new: eax = type -> eax = new item number (or -1 when the table is full)
+br_item_new:
+    push rcx
+    push rdx
+    mov ecx, [br_nlk]
+    cmp ecx, BR_NLK
+    jae .full
+    mov edx, ecx
+    shl edx, 4
+    mov byte [BR_ITM+rdx], al
+    movzx eax, byte [br_form]
+    mov [BR_ITM+rdx+1], al
+    mov byte [BR_ITM+rdx+2], 0
+    mov byte [BR_ITM+rdx+3], 0
+    mov dword [BR_ITM+rdx+4], 0
+    mov dword [BR_ITM+rdx+8], 0
+    mov dword [BR_ITM+rdx+12], 0
+    mov eax, ecx
+    inc dword [br_nlk]
+    jmp .o
+.full:
+    mov eax, -1
+.o: test eax, eax
+    pop rdx
+    pop rcx
+    ret
+
+; br_anchor: eax = hash (bit 31 set) of an id/name at the current row
+br_anchor:
+    push rcx
+    push rdx
+    mov ecx, [br_nanc]
+    cmp ecx, BR_NANC
+    jae .o
+    mov edx, ecx
+    shl edx, 3
+    mov [BR_ANC+rdx], eax
+    mov eax, [br_row]
+    mov [BR_ANC+rdx+4], eax
+    inc dword [br_nanc]
+.o: pop rdx
+    pop rcx
+    ret
+
+; ------------------------------------------------------------------- tables ---
+tag_tab:
+    dq 'html'
+    dd TF_BLK, S_BODY
+    dq 'head'
+    dd TF_HID, 0
+    dq 'body'
+    dd TF_BLK, S_BODY
+    dq 'title'
+    dd 0, S_TITLE
+    dq 'meta'
+    dd TF_VOID, S_META
+    dq 'link'
+    dd TF_VOID, 0
+    dq 'base'
+    dd TF_VOID, 0
+    dq 'script'
+    dd 0, S_SKIP
+    dq 'style'
+    dd 0, S_STYLE
+    dq 'noscrip'
+    dd 0, S_SKIP
+    dq 'svg'
+    dd 0, S_SKIP
+    dq 'templat'
+    dd 0, S_SKIP
+    dq 'iframe'
+    dd 0, S_SKIP
+    dq 'canvas'
+    dd 0, S_SKIP
+    dq 'object'
+    dd 0, S_SKIP
+    dq 'select'
+    dd TF_VOID, S_SELECT
+    dq 'h1'
+    dd TF_BLK|TF_GAP|TF_BOLD|TF_BIG, 0
+    dq 'h2'
+    dd TF_BLK|TF_GAP|TF_BOLD|TF_BIG, 0
+    dq 'h3'
+    dd TF_BLK|TF_GAP|TF_BOLD, 0
+    dq 'h4'
+    dd TF_BLK|TF_GAP|TF_BOLD, 0
+    dq 'h5'
+    dd TF_BLK|TF_GAP|TF_BOLD, 0
+    dq 'h6'
+    dd TF_BLK|TF_GAP|TF_BOLD, 0
+    dq 'p'
+    dd TF_BLK|TF_GAP|TF_SELF, 0
+    dq 'div'
+    dd TF_BLK|TF_SCOPE, 0
+    dq 'section'
+    dd TF_BLK, 0
+    dq 'article'
+    dd TF_BLK, 0
+    dq 'header'
+    dd TF_BLK, 0
+    dq 'footer'
+    dd TF_BLK, 0
+    dq 'nav'
+    dd TF_BLK, 0
+    dq 'main'
+    dd TF_BLK, 0
+    dq 'aside'
+    dd TF_BLK, 0
+    dq 'figure'
+    dd TF_BLK, 0
+    dq 'figcapt'
+    dd TF_BLK, 0
+    dq 'address'
+    dd TF_BLK, 0
+    dq 'details'
+    dd TF_BLK, 0
+    dq 'summary'
+    dd TF_BLK|TF_BOLD, 0
+    dq 'fieldse'
+    dd TF_BLK, 0
+    dq 'legend'
+    dd TF_BLK|TF_BOLD, 0
+    dq 'form'
+    dd TF_BLK, S_FORM
+    dq 'ul'
+    dd TF_BLK|TF_GAP|TF_SCOPE|TF_LIST, S_LIST
+    dq 'menu'
+    dd TF_BLK|TF_GAP|TF_SCOPE|TF_LIST, S_LIST
+    dq 'dir'
+    dd TF_BLK|TF_GAP|TF_SCOPE|TF_LIST, S_LIST
+    dq 'ol'
+    dd TF_BLK|TF_GAP|TF_SCOPE|TF_LIST, S_OL
+    dq 'li'
+    dd TF_BLK|TF_SELF, S_LI
+    dq 'dl'
+    dd TF_BLK|TF_GAP|TF_SCOPE, 0
+    dq 'dt'
+    dd TF_BLK|TF_SELF|TF_BOLD, 0
+    dq 'dd'
+    dd TF_BLK|TF_SELF|TF_IND4, 0
+    dq 'blockqu'
+    dd TF_BLK|TF_GAP|TF_IND4, 0
+    dq 'pre'
+    dd TF_BLK|TF_GAP|TF_PRE|TF_CODE, 0
+    dq 'center'
+    dd TF_BLK|TF_CTR, 0
+    dq 'table'
+    dd TF_BLK|TF_SCOPE, S_TABLE
+    dq 'tr'
+    dd TF_BLK|TF_SELF, 0
+    dq 'td'
+    dd TF_SELF, S_CELL
+    dq 'th'
+    dd TF_SELF|TF_BOLD, S_CELL
+    dq 'a'
+    dd TF_LINK, S_A
+    dq 'b'
+    dd TF_BOLD, 0
+    dq 'strong'
+    dd TF_BOLD, 0
+    dq 'u'
+    dd TF_UL, 0
+    dq 'ins'
+    dd TF_UL, 0
+    dq 's'
+    dd TF_STRIKE, 0
+    dq 'strike'
+    dd TF_STRIKE, 0
+    dq 'del'
+    dd TF_STRIKE, 0
+    dq 'code'
+    dd TF_CODE, 0
+    dq 'kbd'
+    dd TF_CODE, 0
+    dq 'samp'
+    dd TF_CODE, 0
+    dq 'tt'
+    dd TF_CODE, 0
+    dq 'mark'
+    dd TF_MARK, 0
+    dq 'br'
+    dd TF_VOID, S_BR
+    dq 'hr'
+    dd TF_VOID|TF_BLK, S_HR
+    dq 'img'
+    dd TF_VOID, S_IMG
+    dq 'input'
+    dd TF_VOID, S_INPUT
+    dq 'button'
+    dd TF_VOID, S_BUTTON
+    dq 'textare'
+    dd TF_VOID, S_TEXTAREA
+    dq 'font'
+    dd 0, S_FONT
+    dq 'area'
+    dd TF_VOID, 0
+    dq 'col'
+    dd TF_VOID, 0
+    dq 'embed'
+    dd TF_VOID, 0
+    dq 'param'
+    dd TF_VOID, 0
+    dq 'source'
+    dd TF_VOID, 0
+    dq 'track'
+    dd TF_VOID, 0
+    dq 'wbr'
+    dd TF_VOID, 0
+    dq 0
+
+; ---- end html3.inc
+; ---- begin html4.inc
+; =============================================================================
+;  HTML renderer, part 4: tables
+;  A table is scanned for its rows and cells, every cell is measured (shortest
+;  word / longest line), the column widths are chosen to fit the page, and then
+;  the content of every cell is rendered into its own column of the grid.
+; =============================================================================
+BR_TBS  equ BRS+0x1CC00             ; table state per nesting level: 0x80 bytes
+
+; br_tagend: rdx = just behind a tag name -> rdx = the '>' that ends the tag (or the end of the page)
+br_tagend:
+    push rax
+    push rcx
+    xor ecx, ecx
+.l: cmp rdx, [br_end]
+    jae .r
+    mov al, [rdx]
+    test cl, cl
+    jz .q0
+    cmp al, cl
+    jne .n
+    xor ecx, ecx
+    jmp .n
+.q0:
+    cmp al, '>'
+    je .r
+    cmp al, '"'
+    je .q1
+    cmp al, 39
+    jne .n
+.q1:
+    mov cl, al
+.n: inc rdx
+    jmp .l
+.r: pop rcx
+    pop rax
+    ret
+
+; br_tbl_end: rsi = start of the table's content -> rsi = the '<' of the matching </table>, rdx = its '>'
+br_tbl_end:
+    push rax
+    push rcx
+    xor ecx, ecx                    ; nesting depth
+.l: cmp rsi, [br_end]
+    jae .e
+    cmp byte [rsi], '<'
+    jne .n
+    cmp byte [rsi+1], '/'
+    jne .o1
+    mov eax, [rsi+2]
+    or eax, 0x20202020
+    cmp eax, 'tabl'
+    jne .n
+    test ecx, ecx
+    jz .f
+    dec ecx
+    jmp .n
+.o1:
+    mov eax, [rsi+1]
+    or eax, 0x20202020
+    cmp eax, 'tabl'
+    jne .n
+    inc ecx
+.n: inc rsi
+    jmp .l
+.f: mov rdx, rsi
+    call br_tagend
+    jmp .r
+.e: mov rsi, [br_end]
+    mov rdx, rsi
+.r: pop rcx
+    pop rax
+    ret
+
+; br_taglook: rax = tag name -> rdi = its entry in the tag table (tag_unknown when it has none)
+br_taglook:
+    push rdx
+    lea rdi, [tag_tab]
+.lk:
+    mov rdx, [rdi]
+    test rdx, rdx
+    jz .unk
+    cmp rdx, rax
+    je .r
+    add rdi, 16
+    jmp .lk
+.unk:
+    lea rdi, [tag_unknown]
+.r: pop rdx
+    ret
+
+; --------------------------------------------------------------- scanning -----
+; br_tbl_scan: r15 = table state, r8 = end of the <table> tag.
+;   fills the cell array (56 bytes each) and the row array (24 bytes each)
+br_tbl_scan:
+    PUSHA
+    lea rsi, [r8+1]
+    mov r9, [br_end]
+    xor r10d, r10d                  ; nesting depth
+    xor r12d, r12d                  ; the open cell (0 = none)
+    xor r13d, r13d                  ; cells so far
+    xor r14d, r14d                  ; rows so far
+    xor ebp, ebp                    ; the open row (0 = none)
+    mov rax, [br_tbp]
+    mov [r15+8], rax
+    mov rax, [br_rbp]
+    mov [r15+16], rax
+.lp:
+    cmp rsi, r9
+    jae .eof
+    cmp byte [rsi], '<'
+    je .tag
+    inc rsi
+    jmp .lp
+.tag:
+    mov rbx, rsi                    ; start of the tag
+    lea rdx, [rsi+1]
+    cmp rdx, r9
+    jae .eof
+    mov al, [rdx]
+    cmp al, '!'
+    jne .t1
+    cmp word [rdx+1], '--'
+    jne .skipgt
+    lea rsi, [rdx+3]
+    lea rdi, [n_cmt]
+    call br_find
+    add rsi, 3
+    jmp .lp
+.skipgt:
+    mov rsi, rdx
+.sg:
+    cmp rsi, r9
+    jae .eof
+    cmp byte [rsi], '>'
+    je .sg1
+    inc rsi
+    jmp .sg
+.sg1:
+    inc rsi
+    jmp .lp
+.t1:
+    cmp al, '?'
+    je .skipgt
+    xor r11d, r11d                  ; closing flag
+    cmp al, '/'
+    jne .t2
+    inc rdx
+    mov r11d, 1
+    mov al, [rdx]
+.t2:
+    or al, 0x20
+    cmp al, 'a'
+    jb .lit
+    cmp al, 'z'
+    ja .lit
+    mov qword [br_tg2], 0
+    xor edi, edi
+.nm:
+    cmp rdx, r9
+    jae .nmd
+    movzx ecx, byte [rdx]
+    cmp cl, '>'
+    je .nmd
+    cmp cl, ' '
+    jbe .nmd
+    cmp cl, '/'
+    je .nmd
+    or cl, 0x20
+    cmp edi, 7
+    jae .nms
+    mov [br_tg2+rdi], cl
+    inc edi
+.nms:
+    inc rdx
+    jmp .nm
+.nmd:
+    mov rax, [br_tg2]
+    mov rdi, rdx                    ; just behind the name
+    call br_tagend
+    mov r8, rdx                     ; the '>'
+    mov rdx, rdi
+    mov rcx, 'script'
+    cmp rax, rcx
+    je .skipblk
+    mov rcx, 'style'
+    cmp rax, rcx
+    je .skipblk
+    mov rcx, 'table'
+    cmp rax, rcx
+    je .tbl
+    test r10d, r10d
+    jnz .next
+    mov rcx, 'tr'
+    cmp rax, rcx
+    je .tr
+    mov rcx, 'td'
+    cmp rax, rcx
+    je .td
+    mov rcx, 'th'
+    cmp rax, rcx
+    je .td
+    mov rcx, 'tbody'
+    cmp rax, rcx
+    je .sect
+    mov rcx, 'thead'
+    cmp rax, rcx
+    je .sect
+    mov rcx, 'tfoot'
+    cmp rax, rcx
+    je .sect
+    mov rcx, 'caption'
+    cmp rax, rcx
+    je .cap
+.next:
+    lea rsi, [r8+1]
+    jmp .lp
+.lit:
+    lea rsi, [rbx+1]
+    jmp .lp
+.skipblk:
+    test r11d, r11d
+    jnz .next
+    lea rdi, [BR_TMP+0x100]
+    mov word [rdi], '</'
+    mov [rdi+2], rax
+    mov byte [rdi+10], 0
+    mov rsi, r8
+    call br_find
+    mov rdx, rsi
+    call br_tagend
+    lea rsi, [rdx+1]
+    jmp .lp
+.tbl:
+    test r11d, r11d
+    jnz .tc
+    inc r10d
+    jmp .next
+.tc:
+    test r10d, r10d
+    jz .end
+    dec r10d
+    jmp .next
+.sect:
+    call .fin
+    jmp .next
+.tr:
+    call .fin
+    test r11d, r11d
+    jnz .next
+    xor ebp, ebp
+    call .newrow
+    test rbp, rbp
+    jz .next
+    mov [rbp+8], rdx                ; attributes of the <tr>
+    mov [rbp+16], r8
+    jmp .next
+.td:
+    call .fin
+    test r11d, r11d
+    jnz .next
+    test rbp, rbp
+    jnz .hr
+    call .newrow
+    test rbp, rbp
+    jz .next
+    mov qword [rbp+8], 0
+    mov qword [rbp+16], 0
+.hr:
+    mov rdi, [br_tbp]
+    mov eax, r13d
+    imul eax, eax, 56
+    add rdi, rax
+    lea rax, [BR_CEL+BR_NCEL*56-56]
+    cmp rdi, rax
+    ja .next
+    mov r12, rdi
+    xor eax, eax
+    mov ecx, 14
+    rep stosd
+    lea rax, [r8+1]
+    mov [r12], rax
+    mov [r12+16], rdx
+    mov [r12+24], r8
+    mov word [r12+34], 1
+    mov rcx, 'th'
+    cmp qword [br_tg2], rcx
+    jne .nth
+    mov byte [r12+44], 1
+.nth:
+    mov rsi, rdx
+    lea rdi, [n_colspan]
+    call br_attr
+    jnz .cs1
+    mov rsi, rdx
+    call br_num
+    test eax, eax
+    jz .cs1
+    cmp eax, 40
+    jbe .cs2
+    mov eax, 40
+.cs2:
+    mov [r12+34], ax
+.cs1:
+    inc r13d
+    jmp .next
+.cap:
+    test r11d, r11d
+    jnz .next
+    lea rax, [r8+1]
+    mov [r15+48], rax
+    lea rdi, [n_capend]
+    mov rsi, rax
+    call br_find
+    mov [r15+56], rsi
+    mov rdx, rsi
+    call br_tagend
+    lea rsi, [rdx+1]
+    jmp .lp
+.eof:
+    mov rbx, r9
+    mov r8, r9
+.end:
+    call .fin
+    mov [r15+40], r8
+    mov [r15+76], r13d
+    mov [r15+4], r14d
+    ; the number of cells in each row
+    xor ecx, ecx
+.rc:
+    cmp ecx, r14d
+    jae .rd
+    mov rax, [r15+16]
+    lea rax, [rax+rcx*8]
+    lea rax, [rax+rcx*8]
+    lea rax, [rax+rcx*8]            ; + 24 * ecx
+    lea edx, [rcx+1]
+    cmp edx, r14d
+    jae .last
+    mov edi, [rax+24]
+    jmp .set
+.last:
+    mov edi, r13d
+.set:
+    sub edi, [rax]
+    mov [rax+4], edi
+    inc ecx
+    jmp .rc
+.rd:
+    mov eax, r13d
+    imul eax, eax, 56
+    add rax, [br_tbp]
+    mov [br_tbp], rax
+    mov eax, r14d
+    imul eax, eax, 24
+    add rax, [br_rbp]
+    mov [br_rbp], rax
+    POPA
+    ret
+.fin:                               ; closes the open cell at the start of the current tag
+    test r12, r12
+    jz .fr
+    mov [r12+8], rbx
+    xor r12d, r12d
+.fr:
+    ret
+.newrow:                            ; -> rbp = the new row (or 0 when the row array is full)
+    mov rax, [br_rbp]
+    mov ecx, r14d
+    imul ecx, ecx, 24
+    add rax, rcx
+    lea rcx, [BR_ROW+BR_NROW*24-24]
+    cmp rax, rcx
+    ja .nr0
+    mov rbp, rax
+    mov [rbp], r13d
+    mov dword [rbp+4], 0
+    inc r14d
+    ret
+.nr0:
+    xor ebp, ebp
+    ret
+
+; -------------------------------------------------------------- measuring -----
+; br_measure: rsi = start, rdi = end -> br_mw_min = longest word, br_mw_max = longest line (in characters)
+br_measure:
+    PUSHA
+    mov r14, rdi
+    mov rax, [br_end]
+    push rax
+    mov [br_end], r14
+    xor r8d, r8d                    ; current line
+    xor r9d, r9d                    ; current word
+    xor r10d, r10d                  ; longest line
+    xor r11d, r11d                  ; longest word
+    xor r13d, r13d                  ; a blank is pending
+.lp:
+    cmp rsi, r14
+    jae .fin
+    movzx eax, byte [rsi]
+    inc rsi
+    cmp al, '<'
+    je .tag
+    cmp al, '&'
+    je .ent
+    cmp al, ' '
+    jbe .ws
+    mov bl, al
+    and bl, 0xC0
+    cmp bl, 0x80
+    je .lp
+    call .cnt
+    jmp .lp
+.ent:
+    mov ecx, 10
+.en:
+    cmp rsi, r14
+    jae .ec
+    cmp byte [rsi], ';'
+    je .ee
+    cmp byte [rsi], ' '
+    jbe .ec
+    inc rsi
+    dec ecx
+    jnz .en
+    jmp .ec
+.ee:
+    inc rsi
+.ec:
+    call .cnt
+    jmp .lp
+.ws:
+    mov r13d, 1
+    call .eword
+    jmp .lp
+.cnt:                               ; one visible character
+    test r13d, r13d
+    jz .c1
+    xor r13d, r13d
+    test r8d, r8d
+    jz .c1
+    inc r8d
+.c1:
+    inc r8d
+    inc r9d
+    ret
+.addw:                              ; eax = a word of that many characters
+    test r13d, r13d
+    jz .a1
+    xor r13d, r13d
+    test r8d, r8d
+    jz .a1
+    inc r8d
+.a1:
+    add r8d, eax
+    add r9d, eax
+    call .eword
+    ret
+.eword:
+    cmp r9d, r11d
+    jbe .ew
+    mov r11d, r9d
+.ew:
+    xor r9d, r9d
+    ret
+.eline:
+    call .eword
+    cmp r8d, r10d
+    jbe .el
+    mov r10d, r8d
+.el:
+    xor r8d, r8d
+    xor r13d, r13d
+    ret
+.tag:
+    cmp rsi, r14
+    jae .fin
+    cmp byte [rsi], '!'
+    jne .t1
+    cmp word [rsi+1], '--'
+    jne .sgt
+    add rsi, 3
+    lea rdi, [n_cmt]
+    call br_find
+    add rsi, 3
+    jmp .lp
+.sgt:
+    mov rdx, rsi
+    call br_tagend
+    lea rsi, [rdx+1]
+    jmp .lp
+.t1:
+    cmp byte [rsi], '?'
+    je .sgt
+    xor r15d, r15d
+    cmp byte [rsi], '/'
+    jne .t2
+    inc rsi
+    mov r15d, 1
+.t2:
+    mov al, [rsi]
+    or al, 0x20
+    cmp al, 'a'
+    jb .lt
+    cmp al, 'z'
+    ja .lt
+    mov qword [br_tg2], 0
+    xor edi, edi
+.nm:
+    cmp rsi, r14
+    jae .nmd
+    movzx ecx, byte [rsi]
+    cmp cl, '>'
+    je .nmd
+    cmp cl, ' '
+    jbe .nmd
+    cmp cl, '/'
+    je .nmd
+    or cl, 0x20
+    cmp edi, 7
+    jae .nms
+    mov [br_tg2+rdi], cl
+    inc edi
+.nms:
+    inc rsi
+    jmp .nm
+.nmd:
+    mov rbx, rsi                    ; behind the name
+    mov rdx, rsi
+    call br_tagend
+    mov r12, rdx                    ; the '>'
+    lea rsi, [r12+1]                ; default: go on behind the tag
+    mov rax, [br_tg2]
+    call br_taglook
+    mov ebp, [rdi+8]
+    mov ecx, [rdi+12]
+    test r15d, r15d
+    jnz .close
+    cmp ecx, S_SKIP
+    je .skip
+    cmp ecx, S_STYLE
+    je .skip
+    cmp ecx, S_SELECT
+    je .skip
+    cmp ecx, S_IMG
+    je .img
+    cmp ecx, S_INPUT
+    je .inp
+    cmp ecx, S_BR
+    je .brk
+    cmp ecx, S_CELL
+    je .cell
+    test ebp, TF_BLK
+    jnz .brk
+    jmp .lp
+.close:
+    cmp ecx, S_CELL
+    je .cell
+    test ebp, TF_BLK
+    jnz .brk
+    jmp .lp
+.brk:
+    call .eline
+    jmp .lp
+.cell:
+    mov r13d, 1
+    call .eword
+    jmp .lp
+.skip:
+    lea rdi, [BR_TMP+0x100]
+    mov word [rdi], '</'
+    mov rax, [br_tg2]
+    mov [rdi+2], rax
+    mov byte [rdi+10], 0
+    mov rsi, r12
+    call br_find
+    jmp .lp
+.img:
+    push r8
+    mov r8, r12
+    mov rsi, rbx
+    lea rdi, [n_alt]
+    call br_attr
+    pop r8
+    lea rsi, [r12+1]
+    jnz .lp
+    test ecx, ecx
+    jz .lp
+    lea eax, [rcx+2]
+    call .addw
+    jmp .lp
+.inp:
+    push r8
+    mov r8, r12
+    mov rsi, rbx
+    lea rdi, [n_type]
+    call br_attr
+    mov al, 't'
+    jnz .i1
+    test ecx, ecx
+    jz .i1
+    mov al, [rdx]
+    or al, 0x20
+.i1:
+    cmp al, 'h'
+    je .ih
+    cmp al, 's'
+    je .ib
+    cmp al, 'b'
+    je .ib
+    cmp al, 'r'
+    je .ib
+    cmp al, 'c'
+    je .ic
+    mov rsi, rbx                    ; text field: size= or 20
+    lea rdi, [n_size]
+    call br_attr
+    mov eax, 20
+    jnz .iw
+    mov rsi, rdx
+    call br_num
+    test eax, eax
+    jnz .iw
+    mov eax, 20
+.iw:
+    cmp eax, 40
+    jbe .iw2
+    mov eax, 40
+.iw2:
+    pop r8
+    lea rsi, [r12+1]
+    call .addw
+    jmp .lp
+.ib:
+    mov rsi, rbx
+    lea rdi, [n_value]
+    call br_attr
+    mov eax, 6
+    jnz .ibw
+    lea eax, [rcx+4]
+.ibw:
+    pop r8
+    lea rsi, [r12+1]
+    call .addw
+    jmp .lp
+.ic:
+    mov eax, 4
+    jmp .iw2
+.ih:
+    pop r8
+    lea rsi, [r12+1]
+    jmp .lp
+.lt:
+    mov al, '<'
+    call .cnt
+    jmp .lp
+.fin:
+    call .eline
+    mov [br_mw_min], r11d
+    mov [br_mw_max], r10d
+    pop rax
+    mov [br_end], rax
+    POPA
+    ret
+
+; ------------------------------------------------------------------ layout ----
+; br_sp_table: rsi = just behind the tag name, r8 = end of the <table> tag, r11d = tag flags
+;   lays the table out; on return the caller's r8 = the '>' of the closing </table>
+br_sp_table:
+    PUSHA
+    cmp dword [br_tbd], 3
+    jae .flat
+    mov eax, [br_tbd]
+    imul eax, eax, 0x100
+    lea r15, [BR_TBS+rax]
+    mov rdi, r15
+    mov ecx, 64
+    xor eax, eax
+    rep stosd
+    mov rax, [br_tbp]
+    mov [r15+80], rax
+    mov rax, [br_rbp]
+    mov [r15+88], rax
+    mov rax, [br_end]
+    mov [r15+104], rax
+    mov [r15+112], r8
+    mov eax, [br_x0]
+    mov [r15+152], eax
+    mov eax, [br_x1]
+    mov [r15+156], eax
+    mov eax, [br_rtop]
+    mov [r15+160], eax
+    mov eax, [br_fbase]
+    mov [r15+164], eax
+    mov rax, [br_tg]
+    mov [r15+176], rax
+    call br_nl_if
+    call br_open_style
+    jc .nofr
+    mov eax, [br_sp]
+    dec eax
+    mov [r15+96], eax
+    mov dword [r15+100], 1
+.nofr:
+    movzx eax, byte [br_bord]
+    mov [r15+24], eax
+    lea rdi, [n_border]
+    call br_attr
+    jnz .nb
+    mov dword [r15+24], 1
+    test ecx, ecx
+    jz .nb
+    mov rsi, rdx
+    call br_num
+    test eax, eax
+    jnz .nb
+    mov dword [r15+24], 0
+.nb:
+    xor eax, eax
+    cmp byte [br_al], 1
+    sete al
+    mov [r15+28], eax
+    mov byte [br_al], 0
+    mov eax, [br_x1]
+    sub eax, [br_x0]
+    mov [r15+68], eax
+    mov eax, [br_ewidth]
+    mov [r15+64], eax
+    inc dword [br_tbd]
+    call br_tbl_scan
+    cmp dword [r15+76], 0
+    je .done
+    call br_tbl_cols
+    call br_tbl_measure
+    call br_tbl_widths
+    call br_tbl_caption
+    call br_tbl_render
+.done:
+    dec dword [br_tbd]
+    mov rax, [r15+80]
+    mov [br_tbp], rax
+    mov rax, [r15+88]
+    mov [br_rbp], rax
+    mov rax, [r15+104]
+    mov [br_end], rax
+    mov eax, [r15+152]
+    mov [br_x0], eax
+    mov [br_col], eax
+    mov eax, [r15+156]
+    mov [br_x1], eax
+    mov eax, [r15+160]
+    mov [br_rtop], eax
+    mov eax, [r15+164]
+    mov [br_fbase], eax
+    mov dword [br_lineh], 1
+    mov byte [br_pend], 0
+    cmp dword [r15+100], 0
+    je .nf
+    mov ecx, [r15+96]
+    call br_fr_pop
+.nf:
+    mov rax, [r15+40]
+    test rax, rax
+    jnz .rt
+    mov rax, [br_end]
+.rt:
+    mov [rsp+56], rax               ; the caller's r8
+    POPA
+    ret
+.flat:                              ; nested too deep: the content is shown as plain flow
+    call br_nl_if
+    lea rsi, [r8+1]
+    mov r12, rsi
+    call br_tbl_end
+    mov r13, rsi
+    mov r14, rdx
+    mov rsi, r12
+    mov r9, r13
+    mov rax, [br_end]
+    push rax
+    mov [br_end], r13
+    call br_walk
+    pop rax
+    mov [br_end], rax
+    call br_nl_if
+    mov [rsp+56], r14
+    POPA
+    ret
+
+; br_tbl_cols: assigns the first column of every cell, finds the number of columns
+br_tbl_cols:
+    PUSHA
+    mov r12d, [r15+4]
+    xor r13d, r13d
+    xor ebx, ebx
+.row:
+    cmp r13d, r12d
+    jae .done
+    imul ecx, r13d, 24
+    mov rdi, [r15+16]
+    add rdi, rcx
+    mov ecx, [rdi+4]
+    mov eax, [rdi]
+    imul eax, eax, 56
+    add rax, [r15+8]
+    mov rsi, rax
+    xor edx, edx
+.c: test ecx, ecx
+    jz .re
+    cmp edx, 39
+    jbe .ok
+    mov edx, 39
+.ok:
+    mov [rsi+32], dx
+    movzx eax, word [rsi+34]
+    add edx, eax
+    add rsi, 56
+    dec ecx
+    jmp .c
+.re:
+    cmp edx, 40
+    jbe .m
+    mov edx, 40
+.m: cmp edx, ebx
+    jbe .n
+    mov ebx, edx
+.n: inc r13d
+    jmp .row
+.done:
+    test ebx, ebx
+    jnz .s
+    mov ebx, 1
+.s: mov [r15], ebx
+    POPA
+    ret
+
+; br_tbl_measure: the shortest and longest line of every cell and the width its style asks for
+br_tbl_measure:
+    PUSHA
+    mov ebx, [r15+76]
+    mov rbp, [r15+8]
+.l: test ebx, ebx
+    jz .d
+    mov rsi, [rbp]
+    mov rdi, [rbp+8]
+    cmp rdi, rsi
+    jae .e
+    mov rdi, rsi
+.e: call br_measure
+    mov eax, [br_mw_min]
+    cmp eax, 255
+    jbe .m1
+    mov eax, 255
+.m1:
+    mov [rbp+40], ax
+    mov eax, [br_mw_max]
+    cmp eax, 255
+    jbe .m2
+    mov eax, 255
+.m2:
+    mov [rbp+42], ax
+    mov rax, 'td'
+    mov r11d, 0
+    cmp byte [rbp+44], 0
+    je .t
+    mov rax, 'th'
+    mov r11d, TF_BOLD|TF_CTR
+.t: mov [br_tg], rax
+    mov rsi, [rbp+16]
+    mov r8, [rbp+24]
+    mov r12d, S_CELL
+    mov dword [br_peek], 1
+    call br_open_style
+    mov dword [br_peek], 0
+    jc .nw
+    mov eax, [br_ewidth]
+    mov [rbp+48], eax
+    mov ecx, [br_sp]
+    dec ecx
+    call br_fr_pop
+.nw:
+    add rbp, 56
+    dec ebx
+    jmp .l
+.d: POPA
+    ret
+
+; br_tbl_widths: chooses the column widths and their x positions
+br_tbl_widths:
+    PUSHA
+    mov r14d, [r15]                 ; columns
+    mov eax, [br_tbd]
+    dec eax
+    imul eax, eax, 0x400
+    lea rbx, [BR_COL+rax]
+    mov [r15+168], rbx
+    mov rdi, rbx
+    mov ecx, 256
+    xor eax, eax
+    rep stosd
+    mov eax, [r15+24]
+    test eax, eax
+    jz .nb
+    lea eax, [r14*2+r14+1]
+    jmp .ov
+.nb:
+    lea eax, [r14*2-2]
+.ov:
+    mov [r15+72], eax
+    mov eax, [r15+68]
+    sub eax, [r15+72]
+    cmp eax, r14d
+    jge .av
+    mov eax, r14d
+.av:
+    mov r12d, eax                   ; available width of the columns
+    ; ---- pass 1: single column cells
+    mov ecx, [r15+76]
+    mov rbp, [r15+8]
+.p1:
+    test ecx, ecx
+    jz .p2s
+    movzx edx, word [rbp+32]
+    cmp edx, r14d
+    jae .p1n
+    cmp word [rbp+34], 1
+    jne .p1n
+    movzx eax, word [rbp+40]        ; min
+    movzx esi, word [rbp+42]        ; max
+    mov edi, [rbp+48]               ; width asked for
+    test edi, edi
+    jz .p1m
+    test edi, 0x80000000
+    jz .p1c
+    and edi, 0xFF                   ; percent of the available width
+    imul edi, r12d
+    push rax
+    push rdx
+    mov eax, edi
+    xor edx, edx
+    mov edi, 100
+    div edi
+    mov edi, eax
+    pop rdx
+    pop rax
+    jmp .p1x
+.p1c:
+    and edi, 0xFFFF
+.p1x:
+    cmp edi, eax
+    jae .p1y
+    mov edi, eax
+.p1y:
+    mov esi, edi
+.p1m:
+    cmp eax, [rbx+rdx*4]
+    jbe .p1a
+    mov [rbx+rdx*4], eax
+.p1a:
+    cmp esi, [rbx+0xA0+rdx*4]
+    jbe .p1n
+    mov [rbx+0xA0+rdx*4], esi
+.p1n:
+    add rbp, 56
+    dec ecx
+    jmp .p1
+    ; ---- pass 2: cells spanning several columns
+.p2s:
+    mov ecx, [r15+76]
+    mov rbp, [r15+8]
+.p2:
+    test ecx, ecx
+    jz .fix
+    movzx edx, word [rbp+32]
+    movzx esi, word [rbp+34]
+    cmp esi, 1
+    jbe .p2n
+    cmp edx, r14d
+    jae .p2n
+    mov eax, r14d
+    sub eax, edx
+    cmp esi, eax
+    jbe .p2a
+    mov esi, eax
+.p2a:
+    xor eax, eax                    ; sum of the minimums
+    xor edi, edi
+    push rcx
+    xor ecx, ecx
+.p2s1:
+    cmp ecx, esi
+    jae .p2s2
+    lea r8d, [rdx+rcx]
+    add eax, [rbx+r8*4]
+    add edi, [rbx+0xA0+r8*4]
+    inc ecx
+    jmp .p2s1
+.p2s2:
+    pop rcx
+    lea r9d, [rdx+rsi-1]            ; last spanned column
+    movzx r10d, word [rbp+40]
+    sub r10d, eax
+    jbe .p2m
+    add [rbx+r9*4], r10d
+.p2m:
+    movzx r10d, word [rbp+42]
+    sub r10d, edi
+    jbe .p2n
+    add [rbx+0xA0+r9*4], r10d
+.p2n:
+    add rbp, 56
+    dec ecx
+    jmp .p2
+.fix:
+    xor ecx, ecx
+    xor r8d, r8d                    ; sum of minimums
+    xor r9d, r9d                    ; sum of maximums
+.f1:
+    cmp ecx, r14d
+    jae .tw
+    mov eax, [rbx+rcx*4]
+    test eax, eax
+    jnz .f2
+    mov eax, 1
+.f2:
+    mov [rbx+rcx*4], eax
+    mov edx, [rbx+0xA0+rcx*4]
+    cmp edx, eax
+    jae .f3
+    mov edx, eax
+.f3:
+    mov [rbx+0xA0+rcx*4], edx
+    add r8d, eax
+    add r9d, edx
+    inc ecx
+    jmp .f1
+.tw:                                ; target width
+    mov r10d, r12d
+    xor r11d, r11d                  ; 1 = the table asks for a width
+    mov edx, [r15+64]
+    test edx, edx
+    jz .tgo
+    mov r11d, 1
+    test edx, 0x80000000
+    jz .twc
+    and edx, 0xFF
+    mov eax, [r15+68]
+    imul eax, edx
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    jmp .tws
+.twc:
+    and edx, 0xFFFF
+    mov eax, edx
+.tws:
+    sub eax, [r15+72]
+    cmp eax, r14d
+    jge .tw1
+    mov eax, r14d
+.tw1:
+    cmp eax, r12d
+    jbe .tw2
+    mov eax, r12d
+.tw2:
+    mov r10d, eax
+.tgo:
+    ; r8d = sum min, r9d = sum max, r10d = target, r11d = width asked for
+    xor ecx, ecx
+    cmp r9d, r10d
+    jbe .fits
+.shrink:
+    cmp r8d, r10d
+    jae .scale
+    ; between minimum and maximum
+    mov esi, r9d
+    sub esi, r8d                    ; sum(max-min)
+    mov edi, r10d
+    sub edi, r8d                    ; room
+.s1:
+    cmp ecx, r14d
+    jae .total
+    mov eax, [rbx+0xA0+rcx*4]
+    sub eax, [rbx+rcx*4]
+    imul eax, edi
+    xor edx, edx
+    div esi
+    add eax, [rbx+rcx*4]
+    mov [rbx+0x140+rcx*4], eax
+    inc ecx
+    jmp .s1
+.scale:
+.s2:
+    cmp ecx, r14d
+    jae .total
+    mov eax, [rbx+rcx*4]
+    imul eax, r10d
+    xor edx, edx
+    div r8d
+    test eax, eax
+    jnz .s3
+    mov eax, 1
+.s3:
+    mov [rbx+0x140+rcx*4], eax
+    inc ecx
+    jmp .s2
+.fits:
+    test r11d, r11d
+    jz .copy
+    cmp r10d, r9d
+    jbe .copy
+    ; the table is wider than its content: spread the extra room in proportion
+    mov esi, r10d
+    sub esi, r9d                    ; extra
+.e1:
+    cmp ecx, r14d
+    jae .total
+    mov eax, [rbx+0xA0+rcx*4]
+    imul eax, esi
+    xor edx, edx
+    div r9d
+    add eax, [rbx+0xA0+rcx*4]
+    mov [rbx+0x140+rcx*4], eax
+    inc ecx
+    jmp .e1
+.copy:
+    cmp ecx, r14d
+    jae .total
+    mov eax, [rbx+0xA0+rcx*4]
+    mov [rbx+0x140+rcx*4], eax
+    inc ecx
+    jmp .copy
+.total:
+    xor ecx, ecx
+    xor eax, eax
+.t1:
+    cmp ecx, r14d
+    jae .t2
+    add eax, [rbx+0x140+rcx*4]
+    inc ecx
+    jmp .t1
+.t2:
+    add eax, [r15+72]
+    mov [r15+36], eax               ; total width
+    cmp dword [r15+28], 0
+    je .nc
+    mov edx, [r15+68]
+    sub edx, eax
+    jle .nc
+    shr edx, 1
+    mov [r15+32], edx
+.nc:
+    ; x positions of the columns
+    mov eax, [r15+152]
+    add eax, [r15+32]               ; left edge of the table
+    mov [r15+208], eax
+    mov r8d, eax
+    cmp dword [r15+24], 0
+    je .nb2
+    add r8d, 2                      ; line + padding
+.nb2:
+    xor ecx, ecx
+.x1:
+    cmp ecx, r14d
+    jae .xd
+    mov [rbx+0x1E0+rcx*4], r8d
+    add r8d, [rbx+0x140+rcx*4]
+    add r8d, 2
+    cmp dword [r15+24], 0
+    je .x2
+    inc r8d
+.x2:
+    inc ecx
+    jmp .x1
+.xd:
+    ; the x of the closing vertical line (bordered tables)
+    mov eax, [r15+208]
+    add eax, [r15+36]
+    dec eax
+    mov [r15+116], eax
+    POPA
+    ret
+
+; br_tbl_caption: the <caption> is shown centred above the table
+br_tbl_caption:
+    PUSHA
+    mov rsi, [r15+48]
+    test rsi, rsi
+    jz .o
+    mov r9, [r15+56]
+    cmp rsi, r9
+    jae .o
+    mov byte [br_pend], 0
+    movzx eax, byte [br_al]
+    push rax
+    mov byte [br_al], 1
+    or byte [br_fl], FX_BOLD
+    mov [br_end], r9
+    call br_walk
+    call br_nl_if
+    and byte [br_fl], ~FX_BOLD
+    pop rax
+    mov [br_al], al
+    mov rax, [r15+104]
+    mov [br_end], rax
+.o: POPA
+    ret
+
+; br_boxc: eax = row, ecx = column, dl = line character
+br_boxc:
+    push rbx
+    cmp ecx, COLS-2
+    jae .o
+    imul ebx, eax, COLS
+    add ebx, ecx
+    mov [BRC+rbx], dl
+    mov byte [BRA+rbx], 0
+    mov byte [BRX+rbx], 0
+    mov dword [BRF+rbx*4], BC_SET|0x9AA0A6
+.o: pop rbx
+    ret
+
+; br_tbl_hline: edi = 0 top, 1 middle, 2 bottom -> a horizontal border at row [br_row]
+br_tbl_hline:
+    PUSHA
+    mov rbx, [r15+168]
+    mov r14d, [r15]
+    mov r12d, edi
+    mov esi, [r15+208]              ; left line
+    mov r13d, [r15+116]             ; right line
+    mov eax, [br_row]
+    mov ecx, esi
+.h: cmp ecx, r13d
+    ja .j
+    mov dl, BL_H
+    push rax
+    call br_boxc
+    pop rax
+    inc ecx
+    jmp .h
+.j: lea r8d, [BL_TL]                ; left corner: top / left tee / bottom
+    lea r9d, [BL_TT]
+    lea r10d, [BL_TR]
+    cmp r12d, 1
+    jb .jt
+    je .jm
+    mov r8d, BL_BL
+    mov r9d, BL_BT
+    mov r10d, BL_BR
+    jmp .jt
+.jm:
+    mov r8d, BL_LT
+    mov r9d, BL_X
+    mov r10d, BL_RT
+.jt:
+    mov eax, [br_row]
+    mov ecx, esi
+    mov edx, r8d
+    call br_boxc
+    xor ecx, ecx
+.jc:
+    cmp ecx, r14d
+    jae .jr
+    test ecx, ecx
+    jz .jn
+    mov eax, [rbx+0x1E0+rcx*4]
+    sub eax, 2
+    mov r11d, r9d
+    test r12d, r12d
+    jz .nm
+    cmp ecx, 63
+    ja .nm
+    bt qword [r15+216], rcx
+    jnc .nm
+    cmp r11d, BL_BT
+    jne .a1
+    mov r11d, BL_H
+    jmp .nm
+.a1:
+    cmp r11d, BL_X
+    jne .nm
+    mov r11d, BL_TT
+.nm:
+    push rcx
+    mov ecx, eax
+    mov eax, [br_row]
+    mov edx, r11d
+    call br_boxc
+    pop rcx
+.jn:
+    inc ecx
+    jmp .jc
+.jr:
+    mov eax, [br_row]
+    mov ecx, r13d
+    mov edx, r10d
+    call br_boxc
+    POPA
+    ret
+
+; br_fillbg: eax = first row, ecx = first column, esi = last column + 1, edi = rows, edx = colour
+;   gives the cells of the rectangle that have no background of their own this colour
+br_fillbg:
+    PUSHA
+    test edx, edx
+    jz .o
+    cmp esi, COLS-2
+    jbe .a
+    mov esi, COLS-2
+.a: mov r8d, edx
+.r: test edi, edi
+    jz .o
+    imul ebx, eax, COLS
+    mov edx, ecx
+.c: cmp edx, esi
+    jae .rn
+    lea r9d, [rbx+rdx]
+    cmp dword [BRB+r9*4], 0
+    jne .cn
+    mov [BRB+r9*4], r8d
+.cn:
+    inc edx
+    jmp .c
+.rn:
+    inc eax
+    dec edi
+    jmp .r
+.o: POPA
+    ret
+
+; br_tbl_render: renders every row and cell
+br_tbl_render:
+    PUSHA
+    mov rbx, [r15+168]
+    cmp dword [r15+24], 0
+    je .rows0
+    xor edi, edi
+    call br_tbl_hline
+    inc dword [br_row]
+.rows0:
+    xor r13d, r13d                  ; row index
+.row:
+    cmp r13d, [r15+4]
+    jae .end
+    mov eax, [br_row]
+    mov [r15+128], eax              ; first row of this table row
+    mov dword [r15+132], 0
+    mov dword [r15+140], -1
+    imul ecx, r13d, 24
+    mov rax, [r15+16]
+    add rax, rcx
+    mov [r15+184], rax              ; the row entry
+    mov rsi, [rax+8]
+    test rsi, rsi
+    jz .nt
+    mov r8, [rax+16]
+    mov rax, 'tr'
+    mov [br_tg], rax
+    mov r11d, TF_BLK
+    xor r12d, r12d
+    mov eax, [r15+152]              ; the table's own region
+    mov [br_x0], eax
+    mov [br_col], eax
+    mov eax, [r15+156]
+    mov [br_x1], eax
+    call br_open_style
+    jc .nt
+    mov eax, [br_sp]
+    dec eax
+    mov [r15+140], eax
+.nt:
+    mov eax, [br_bbg]
+    mov [r15+136], eax              ; background of the row
+    mov rax, [r15+184]
+    mov ebx, [rax+4]
+    mov ecx, [rax]
+    imul ecx, ecx, 56
+    mov rbp, [r15+8]
+    add rbp, rcx
+    mov rdi, rbp
+    mov [r15+192], rbp              ; first cell of the row
+    mov [r15+200], ebx
+.cell:
+    test ebx, ebx
+    jz .cdone
+    movzx ecx, word [rbp+32]
+    movzx eax, word [rbp+34]
+    mov edx, [r15]
+    sub edx, ecx
+    cmp eax, edx
+    jbe .sp
+    mov eax, edx
+.sp:
+    test eax, eax
+    jnz .s1
+    mov eax, 1
+.s1:
+    mov [rbp+34], ax
+    mov rdi, [r15+168]
+    mov edx, [rdi+0x1E0+rcx*4]      ; x0 of the cell
+    lea ecx, [rcx+rax-1]
+    mov esi, [rdi+0x1E0+rcx*4]
+    add esi, [rdi+0x140+rcx*4]      ; x1
+    mov [br_x0], edx
+    mov [br_x1], esi
+    mov [br_col], edx
+    mov eax, [r15+128]
+    mov [br_row], eax
+    mov [br_rtop], eax
+    mov dword [br_lineh], 1
+    mov byte [br_pend], 0
+    mov byte [br_gap], 0
+    mov byte [br_al], 0
+    mov eax, [br_fbase]
+    mov [r15+148], eax
+    mov rax, 'td'
+    mov r11d, 0
+    cmp byte [rbp+44], 0
+    je .tg
+    mov rax, 'th'
+    mov r11d, TF_BOLD|TF_CTR
+.tg:
+    mov [br_tg], rax
+    mov rsi, [rbp+16]
+    mov r8, [rbp+24]
+    mov r12d, S_CELL
+    mov eax, [br_sp]
+    mov [r15+144], eax
+    call br_open_style
+    jc .nf
+    mov eax, [br_bbg]
+    mov [rbp+36], eax
+    mov eax, [br_sp]
+    mov [br_fbase], eax
+    mov rsi, [rbp]
+    mov r9, [rbp+8]
+    cmp rsi, r9
+    jae .nw
+    mov [br_end], r9
+    call br_walk
+.nw:
+    call br_nl_if
+    mov ecx, [r15+144]
+    call br_fr_pop
+    mov rax, [r15+104]
+    mov [br_end], rax
+.nf:
+    mov eax, [r15+148]
+    mov [br_fbase], eax
+    mov eax, [br_row]
+    sub eax, [r15+128]
+    cmp eax, [r15+132]
+    jbe .nh
+    mov [r15+132], eax
+.nh:
+    add rbp, 56
+    dec ebx
+    jmp .cell
+.cdone:
+    cmp dword [r15+132], 0
+    jne .h1
+    mov dword [r15+132], 1
+.h1:
+    ; backgrounds of the cells, then of the row
+    mov rbp, [r15+192]
+    mov ebx, [r15+200]
+    mov rdi, [r15+168]
+.bg:
+    test ebx, ebx
+    jz .bgr
+    movzx ecx, word [rbp+32]
+    movzx eax, word [rbp+34]
+    mov edx, [rdi+0x1E0+rcx*4]
+    lea esi, [rcx+rax-1]
+    mov esi, [rdi+0x1E0+rsi*4]
+    mov eax, esi
+    movzx esi, word [rbp+34]
+    lea esi, [rcx+rsi-1]
+    mov esi, [rdi+0x140+rsi*4]
+    add esi, eax                    ; x1
+    mov ecx, edx                    ; x0
+    cmp dword [r15+24], 0
+    je .bg1
+    dec ecx
+    inc esi
+.bg1:
+    mov eax, [r15+128]
+    push rdi
+    mov edi, [r15+132]
+    mov edx, [rbp+36]
+    call br_fillbg
+    pop rdi
+    add rbp, 56
+    dec ebx
+    jmp .bg
+.bgr:
+    mov ecx, [r15+208]
+    mov esi, ecx
+    add esi, [r15+36]
+    mov eax, [r15+128]
+    mov edi, [r15+132]
+    mov edx, [r15+136]
+    call br_fillbg
+    ; vertical borders
+    cmp dword [r15+24], 0
+    je .nob
+    mov r14d, [r15]
+    mov rdi, [r15+168]
+    mov qword [r15+216], 0          ; the column borders that run through a cell with a colspan
+    mov rbp, [r15+192]
+    mov ebx, [r15+200]
+.mk:
+    test ebx, ebx
+    jz .mkd
+    movzx ecx, word [rbp+32]
+    movzx eax, word [rbp+34]
+    dec eax
+.mb:
+    test eax, eax
+    jle .mn
+    inc ecx
+    cmp ecx, 63
+    ja .mn
+    bts qword [r15+216], rcx
+    dec eax
+    jmp .mb
+.mn:
+    add rbp, 56
+    dec ebx
+    jmp .mk
+.mkd:
+    mov esi, 1                      ; the border line above gets no tee where a cell spans over it
+.fx:
+    cmp esi, r14d
+    jae .fxd
+    cmp esi, 63
+    ja .fxd
+    bt qword [r15+216], rsi
+    jnc .fxn
+    mov eax, [rdi+0x1E0+rsi*4]
+    sub eax, 2
+    mov edx, [r15+128]
+    dec edx
+    imul edx, COLS
+    add edx, eax
+    movzx eax, byte [BRC+rdx]
+    cmp al, BL_TT
+    je .f14
+    cmp al, BL_X
+    jne .fxn
+    mov byte [BRC+rdx], BL_BT
+    jmp .fxn
+.f14:
+    mov byte [BRC+rdx], BL_H
+.fxn:
+    inc esi
+    jmp .fx
+.fxd:
+    xor ecx, ecx
+.vl:
+    cmp ecx, r14d
+    ja .nob
+    cmp ecx, 63
+    ja .vl1
+    bt qword [r15+216], rcx
+    jc .vn
+.vl1:
+    cmp ecx, r14d
+    jae .vlast
+    mov r8d, [rdi+0x1E0+rcx*4]
+    sub r8d, 2
+    jmp .vdo
+.vlast:
+    mov r8d, [r15+116]
+.vdo:
+    xor r9d, r9d
+.vr:
+    cmp r9d, [r15+132]
+    jae .vn
+    mov eax, [r15+128]
+    add eax, r9d
+    push rcx
+    mov ecx, r8d
+    mov dl, BL_V
+    call br_boxc
+    pop rcx
+    inc r9d
+    jmp .vr
+.vn:
+    inc ecx
+    jmp .vl
+.nob:
+    mov ecx, [r15+140]
+    cmp ecx, -1
+    je .np
+    call br_fr_pop
+.np:
+    mov eax, [r15+128]
+    add eax, [r15+132]
+    mov [br_row], eax
+    mov dword [br_lineh], 1
+    cmp dword [r15+24], 0
+    je .nx
+    mov edi, 1
+    mov eax, r13d
+    inc eax
+    cmp eax, [r15+4]
+    jb .hl
+    mov edi, 2
+.hl:
+    call br_tbl_hline
+    inc dword [br_row]
+.nx:
+    inc r13d
+    jmp .row
+.end:
+    POPA
+    ret
+
+; ---- end html4.inc
+; ---- begin html5.inc
+; =============================================================================
+;  HTML renderer, part 5: forms and form controls
+;  Items (links and controls) share one table: BR_ITM (type, form, flags, size,
+;  row, column) and BRL (128 bytes: link target, or name / value / label).
+; =============================================================================
+IT_LINK  equ 0
+IT_TEXT  equ 1
+IT_PASS  equ 2
+IT_BTN   equ 3
+IT_CHK   equ 4
+IT_RAD   equ 5
+IT_HID   equ 6
+IT_SEL   equ 7
+IF_CHK   equ 1                      ; item flags: checked
+IF_NOSUB equ 2                      ;             button that does not submit
+IF_RESET equ 4
+IF_AREA  equ 8                      ;             textarea
+BR_FRMS  equ 144
+
+; br_acopy: rsi = attributes, r8 = end of the tag, rdi = attribute name, [br_dst] / [br_dmax]
+;   -> ZF=1 when found; the decoded value is copied to [br_dst] (at most [br_dmax] bytes + NUL)
+br_acopy:
+    PUSHA
+    call br_attr
+    jnz .no
+    mov rsi, rdx
+    mov rdi, [br_dst]
+    mov r9d, [br_dmax]
+.l: test ecx, ecx
+    jz .e
+    mov al, [rsi]
+    cmp al, '&'
+    jne .p
+    lea r10, [ac_ent]
+.en:
+    cmp byte [r10], 0
+    je .p                           ; unknown entity: a plain '&'
+    xor edx, edx
+.ec:
+    mov al, [r10+rdx]
+    test al, al
+    jz .em
+    lea ebx, [rdx+1]
+    cmp ebx, ecx
+    jae .enx
+    cmp al, [rsi+rbx]
+    jne .enx
+    inc edx
+    jmp .ec
+.em:
+    mov al, [r10+rdx+1]             ; the replacement
+    lea ebx, [rdx+1]
+    add rsi, rbx
+    sub ecx, ebx
+    jmp .put
+.enx:
+.es:
+    cmp byte [r10], 0
+    je .es2
+    inc r10
+    jmp .es
+.es2:
+    add r10, 2
+    jmp .en
+.p: mov al, [rsi]
+.put:
+    test r9d, r9d
+    jz .e
+    mov [rdi], al
+    inc rdi
+    dec r9d
+    inc rsi
+    dec ecx
+    jmp .l
+.e: mov byte [rdi], 0
+    POPA
+    xor eax, eax
+    ret
+.no:
+    POPA
+    or eax, 1
+    ret
+ac_ent:
+    db "amp;", 0, "&"
+    db "quot;", 0, 34
+    db "lt;", 0, "<"
+    db "gt;", 0, ">"
+    db "#39;", 0, 39
+    db "apos;", 0, 39
+    db "nbsp;", 0, " "
+    db 0
+
+; br_ctl_len: rsi = raw utf-8 -> eax = number of characters
+br_ctl_len:
+    push rcx
+    xor eax, eax
+.l: movzx ecx, byte [rsi]
+    test cl, cl
+    jz .d
+    inc rsi
+    and cl, 0xC0
+    cmp cl, 0x80
+    je .l
+    inc eax
+    jmp .l
+.d: pop rcx
+    ret
+
+; br_ctl_text: ecx = item -> BR_TMP+0x400 = the characters shown for it (code page), eax = length
+br_ctl_text:
+    PUSHA
+    mov byte [br_ctl_ph], 0
+    mov ebx, ecx
+    shl ebx, 7
+    lea r12, [BRL+rbx]              ; item data
+    mov ebx, ecx
+    shl ebx, 4
+    lea r13, [BR_ITM+rbx]           ; item info
+    lea rdi, [BR_TMP+0x400]
+    movzx eax, byte [r13]
+    cmp eax, IT_CHK
+    je .chk
+    cmp eax, IT_RAD
+    je .rad
+    cmp eax, IT_BTN
+    je .btn
+    cmp eax, IT_SEL
+    je .sel
+    ; text and password fields
+    mov byte [br_ctl_ph], 0
+    lea rsi, [r12+32]
+    cmp byte [rsi], 0
+    jne .val
+    lea rsi, [r12+96]               ; the placeholder is shown while the field is empty
+    cmp byte [rsi], 0
+    je .done
+    mov byte [br_ctl_ph], 1
+    jmp .cl
+.val:
+    cmp byte [r13], IT_PASS
+    jne .cl
+.pl:
+    cmp byte [rsi], 0
+    je .done
+    movzx eax, byte [rsi]
+    and al, 0xC0
+    cmp al, 0x80
+    je .pn
+    mov byte [rdi], '*'
+    inc rdi
+.pn:
+    inc rsi
+    jmp .pl
+.cl:
+    cmp byte [rsi], 0
+    je .done
+    call br_u8cp
+    mov [rdi], al
+    inc rdi
+    jmp .cl
+.sel:
+    mov byte [rdi], ' '
+    inc rdi
+    movzx ecx, byte [r13+3]
+    sub ecx, 4
+    lea rsi, [r12+96]
+.sl:
+    test ecx, ecx
+    jle .se
+    mov al, ' '
+    cmp byte [rsi], 0
+    je .sp
+    mov al, [rsi]
+    inc rsi
+.sp:
+    mov [rdi], al
+    inc rdi
+    dec ecx
+    jmp .sl
+.se:
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'v'
+    mov byte [rdi+2], ' '
+    add rdi, 3
+    jmp .done
+.chk:
+    mov al, '['
+    mov ah, ' '
+    test byte [r13+2], IF_CHK
+    jz .cb
+    mov ah, 'x'
+.cb:
+    mov [rdi], al
+    mov [rdi+1], ah
+    mov byte [rdi+2], ']'
+    add rdi, 3
+    jmp .done
+.rad:
+    mov al, '('
+    mov ah, ' '
+    test byte [r13+2], IF_CHK
+    jz .rb
+    mov ah, 'o'
+.rb:
+    mov [rdi], al
+    mov [rdi+1], ah
+    mov byte [rdi+2], ')'
+    add rdi, 3
+    jmp .done
+.btn:
+    mov byte [rdi], ' '
+    inc rdi
+    lea rsi, [r12+96]
+    cmp byte [rsi], 0
+    jne .bl
+    lea rsi, [r12+32]
+    cmp byte [rsi], 0
+    jne .bl
+    lea rsi, [s_submit]
+.bl:
+    cmp byte [rsi], 0
+    je .be
+    call br_u8cp
+    mov [rdi], al
+    inc rdi
+    jmp .bl
+.be:
+    mov byte [rdi], ' '
+    inc rdi
+.done:
+    mov byte [rdi], 0
+    lea rax, [BR_TMP+0x400]
+    sub rdi, rax
+    mov [rsp+8*14], edi             ; eax of the caller
+    POPA
+    ret
+
+; br_ctl_draw: ecx = item -> (re)writes its cells; the field shows its text
+br_ctl_draw:
+    PUSHA
+    mov r14d, ecx
+    mov ebx, ecx
+    shl ebx, 4
+    lea r13, [BR_ITM+rbx]
+    movzx r15d, byte [r13+3]        ; width
+    mov r12d, [r13+4]               ; row
+    movzx ebp, word [r13+8]         ; column
+    call br_ctl_text
+    mov esi, eax                    ; length of the text
+    ; the visible part
+    lea r8, [BR_TMP+0x400]
+    xor edi, edi                    ; offset into the text
+    cmp byte [r13], IT_TEXT
+    je .win
+    cmp byte [r13], IT_PASS
+    jne .go
+.win:
+    cmp byte [br_editing], 2
+    jne .go
+    cmp [br_eitem], r14d
+    jne .go
+    ; being edited: the end of the text and a cursor
+    mov byte [r8+rsi], '_'
+    inc esi
+    mov byte [r8+rsi], 0
+    mov edi, esi
+    sub edi, r15d
+    jns .go
+    xor edi, edi
+.go:
+    xor ecx, ecx
+.c: cmp ecx, r15d
+    jae .o
+    mov al, ' '
+    lea edx, [rdi+rcx]
+    cmp edx, esi
+    jae .w
+    mov al, [r8+rdx]
+.w: imul ebx, r12d, COLS
+    add ebx, ebp
+    add ebx, ecx
+    cmp ebx, BR_MAXR*COLS
+    jae .o
+    mov [BRC+rbx], al
+    lea edx, [r14+8]
+    mov [BRA+rbx], dl
+    mov byte [BRX+rbx], FX_CTL
+    xor edx, edx
+    cmp byte [br_ctl_ph], 0
+    je .pc
+    mov edx, BC_SET|0x80868B
+.pc:
+    mov [BRF+rbx*4], edx
+    mov dword [BRB+rbx*4], 0
+    inc ecx
+    jmp .c
+.o: POPA
+    ret
+
+; br_ctl_place: ecx = item, edx = width -> puts the control on the line and draws it
+br_ctl_place:
+    PUSHA
+    mov r14d, ecx
+    mov r15d, edx
+    cmp dword [br_hid], 0
+    jne .o
+    call br_gapnow
+    cmp byte [br_pend], 0
+    je .np
+    mov byte [br_pend], 0
+    mov eax, [br_col]
+    cmp eax, [br_x0]
+    je .np
+    lea eax, [rax+r15+1]
+    cmp eax, [br_x1]
+    ja .np
+    mov al, ' '
+    call br_put
+.np:
+    mov eax, [br_col]
+    add eax, r15d
+    cmp eax, [br_x1]
+    jbe .fit
+    mov eax, [br_col]
+    cmp eax, [br_x0]
+    je .fit
+    call br_nl
+.fit:
+    mov eax, [br_x1]
+    sub eax, [br_col]
+    cmp r15d, eax
+    jbe .w
+    mov r15d, eax
+.w: cmp r15d, 1
+    jge .w2
+    mov r15d, 1
+.w2:
+    mov ebx, r14d
+    shl ebx, 4
+    mov eax, [br_row]
+    mov [BR_ITM+rbx+4], eax
+    mov eax, [br_col]
+    mov [BR_ITM+rbx+8], ax
+    mov [BR_ITM+rbx+3], r15b
+    mov ecx, r14d
+    call br_ctl_draw
+    add [br_col], r15d
+.o: POPA
+    ret
+
+; ---- <form>
+br_sp_form:
+    PUSHA
+    mov r13, rsi
+    mov eax, [br_nfrm]
+    cmp eax, 16
+    jae .o
+    imul ebx, eax, BR_FRMS
+    lea rdi, [BR_FRM+rbx]
+    push rdi
+    mov ecx, BR_FRMS/4
+    xor eax, eax
+    rep stosd
+    pop rdi
+    mov [br_dst], rdi
+    mov dword [br_dmax], 127
+    mov rsi, r13
+    lea rdi, [n_action]
+    call br_acopy
+    mov rsi, r13
+    lea rdi, [n_method]
+    call br_attr
+    jnz .m
+    test ecx, ecx
+    jz .m
+    mov al, [rdx]
+    or al, 0x20
+    cmp al, 'p'
+    jne .m
+    imul ebx, [br_nfrm], BR_FRMS
+    mov byte [BR_FRM+rbx+128], 1
+.m: mov eax, [br_nfrm]
+    mov [br_form], al
+    inc dword [br_nfrm]
+.o: POPA
+    ret
+
+; ---- <input>
+br_sp_input:
+    PUSHA
+    mov r13, rsi
+    mov r12d, IT_TEXT
+    lea rdi, [n_type]
+    call br_attr
+    jnz .tp
+    test ecx, ecx
+    jz .tp
+    movzx eax, byte [rdx]
+    or al, 0x20
+    cmp al, 'h'
+    je .hid
+    cmp al, 's'
+    je .btn
+    cmp al, 'b'
+    je .btn
+    cmp al, 'i'
+    je .btn
+    cmp al, 'p'
+    je .pass
+    cmp al, 'c'
+    jne .t2
+    cmp ecx, 2
+    jb .tp
+    mov al, [rdx+1]
+    or al, 0x20
+    cmp al, 'h'
+    jne .tp
+    mov r12d, IT_CHK
+    jmp .tp
+.t2:
+    cmp al, 'r'
+    jne .tp
+    cmp ecx, 2
+    jb .tp
+    mov al, [rdx+1]
+    or al, 0x20
+    cmp al, 'a'
+    je .rad
+    mov r12d, IT_BTN                ; reset
+    jmp .tp
+.hid:
+    mov r12d, IT_HID
+    jmp .tp
+.btn:
+    mov r12d, IT_BTN
+    jmp .tp
+.pass:
+    mov r12d, IT_PASS
+    jmp .tp
+.rad:
+    mov r12d, IT_RAD
+.tp:
+    mov eax, r12d
+    call br_item_new
+    js .o
+    mov r14d, eax
+    mov ebx, eax
+    shl ebx, 7
+    lea rbx, [BRL+rbx]
+    mov rdi, rbx
+    push rax
+    mov ecx, 32
+    xor eax, eax
+    rep stosd
+    pop rax
+    mov [br_dst], rbx
+    mov dword [br_dmax], 31
+    mov rsi, r13
+    lea rdi, [n_name]
+    call br_acopy
+    lea rax, [rbx+32]
+    mov [br_dst], rax
+    mov dword [br_dmax], 63
+    mov rsi, r13
+    lea rdi, [n_value]
+    call br_acopy
+    lea rax, [rbx+96]
+    mov [br_dst], rax
+    mov dword [br_dmax], 31
+    mov rsi, r13
+    lea rdi, [n_placeh]
+    call br_acopy
+    mov ebx, r14d
+    shl ebx, 4
+    cmp r12d, IT_CHK
+    je .cr
+    cmp r12d, IT_RAD
+    jne .nc
+.cr:
+    mov rsi, r13
+    lea rdi, [n_checked]
+    call br_attr
+    jnz .nv
+    or byte [BR_ITM+rbx+2], IF_CHK
+.nv:
+    mov ecx, r14d
+    shl ecx, 7
+    cmp byte [BRL+rcx+32], 0
+    jne .nc
+    mov dword [BRL+rcx+32], 'on'
+.nc:
+    cmp r12d, IT_HID
+    je .o
+    ; type=button / reset do not submit
+    cmp r12d, IT_BTN
+    jne .sz
+    mov rsi, r13
+    lea rdi, [n_type]
+    call br_attr
+    jnz .sz
+    test ecx, ecx
+    jz .sz
+    mov al, [rdx]
+    or al, 0x20
+    cmp al, 's'
+    je .sz
+    cmp al, 'i'
+    je .sz
+    or byte [BR_ITM+rbx+2], IF_NOSUB
+.sz:
+    mov edx, 3
+    cmp r12d, IT_CHK
+    je .pl
+    cmp r12d, IT_RAD
+    je .pl
+    cmp r12d, IT_BTN
+    jne .txt
+    mov ecx, r14d
+    call br_ctl_text
+    mov edx, eax
+    jmp .pl
+.txt:
+    mov rsi, r13
+    lea rdi, [n_size]
+    call br_attr
+    jnz .tdef
+    mov rsi, rdx
+    call br_num
+    mov edx, eax
+    test edx, edx
+    jnz .tw
+.tdef:
+    mov edx, 20
+.tw:
+    cmp edx, 40
+    jbe .pl
+    mov edx, 40
+.pl:
+    mov ecx, r14d
+    call br_ctl_place
+.o: POPA
+    ret
+
+; ---- <button>label</button>
+br_sp_button:
+    PUSHA
+    mov r13, rsi
+    lea rsi, [r8+1]
+    mov r12, rsi                    ; start of the label
+    lea rdi, [n_btnend]
+    call br_find
+    mov r15, rsi                    ; the closing tag
+    mov rdx, rsi
+    call br_tagend
+    mov [rsp+56], rdx               ; the caller's r8
+    mov eax, IT_BTN
+    call br_item_new
+    js .o
+    mov r14d, eax
+    mov ebx, eax
+    shl ebx, 7
+    lea rbx, [BRL+rbx]
+    mov rdi, rbx
+    mov ecx, 32
+    xor eax, eax
+    rep stosd
+    mov [br_dst], rbx
+    mov dword [br_dmax], 31
+    mov rsi, r13
+    lea rdi, [n_name]
+    call br_acopy
+    lea rax, [rbx+32]
+    mov [br_dst], rax
+    mov dword [br_dmax], 63
+    mov rsi, r13
+    lea rdi, [n_value]
+    call br_acopy
+    ; the label: the text of the element without its tags
+    lea rdi, [rbx+96]
+    mov rsi, r12
+    xor ecx, ecx
+    xor edx, edx                    ; blank pending
+.lb:
+    cmp rsi, r15
+    jae .le
+    movzx eax, byte [rsi]
+    inc rsi
+    cmp al, '<'
+    jne .l1
+.tg:
+    cmp rsi, r15
+    jae .le
+    cmp byte [rsi], '>'
+    je .tge
+    inc rsi
+    jmp .tg
+.tge:
+    inc rsi
+    jmp .lb
+.l1:
+    cmp al, ' '
+    ja .l2
+    mov edx, 1
+    jmp .lb
+.l2:
+    cmp ecx, 28
+    jae .le
+    test edx, edx
+    jz .l3
+    test ecx, ecx
+    jz .l3
+    mov byte [rdi], ' '
+    inc rdi
+    inc ecx
+.l3:
+    xor edx, edx
+    cmp al, '&'
+    jne .l4
+    mov eax, [rsi]
+    cmp eax, 'amp;'
+    jne .l5
+    add rsi, 4
+.l5:
+    mov al, '&'
+.l4:
+    mov [rdi], al
+    inc rdi
+    inc ecx
+    jmp .lb
+.le:
+    mov byte [rdi], 0
+    mov ebx, r14d
+    shl ebx, 4
+    mov rsi, r13
+    lea rdi, [n_type]
+    call br_attr
+    jnz .sz
+    test ecx, ecx
+    jz .sz
+    mov al, [rdx]
+    or al, 0x20
+    cmp al, 's'
+    je .sz
+    cmp al, 'r'
+    jne .ns
+    or byte [BR_ITM+rbx+2], IF_NOSUB|IF_RESET
+    jmp .sz
+.ns:
+    or byte [BR_ITM+rbx+2], IF_NOSUB
+.sz:
+    mov ecx, r14d
+    call br_ctl_text
+    mov edx, eax
+    mov ecx, r14d
+    call br_ctl_place
+.o: POPA
+    ret
+
+; ---- <textarea>text</textarea>: a single line field
+br_sp_textarea:
+    PUSHA
+    mov r13, rsi
+    lea rsi, [r8+1]
+    mov r12, rsi
+    lea rdi, [n_taend]
+    call br_find
+    mov r15, rsi
+    mov rdx, rsi
+    call br_tagend
+    mov [rsp+56], rdx
+    mov eax, IT_TEXT
+    call br_item_new
+    js .o
+    mov r14d, eax
+    mov ebx, eax
+    shl ebx, 7
+    lea rbx, [BRL+rbx]
+    mov rdi, rbx
+    mov ecx, 32
+    xor eax, eax
+    rep stosd
+    mov [br_dst], rbx
+    mov dword [br_dmax], 31
+    mov rsi, r13
+    lea rdi, [n_name]
+    call br_acopy
+    lea rdi, [rbx+32]               ; the initial text
+    mov rsi, r12
+    xor ecx, ecx
+.t: cmp rsi, r15
+    jae .te
+    cmp ecx, 62
+    jae .te
+    mov al, [rsi]
+    inc rsi
+    cmp al, 13
+    je .t
+    cmp al, 10
+    jne .t1
+    mov al, ' '
+.t1:
+    mov [rdi], al
+    inc rdi
+    inc ecx
+    jmp .t
+.te:
+    mov byte [rdi], 0
+    mov ebx, r14d
+    shl ebx, 4
+    or byte [BR_ITM+rbx+2], IF_AREA
+    mov rsi, r13
+    lea rdi, [n_cols]
+    call br_attr
+    jnz .wdef
+    mov rsi, rdx
+    call br_num
+    mov edx, eax
+    test edx, edx
+    jnz .w
+.wdef:
+    mov edx, 30
+.w: cmp edx, 50
+    jbe .p
+    mov edx, 50
+.p: mov ecx, r14d
+    call br_ctl_place
+.o: POPA
+    ret
+
+; br_urlenc: rsi = text (raw bytes), rdi = destination -> rdi advanced
+br_urlenc:
+    push rax
+    push rcx
+.l: movzx eax, byte [rsi]
+    inc rsi
+    test al, al
+    jz .d
+    cmp al, ' '
+    je .sp
+    cmp al, '-'
+    je .ok
+    cmp al, '.'
+    je .ok
+    cmp al, '_'
+    je .ok
+    cmp al, '~'
+    je .ok
+    cmp al, '0'
+    jb .pc
+    cmp al, '9'
+    jbe .ok
+    mov cl, al
+    or cl, 0x20
+    cmp cl, 'a'
+    jb .pc
+    cmp cl, 'z'
+    jbe .ok
+.pc:
+    mov byte [rdi], '%'
+    mov ecx, eax
+    shr ecx, 4
+    call .hx
+    mov [rdi+1], cl
+    mov ecx, eax
+    and ecx, 15
+    call .hx
+    mov [rdi+2], cl
+    add rdi, 3
+    jmp .l
+.sp:
+    mov al, '+'
+.ok:
+    mov [rdi], al
+    inc rdi
+    jmp .l
+.hx:
+    cmp cl, 10
+    jb .h1
+    add cl, 'A'-10
+    ret
+.h1:
+    add cl, '0'
+    ret
+.d: pop rcx
+    pop rax
+    ret
+
+; br_form_submit: ecx = the item that was activated (or -1) -> the address to load is in url_tmp
+;   (GET: with the query; POST: http_post = 1 and the body in BR_Q).  CF=1 when it cannot be sent.
+br_form_submit:
+    PUSHA
+    mov r14d, ecx
+    mov ebx, ecx
+    cmp ecx, -1
+    je .nf
+    shl ebx, 4
+    movzx r12d, byte [BR_ITM+rbx+1] ; the form
+    jmp .go
+.nf:
+    mov r12d, 0
+.go:
+    cmp r12d, 0xFF
+    je .fail
+    ; ---- the query string
+    lea rdi, [BR_Q]
+    xor r13d, r13d                  ; item
+.it:
+    cmp r13d, [br_nlk]
+    jae .qd
+    mov ebx, r13d
+    shl ebx, 4
+    lea r15, [BR_ITM+rbx]
+    cmp [r15+1], r12b
+    jne .nx
+    movzx eax, byte [r15]
+    test eax, eax
+    jz .nx                          ; a link
+    cmp eax, IT_BTN
+    jne .nb
+    cmp r13d, r14d
+    jne .nx
+.nb:
+    cmp eax, IT_CHK
+    je .ck
+    cmp eax, IT_RAD
+    jne .inc
+.ck:
+    test byte [r15+2], IF_CHK
+    jz .nx
+.inc:
+    mov ebx, r13d
+    shl ebx, 7
+    lea rsi, [BRL+rbx]
+    cmp byte [rsi], 0
+    je .nx
+    lea rax, [BR_Q+0xF00]
+    cmp rdi, rax
+    ja .qd
+    call br_urlenc
+    mov byte [rdi], '='
+    inc rdi
+    lea rsi, [BRL+rbx+32]
+    call br_urlenc
+    mov byte [rdi], '&'
+    inc rdi
+.nx:
+    inc r13d
+    jmp .it
+.qd:
+    lea rax, [BR_Q]
+    cmp rdi, rax
+    je .q0
+    dec rdi                         ; the last '&'
+.q0:
+    mov byte [rdi], 0
+    ; ---- the address
+    imul ebx, r12d, BR_FRMS
+    lea rsi, [BR_FRM+rbx]
+    mov r15d, ebx
+    cmp byte [rsi], 0
+    jne .act
+    lea rsi, [br_loc]               ; no action: this page
+.act:
+    lea rdi, [br_loc]
+    lea rdx, [url_tmp]
+    call url_resolve
+    cmp byte [url_tmp], 0
+    je .fail
+    lea rdi, [url_tmp]              ; drop a fragment and, for GET, the old query
+    mov rsi, rdi
+.cut:
+    mov al, [rsi]
+    test al, al
+    jz .cd
+    cmp al, '#'
+    je .cd
+    cmp al, '?'
+    jne .cn
+    cmp byte [BR_FRM+r15+128], 0
+    jne .cn
+    jmp .cd
+.cn:
+    inc rsi
+    jmp .cut
+.cd:
+    mov byte [rsi], 0
+    cmp byte [BR_FRM+r15+128], 0
+    jne .post
+    cmp byte [BR_Q], 0
+    je .ok
+    mov rdi, rsi
+    mov byte [rdi], '?'
+    inc rdi
+    lea rsi, [BR_Q]
+    call sappend
+    jmp .ok
+.post:
+    mov byte [http_post], 1
+    lea rax, [BR_Q]
+    mov [http_body], rax
+.ok:
+    POPA
+    clc
+    ret
+.fail:
+    POPA
+    stc
+    ret
+
+; br_ctl_toggle: ecx = checkbox or radio item
+br_ctl_toggle:
+    PUSHA
+    mov r14d, ecx
+    mov ebx, ecx
+    shl ebx, 4
+    lea r13, [BR_ITM+rbx]
+    cmp byte [r13], IT_SEL
+    jne .nsel
+    mov ebx, r14d                   ; a list: the next option
+    shl ebx, 7
+    movzx eax, byte [BRL+rbx+127]
+    inc eax
+    movzx edx, word [r13+10]
+    cmp eax, edx
+    jb .sok
+    xor eax, eax
+.sok:
+    mov ecx, r14d
+    call br_sel_pick
+    mov ecx, r14d
+    call br_ctl_draw
+    POPA
+    ret
+.nsel:
+    cmp byte [r13], IT_RAD
+    jne .chk
+    ; a radio button: clear the others of the same form and name
+    xor r12d, r12d
+    mov ebx, r14d
+    shl ebx, 7
+    lea r15, [BRL+rbx]
+.rl:
+    cmp r12d, [br_nlk]
+    jae .set
+    cmp r12d, r14d
+    je .rn
+    mov ebx, r12d
+    shl ebx, 4
+    cmp byte [BR_ITM+rbx], IT_RAD
+    jne .rn
+    mov al, [r13+1]
+    cmp [BR_ITM+rbx+1], al
+    jne .rn
+    mov ecx, r12d
+    shl ecx, 7
+    lea rsi, [BRL+rcx]
+    mov rdi, r15
+    call strcmp
+    jne .rn
+    and byte [BR_ITM+rbx+2], ~IF_CHK
+    mov ecx, r12d
+    call br_ctl_draw
+.rn:
+    inc r12d
+    jmp .rl
+.set:
+    or byte [r13+2], IF_CHK
+    jmp .dr
+.chk:
+    xor byte [r13+2], IF_CHK
+.dr:
+    mov ecx, r14d
+    call br_ctl_draw
+    POPA
+    ret
+
+
+; br_sp_img: <img> -> its alt text in brackets (pictures themselves are not loaded)
+br_sp_img:
+    PUSHA
+    lea rax, [BR_TMP+0x800]
+    mov [br_dst], rax
+    mov dword [br_dmax], 120
+    lea rdi, [n_alt]
+    call br_acopy
+    jnz .o
+    lea rsi, [BR_TMP+0x800]
+    cmp byte [rsi], 0
+    je .o
+    cmp byte [br_hid], 0
+    jne .o
+    mov al, '['
+    call br_emit
+.l: cmp byte [rsi], 0
+    je .e
+    call br_u8cp
+    call br_emit
+    jmp .l
+.e: mov al, ']'
+    call br_emit
+.o: POPA
+    ret
+
+; br_sel_pick: ecx = list item, eax = option number -> the item's value and shown text
+br_sel_pick:
+    PUSHA
+    mov r14d, ecx
+    mov r12d, eax
+    mov ebx, ecx
+    shl ebx, 4
+    mov edi, [BR_ITM+rbx+12]
+    add rdi, BR_OPT
+    mov edx, eax
+.sk:
+    test edx, edx
+    jz .at
+.v1:
+    cmp byte [rdi], 0
+    je .v2
+    inc rdi
+    jmp .v1
+.v2:
+    inc rdi
+.l1:
+    cmp byte [rdi], 0
+    je .l2
+    inc rdi
+    jmp .l1
+.l2:
+    inc rdi
+    dec edx
+    jmp .sk
+.at:
+    mov ecx, r14d
+    shl ecx, 7
+    mov rsi, rdi
+    lea rdi, [BRL+rcx+32]
+.c1:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .c1
+    lea rdi, [BRL+rcx+96]
+.c2:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .c2
+    mov [BRL+rcx+127], r12b
+    POPA
+    ret
+
+; ---- <select><option>..</select>: a button showing the chosen option; Enter or a click shows the next
+br_sp_select:
+    PUSHA
+    mov r13, rsi
+    lea rsi, [r8+1]
+    mov r12, rsi
+    lea rdi, [n_selend]
+    call br_find
+    mov r15, rsi
+    mov rdx, rsi
+    call br_tagend
+    mov [rsp+56], rdx
+    cmp dword [br_hid], 0
+    jne .o
+    mov eax, IT_SEL
+    call br_item_new
+    js .o
+    mov r14d, eax
+    mov ebx, eax
+    shl ebx, 7
+    lea rbx, [BRL+rbx]
+    mov rdi, rbx
+    mov ecx, 32
+    xor eax, eax
+    rep stosd
+    mov [br_dst], rbx
+    mov dword [br_dmax], 31
+    mov rsi, r13
+    lea rdi, [n_name]
+    call br_acopy
+    mov ebx, r14d
+    shl ebx, 4
+    mov eax, [br_optp]
+    mov [BR_ITM+rbx+12], eax
+    mov rsi, r12
+    xor r10d, r10d                  ; options
+    xor r11d, r11d                  ; longest text
+    mov dword [br_sidx], 0
+.scan:
+    cmp rsi, r15
+    jae .done
+    cmp byte [rsi], '<'
+    jne .nx
+    mov eax, [rsi+1]
+    or eax, 0x20202020
+    cmp eax, 'opti'
+    jne .nx
+    mov ax, [rsi+5]
+    or ax, 0x2020
+    cmp ax, 'on'
+    jne .nx
+    mov r9, rsi
+    lea rdx, [rsi+7]
+    call br_tagend
+    mov r8, rdx                     ; the end of this <option>
+    mov edi, [br_optp]
+    cmp edi, 0x2E00
+    ja .done
+    add rdi, BR_OPT
+    mov byte [rdi], 0
+    lea rsi, [r9+7]
+    mov [br_dst], rdi
+    mov dword [br_dmax], 62
+    push rdi
+    lea rdi, [n_value]
+    call br_acopy
+    pop rdi
+    setz al
+    mov [br_vfound], al
+    lea rsi, [r9+7]
+    push rdi
+    lea rdi, [n_selected]
+    call br_attr
+    pop rdi
+    jnz .nsl
+    mov [br_sidx], r10d
+.nsl:
+    mov rbx, rdi                    ; the value; its text follows the NUL
+.vz:
+    cmp byte [rdi], 0
+    je .vz2
+    inc rdi
+    jmp .vz
+.vz2:
+    inc rdi
+    mov rbp, rdi                    ; text start
+    lea rsi, [r8+1]
+    xor ecx, ecx
+.tx:
+    cmp rsi, r15
+    jae .te
+    cmp ecx, 30
+    jae .te
+    mov al, [rsi]
+    cmp al, '<'
+    je .te
+    cmp al, ' '
+    ja .tc
+    test ecx, ecx
+    jz .tskip
+    cmp byte [rdi-1], ' '
+    je .tskip
+    mov al, ' '
+    mov [rdi], al
+    inc rdi
+    inc ecx
+.tskip:
+    inc rsi
+    jmp .tx
+.tc:
+    call br_u8cp
+    mov [rdi], al
+    inc rdi
+    inc ecx
+    jmp .tx
+.te:
+    cmp ecx, 0
+    je .te2
+    cmp byte [rdi-1], ' '
+    jne .te2
+    dec rdi
+    dec ecx
+.te2:
+    mov byte [rdi], 0
+    inc rdi
+    cmp ecx, r11d
+    jbe .nl
+    mov r11d, ecx
+.nl:
+    cmp byte [br_vfound], 0
+    jne .vok
+    mov rsi, rbp                    ; no value attribute: the text is the value
+    mov rdi, rbx
+.cv:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .cv
+    lea rdi, [rbp+rcx+1]
+.vok:
+    mov eax, edi
+    sub eax, BR_OPT
+    mov [br_optp], eax
+    inc r10d
+    mov rsi, r8
+.nx:
+    inc rsi
+    jmp .scan
+.done:
+    mov ebx, r14d
+    shl ebx, 4
+    mov [BR_ITM+rbx+10], r10w
+    lea eax, [r11+4]
+    mov [BR_ITM+rbx+3], al
+    test r10d, r10d
+    jz .np
+    mov ecx, r14d
+    mov eax, [br_sidx]
+    call br_sel_pick
+.np:
+    mov ecx, r14d
+    call br_ctl_text
+    mov edx, eax
+    mov ecx, r14d
+    call br_ctl_place
+.o: POPA
+    ret
+
+; ---- end html5.inc
+; ---- begin browser.inc
+; =============================================================================
+;  BROWSER (v3.6): address bar, local pages, http/https pages; the HTML engine is in
+;  html1..html5.inc (tags, CSS, tables, forms).  This file: loading, drawing, keys.
+; =============================================================================
+
+app_browser:
+    PUSHA
+    lea rsi, [p_www_idx]
+    lea rdi, [br_loc]
+    call strcpy
+    call br_run
+    POPA
+    ret
+
+browser_open:                       ; rax = file slot of a page (called from Files)
+    PUSHA
+    mov rsi, rax
+    lea rdi, [br_loc]
+    call strcpy
+    call br_run
+    POPA
+    ret
+
+
 br_page_msg:                        ; rsi = html text -> HTTPB page "net.htm"
     PUSHA
     mov r12, rsi
@@ -16224,15 +22404,18 @@ br_errpage:                         ; eax = E_ code, br_loc = address
 br_load:
     PUSHA
     mov dword [br_nlk], 0
+    mov byte [br_csin], 0
     lea rsi, [br_loc]
     cmp byte [rsi], '/'
     je .local
     ; ---- network page
+    mov byte [br_isweb], 1
     mov eax, [rsi]
     or eax, 0x20202020
     cmp eax, 0x70747468             ; "http" present?
     je .hasscheme
     lea rdi, [url_tmp]              ; add "http://"
+    mov byte [rdi], 0
     lea rsi, [s_http_s]
     call sappend
     lea rsi, [br_loc]
@@ -16242,6 +22425,7 @@ br_load:
     call strcpy
 .hasscheme:
     lea rdi, [br_msg]
+    mov byte [rdi], 0
     lea rsi, [s_br_loading]
     call sappend
     lea rsi, [br_loc]
@@ -16252,6 +22436,7 @@ br_load:
     call br_draw
     lea rsi, [br_loc]
     call http_fetch
+    mov byte [http_post], 0
     test eax, eax
     jz .ok
     call br_errpage
@@ -16264,9 +22449,12 @@ br_load:
     lea rsi, [net_url]
     lea rdi, [br_loc]
     call strcpy
+    mov al, [http_cs]
+    mov [br_csin], al
     mov rax, HTTPB
     mov [br_slot], rax
     lea rdi, [br_msg]
+    mov byte [rdi], 0
     lea rsi, [s_br_http]
     call sappend
     mov eax, [http_status]
@@ -16280,6 +22468,7 @@ br_load:
     mov [br_stat], rax
     jmp .render
 .local:
+    mov byte [br_isweb], 0
     lea rsi, [br_loc]
     call fs_find
     test rax, rax
@@ -16293,7 +22482,6 @@ br_load:
     call fs_find
     test rax, rax
     jnz .got
-    lea rsi, [br_loc]
     mov rdi, TMPB
     mov byte [rdi], 0
     lea rsi, [s_nf1]
@@ -16317,6 +22505,53 @@ br_load:
     je .o
     mov dword [br_sel], 0
 .o: POPA
+    ret
+
+; br_jump: [br_frag] = hash of a #fragment (0 = none) -> scrolls to that anchor
+br_jump:
+    PUSHA
+    mov eax, [br_frag]
+    test eax, eax
+    jz .o
+    xor ecx, ecx
+.l: cmp ecx, [br_nanc]
+    jae .o
+    mov edx, ecx
+    shl edx, 3
+    cmp [BR_ANC+rdx], eax
+    je .f
+    inc ecx
+    jmp .l
+.f: mov esi, [BR_ANC+rdx+4]         ; the row of the anchor
+    mov eax, esi
+    mov ecx, [br_rows]
+    sub ecx, BRVIS
+    jg .c1
+    xor ecx, ecx
+.c1:
+    cmp eax, ecx
+    jle .c2
+    mov eax, ecx
+.c2:
+    mov [br_top], eax
+    imul edi, esi, COLS             ; select the first item at or after that row
+    mov ecx, [br_rows]
+    imul ecx, COLS
+    sub ecx, edi
+    jle .o
+    add rdi, BRA
+.s: cmp byte [rdi], 0
+    jne .sel
+    inc rdi
+    dec ecx
+    jnz .s
+    jmp .o
+.sel:
+    movzx eax, byte [rdi]
+    sub eax, 8
+    mov [br_sel], eax
+.o: mov dword [br_frag], 0
+    POPA
     ret
 
 br_hist_push:
@@ -16345,7 +22580,7 @@ br_hist_push:
 br_row0:                            ; rsi = text -> drawn on row 0 (cut to the window width)
     PUSHA
     mov rdi, TMPB+0x200
-    mov ecx, COLS-4
+    mov ecx, COLS-12
 .c: lodsb
     test al, al
     jz .z
@@ -16360,14 +22595,173 @@ br_row0:                            ; rsi = text -> drawn on row 0 (cut to the w
     POPA
     ret
 
+; ------------------------------------------------------------- drawing --------
+; br_islight: eax = 0xRRGGBB -> eax = 1 when the colour is light
+br_islight:
+    push rcx
+    push rdx
+    movzx ecx, al
+    mov edx, eax
+    shr edx, 8
+    movzx edx, dl
+    shr eax, 16
+    movzx eax, al
+    imul eax, 3
+    imul edx, 6
+    add eax, edx
+    add eax, ecx
+    cmp eax, 1280
+    setae al
+    movzx eax, al
+    pop rdx
+    pop rcx
+    ret
+
+; br_linech: al = line-drawing character, ebx = x, ecx = y, [g_fg] = colour
+br_linech:
+    PUSHA
+    movzx eax, al
+    cmp eax, 16
+    ja .o
+    lea rdx, [bl_mask]
+    movzx r12d, byte [rdx+rax]
+    mov r13d, [g_fg]
+    mov r14d, ebx
+    mov r15d, ecx
+    test r12d, 1
+    jz .nl
+    mov ebx, r14d
+    lea ecx, [r15+7]
+    mov esi, 4
+    mov edx, 1
+    mov eax, r13d
+    call rect
+.nl:
+    test r12d, 2
+    jz .nr
+    lea ebx, [r14+3]
+    lea ecx, [r15+7]
+    mov esi, 5
+    mov edx, 1
+    mov eax, r13d
+    call rect
+.nr:
+    test r12d, 4
+    jz .nu
+    lea ebx, [r14+3]
+    mov ecx, r15d
+    mov esi, 1
+    mov edx, 8
+    mov eax, r13d
+    call rect
+.nu:
+    test r12d, 8
+    jz .o
+    lea ebx, [r14+3]
+    lea ecx, [r15+7]
+    mov esi, 1
+    mov edx, 9
+    mov eax, r13d
+    call rect
+.o: POPA
+    ret
+
+; br_glyph2x: al = char, ebx = x, ecx = y, [br_gq] bit0 = right half, bit1 = lower half
+;   one quarter of the character blown up 2x (headings use four cells per letter)
+br_glyph2x:
+    PUSHA
+    movzx eax, al
+    shl eax, 6
+    lea r8, [font_mono+rax]
+    movzx eax, byte [br_gq]
+    test al, 2
+    jz .u
+    add r8, 32
+.u: mov r12d, ebx
+    mov r13d, ecx
+    and eax, 1
+    lea r14d, [rax*2]
+    xor r15d, r15d
+.r: lea rdi, [r8+r15*4]
+    add rdi, r14
+    xor ebp, ebp
+.p: mov eax, ebp
+    shr eax, 1
+    movzx eax, byte [rdi+rax]
+    test ebp, 1
+    jnz .lo
+    shr eax, 4
+    jmp .t
+.lo:
+    and eax, 15
+.t: cmp eax, 6
+    jb .np
+    lea ebx, [r12+rbp*2]
+    lea ecx, [r13+r15*2]
+    mov esi, 2
+    mov edx, 2
+    mov eax, [g_fg]
+    call rect
+.np:
+    inc ebp
+    cmp ebp, 4
+    jb .p
+    inc r15d
+    cmp r15d, 8
+    jb .r
+    POPA
+    ret
+
+; br_scrollbar: a track at the right edge of the page with a thumb (clicking it scrolls)
+br_scrollbar:
+    PUSHA
+    mov r12d, [br_rows]
+    cmp r12d, BRVIS
+    jbe .o
+    mov eax, 0xE0E0E0
+    cmp dword [br_islt], 0
+    jne .tc
+    mov eax, 0x3A3A4A
+.tc:
+    mov ebx, GX+770
+    mov ecx, GY+32
+    mov esi, 12
+    mov edx, BRVIS*16
+    call rect
+    mov eax, BRVIS*16
+    imul eax, BRVIS
+    xor edx, edx
+    div r12d
+    cmp eax, 20
+    jae .th
+    mov eax, 20
+.th:
+    mov r13d, eax                   ; thumb height
+    mov eax, BRVIS*16
+    sub eax, r13d
+    imul eax, [br_top]
+    mov ecx, r12d
+    sub ecx, BRVIS
+    xor edx, edx
+    div ecx
+    add eax, GY+32
+    mov ecx, eax
+    mov edx, r13d
+    mov eax, 0x8A8F98
+    mov ebx, GX+771
+    mov esi, 10
+    call rect
+.o: POPA
+    ret
+
 br_draw:
     PUSHA
     lea rsi, [s_brw_t]
     call draw_win
     mov byte [g_tr], 0
     SETC g_bg, C_WIN
-    cmp byte [br_editing], 0
-    jne .edit
+    cmp byte [br_editing], 1
+    je .edit
     SETC g_fg, C_TXT
     lea rsi, [br_loc]
     call br_row0
@@ -16375,6 +22769,7 @@ br_draw:
 .edit:
     ACCSET g_fg
     mov rdi, TMPB
+    mov byte [rdi], 0
     lea rsi, [s_br_go]
     call sappend
     lea rsi, [br_edit]
@@ -16392,75 +22787,279 @@ br_draw:
     mov eax, 0
     mov edx, 1
     call puts_cell
+    SETC g_fg, C_ACC
+    lea rsi, [s_br_btns]
+    mov eax, 87
+    xor edx, edx
+    call puts_cell
+    ; ---- page colours
+    mov eax, [br_pbg]
+    test eax, 0x1000000
+    jz .thm
+    and eax, 0xFFFFFF
+    jmp .pg
+.thm:
+    mov eax, C_WIN
+    and eax, 0xFFFFFF
+.pg:
+    mov [br_pgbg], eax
+    call br_islight
+    mov [br_islt], eax
+    mov eax, [br_pgbg]
+    mov ebx, GX
+    mov ecx, GY+32
+    mov esi, (COLS-2)*8
+    mov edx, BRVIS*16
+    call rect
+    mov r11d, -1                    ; the selected item (+8)
+    cmp dword [br_sel], 0
+    jl .ns
+    mov r11d, [br_sel]
+    add r11d, 8
+.ns:
     xor r10d, r10d
 .row:
     mov eax, [br_top]
     add eax, r10d
     cmp eax, [br_rows]
     jae .done
-    imul eax, COLS
-    lea r8, [rax+BRC]
-    lea r11, [rax+BRA]
+    imul r13d, eax, COLS
     mov ecx, r10d
     add ecx, 2
     shl ecx, 4
     add ecx, GY
     mov ebx, GX
     xor r12d, r12d
-.c: movzx edx, byte [r11+r12]
-    mov al, [r8+r12]
-    mov esi, [br_sel]
-    add esi, 8
-    cmp edx, esi
-    jne .nsel
-    cmp dword [br_sel], 0
-    jl .nsel
-    ACCSET g_bg
-    mov dword [g_fg], 0xFFFFFF
-    call glyph
-    SETC g_bg, C_WIN
-    jmp .next
-.nsel:
-    cmp al, ' '
-    je .next
+.c: lea ebp, [r13+r12]
+    movzx edx, byte [BRA+rbp]
+    movzx r9d, byte [BRX+rbp]
+    mov r14d, [BRB+rbp*4]
+    mov r15d, [BRF+rbp*4]
+    mov r8d, -1                     ; the kind of item the cell belongs to
     test edx, edx
-    jz .norm
-    cmp edx, 1
-    je .head
-    cmp edx, 3
-    je .dim
-    ACCSET g_fg
-    call glyph
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    mov eax, C_ACC
-    add ecx, 14
+    jz .noit
+    cmp byte [BRC+rbp], ' '         ; blanks at the edge of a link are not part of it
+    jne .inl
+    test r9d, FX_CTL
+    jnz .inl
+    test r12d, r12d
+    jz .strip
+    cmp [BRA+rbp-1], dl
+    jne .strip
+    cmp [BRA+rbp+1], dl
+    je .inl
+.strip:
+    xor edx, edx
+    and r9d, ~FX_UL
+    and r15d, ~0x2000000
+    jmp .noit
+.inl:
+    lea eax, [rdx-8]
+    shl eax, 4
+    movzx r8d, byte [BR_ITM+rax]
+.noit:
+    test r14d, 0x1000000
+    jz .nbg
+    and r14d, 0xFFFFFF
+    jmp .gbg
+.nbg:
+    mov r14d, [br_pgbg]
+.gbg:
+    test r9d, FX_CTL
+    jz .nctl
+    cmp r8d, IT_TEXT
+    je .field
+    cmp r8d, IT_PASS
+    je .field
+    cmp r8d, IT_BTN
+    je .btnc
+    cmp r8d, IT_SEL
+    jne .nctl
+.btnc:
+    mov r14d, 0xE8EAED
+    cmp dword [br_islt], 0
+    jne .nctl
+    mov r14d, 0x45475A
+    jmp .nctl
+.field:
+    mov r14d, 0xFFFFFF
+    cmp dword [br_islt], 0
+    jne .nctl
+    mov r14d, 0x2B2B3A
+.nctl:
+    test edx, edx
+    jz .nsel
+    cmp edx, r11d
+    jne .nsel
+    mov r14d, [th_acc]
+    and r14d, 0xFFFFFF
+    mov r15d, 0x1FFFFFF
+.nsel:
+    ; ---- the text colour
+    test r15d, 0x1000000
+    jz .dfg
+    and r15d, 0xFFFFFF
+    jmp .fg
+.dfg:
+    mov esi, 0                      ; 1 = the themed background of a local page
+    test dword [br_pbg], 0x1000000
+    jnz .nth
+    cmp r14d, [br_pgbg]
+    jne .nth
+    mov esi, 1
+.nth:
+    test r15d, 0x2000000
+    jnz .lnk
+    test r8d, r8d
+    jnz .txt
+.lnk:
+    test esi, esi
+    jz .lnk2
+    mov r15d, [th_acc]
+    and r15d, 0xFFFFFF
+    jmp .fg
+.lnk2:
+    mov eax, r14d
+    call br_islight
+    mov r15d, 0x8AB4F8
+    test eax, eax
+    jz .fg
+    mov r15d, 0x0B57D0
+    jmp .fg
+.txt:
+    test esi, esi
+    jz .txt2
+    mov r15d, C_TXT
+    and r15d, 0xFFFFFF
+    jmp .fg
+.txt2:
+    mov eax, r14d
+    call br_islight
+    mov r15d, 0xE8EAED
+    test eax, eax
+    jz .fg
+    mov r15d, 0x202124
+.fg:
+    mov [g_fg], r15d
+    mov [g_bg], r14d
+    cmp r14d, [br_pgbg]
+    je .nofill
+    mov eax, r14d
     mov esi, 8
-    mov edx, 1
+    mov edx, 16
     call rect
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    jmp .next
-.norm:
-    SETC g_fg, C_TXT
+.nofill:
+    mov al, [BRC+rbp]
+    test al, al
+    jz .deco
+    cmp al, ' '
+    je .deco
+    jb .line
+    test r9d, FX_BIG
+    jnz .big
     call glyph
-    jmp .next
-.head:
-    ACCSET g_fg
-    call glyph
+    test r9d, FX_BOLD
+    jz .deco
     inc ebx
     mov byte [g_tr], 1
     call glyph
     mov byte [g_tr], 0
     dec ebx
+    jmp .deco
+.big:
+    mov edx, r9d
+    shr edx, 6
+    and edx, 3
+    mov [br_gq], dl
+    call br_glyph2x
+    jmp .deco
+.line:
+    call br_linech
     jmp .next
-.dim:
-    SETC g_fg, C_DIM
-    call glyph
+.deco:
+    cmp byte [BRC+rbp], ' '         ; no underline or strike-through on the edge blanks of a styled run
+    ja .dok
+    test r12d, r12d
+    jz .dok
+    mov eax, r9d
+    and eax, FX_UL|FX_STR
+    jz .dok
+    mov edx, eax
+    and al, [BRX+rbp-1]
+    cmp al, dl
+    je .rt
+    mov eax, edx
+    not eax
+    and r9d, eax
+.rt:
+    mov eax, r9d
+    and eax, FX_UL|FX_STR
+    jz .dok
+    mov edx, eax
+    and al, [BRX+rbp+1]
+    cmp al, dl
+    je .dok
+    mov eax, edx
+    not eax
+    and r9d, eax
+.dok:
+    test r9d, FX_UL
+    jz .nu
+    add ecx, 14
+    mov eax, r15d
+    mov esi, 8
+    mov edx, 1
+    call rect
+    sub ecx, 14
+.nu:
+    test r9d, FX_STR
+    jz .ns2
+    add ecx, 8
+    mov eax, r15d
+    mov esi, 8
+    mov edx, 1
+    call rect
+    sub ecx, 8
+.ns2:
+    test r9d, FX_CTL
+    jz .next
+    cmp r8d, IT_TEXT
+    je .box
+    cmp r8d, IT_PASS
+    je .box
+    cmp r8d, IT_BTN
+    je .box
+    cmp r8d, IT_SEL
+    jne .next
+.box:
+    mov eax, 0x9AA0A6
+    cmp dword [br_islt], 0
+    jne .bc
+    mov eax, 0x6C7086
+.bc:
+    mov r15d, eax
+    mov esi, 8
+    mov edx, 1
+    call rect
+    add ecx, 15
+    call rect
+    sub ecx, 15
+    movzx edi, byte [BRA+rbp]
+    mov esi, 1
+    mov edx, 16
+    mov eax, r15d
+    test r12d, r12d
+    jz .ledge
+    cmp [BRA+rbp-1], dil
+    je .nl2
+.ledge:
+    call rect
+.nl2:
+    cmp [BRA+rbp+1], dil
+    je .next
+    add ebx, 7
+    call rect
+    sub ebx, 7
 .next:
     add ebx, 8
     inc r12d
@@ -16470,17 +23069,23 @@ br_draw:
     cmp r10d, BRVIS
     jb .row
 .done:
+    call br_scrollbar
     mov rsi, [br_stat]
     cmp dword [br_sel], 0
     jl .st
     cmp byte [br_editing], 0
     jne .st
     mov eax, [br_sel]
+    mov ecx, eax
+    shl ecx, 4
+    cmp byte [BR_ITM+rcx], IT_LINK
+    jne .st
     shl eax, 7
     lea rsi, [BRL+rax]
     mov rdi, TMPB+0x400
     mov word [rdi], '->'
     mov byte [rdi+2], ' '
+    mov byte [rdi+3], 0
     add rdi, 3
     call sappend
     mov rsi, TMPB+0x400
@@ -16489,12 +23094,14 @@ br_draw:
     POPA
     ret
 
+; ------------------------------------------------------------- keys -----------
 br_run:
     PUSHA
     mov dword [br_hn], 0
     mov byte [br_editing], 0
     mov dword [br_top], 0
     mov dword [br_sel], -1
+    mov dword [br_frag], 0
     call br_clear
     lea rax, [s_br_hint]
     mov [br_stat], rax
@@ -16502,8 +23109,12 @@ br_run:
 .draw:
     call br_draw
 .k: call getkey
-    cmp byte [br_editing], 0
-    jne .edkey
+    cmp al, K_CLICK
+    je .click
+    cmp byte [br_editing], 1
+    je .edkey
+    cmp byte [br_editing], 2
+    je .fkey
     cmp al, 27
     je .exit
     cmp al, K_DN
@@ -16547,6 +23158,64 @@ br_run:
     mov dword [br_elen], 0
     mov byte [br_edit], 0
     jmp .draw
+; ---- the mouse
+.click:
+    cmp byte [br_editing], 2
+    jne .m0
+    mov ecx, [br_eitem]             ; leaves a field that is being edited
+    mov byte [br_editing], 0
+    call br_ctl_draw
+.m0:
+    cmp byte [br_editing], 1
+    jne .m1
+    mov byte [br_editing], 0
+.m1:
+    mov eax, [clk_y]
+    test eax, eax
+    js .k
+    jnz .pgclick
+    mov eax, [clk_x]                ; the address line: [<] back, [R] reload, anywhere else types an address
+    cmp eax, 87
+    jb .edit
+    cmp eax, 90
+    jb .back
+    cmp eax, 91
+    jb .edit
+    cmp eax, 94
+    jb .reload
+    jmp .edit
+.pgclick:
+    cmp eax, 2
+    jb .draw
+    sub eax, 2
+    cmp eax, BRVIS
+    jae .draw
+    mov ecx, [clk_x]
+    cmp ecx, 96
+    jae .sbar
+    test ecx, ecx
+    js .draw
+    add eax, [br_top]
+    cmp eax, [br_rows]
+    jae .draw
+    imul eax, COLS
+    add eax, ecx
+    movzx eax, byte [BRA+rax]
+    cmp eax, 8
+    jb .draw
+    sub eax, 8
+    mov [br_sel], eax
+    jmp .follow
+.sbar:
+    mov ecx, [br_rows]
+    sub ecx, BRVIS
+    jle .draw
+    imul eax, ecx
+    xor edx, edx
+    mov ebx, BRVIS-1
+    div ebx
+    jmp .st
+; ---- address editing
 .edkey:
     cmp al, 27
     je .edcancel
@@ -16585,11 +23254,78 @@ br_run:
     lea rdi, [br_loc]
     call strcpy
     jmp .loadit
+; ---- editing a text field of the page
+.fkey:
+    mov ecx, [br_eitem]
+    cmp al, 27
+    je .fend
+    cmp al, 13
+    je .fgo
+    cmp al, 9
+    je .ftab
+    cmp al, 8
+    je .fbs
+    cmp al, ' '
+    jb .k
+    cmp al, 126
+    ja .k
+    mov r12d, eax
+    shl ecx, 7
+    lea rsi, [BRL+rcx+32]
+    mov rdi, rsi
+    call strlen
+    cmp eax, 62
+    jae .k
+    mov byte [rdi+rax+1], 0
+    mov ecx, r12d
+    mov [rdi+rax], cl
+    jmp .fredraw
+.fbs:
+    shl ecx, 7
+    lea rsi, [BRL+rcx+32]
+    call strlen
+    test eax, eax
+    jz .k
+    mov byte [rsi+rax-1], 0
+.fredraw:
+    mov ecx, [br_eitem]
+    call br_ctl_draw
+    jmp .draw
+.fend:
+    mov byte [br_editing], 0
+    call br_ctl_draw
+    jmp .draw
+.ftab:
+    mov byte [br_editing], 0
+    call br_ctl_draw
+    jmp .nx
+.fgo:
+    mov ebx, ecx
+    shl ebx, 4
+    test byte [BR_ITM+rbx+2], IF_AREA
+    jz .fsub
+    mov r12d, ecx                   ; a text area: Enter is a blank
+    shl ecx, 7
+    lea rsi, [BRL+rcx+32]
+    mov rdi, rsi
+    call strlen
+    cmp eax, 62
+    jae .k
+    mov byte [rdi+rax], ' '
+    mov byte [rdi+rax+1], 0
+    jmp .fredraw
+.fsub:
+    mov byte [br_editing], 0
+    call br_ctl_draw
+    jmp .submit
 .reload:
+    mov dword [br_frag], 0
     jmp .loadit
 .loadit:
     call br_load
+    call br_jump
     jmp .draw
+; ---- scrolling
 .dn:
     mov eax, [br_top]
     inc eax
@@ -16627,24 +23363,44 @@ br_run:
 .c3:
     mov [br_top], eax
     jmp .draw
+; ---- Tab / arrows: next or previous item (hidden fields are skipped)
 .nx:
     mov eax, [br_nlk]
     test eax, eax
     jz .k
+    mov r12d, eax                   ; at most this many steps
     mov ecx, [br_sel]
+.nl:
     inc ecx
     cmp ecx, eax
-    jb .ss
+    jb .nt
     xor ecx, ecx
-    jmp .ss
+.nt:
+    mov edx, ecx
+    shl edx, 4
+    cmp byte [BR_ITM+rdx], IT_HID
+    jne .ss
+    dec r12d
+    jnz .nl
+    jmp .k
 .pv:
     mov eax, [br_nlk]
     test eax, eax
     jz .k
+    mov r12d, eax
     mov ecx, [br_sel]
+.pl:
     dec ecx
-    jns .ss
+    jns .pt
     lea ecx, [rax-1]
+.pt:
+    mov edx, ecx
+    shl edx, 4
+    cmp byte [BR_ITM+rdx], IT_HID
+    jne .ss
+    dec r12d
+    jnz .pl
+    jmp .k
 .ss:
     mov [br_sel], ecx
     lea eax, [rcx+8]
@@ -16681,11 +23437,56 @@ br_run:
     lea rsi, [BRH+rcx]
     lea rdi, [br_loc]
     call strcpy
+    mov dword [br_frag], 0
     jmp .loadit
+; ---- Enter on the selected item
 .follow:
     mov eax, [br_sel]
     test eax, eax
     js .k
+    mov ebx, eax
+    shl ebx, 4
+    movzx edx, byte [BR_ITM+rbx]
+    test edx, edx
+    jz .link
+    cmp edx, IT_TEXT
+    je .fedit
+    cmp edx, IT_PASS
+    je .fedit
+    cmp edx, IT_BTN
+    je .submit
+    cmp edx, IT_CHK
+    je .tog
+    cmp edx, IT_RAD
+    je .tog
+    cmp edx, IT_SEL
+    je .tog
+    jmp .k
+.fedit:
+    mov [br_eitem], eax
+    mov byte [br_editing], 2
+    mov ecx, eax
+    call br_ctl_draw
+    jmp .draw
+.tog:
+    mov ecx, eax
+    call br_ctl_toggle
+    jmp .draw
+.submit:
+    mov ecx, [br_sel]
+    call br_form_submit
+    jc .nosub
+    mov dword [br_frag], 0
+    call br_hist_push
+    lea rsi, [url_tmp]
+    lea rdi, [br_loc]
+    call strcpy
+    jmp .loadit
+.nosub:
+    lea rax, [s_br_nosub]
+    mov [br_stat], rax
+    jmp .draw
+.link:
     shl eax, 7
     lea rsi, [BRL+rax]
     lea rdi, [br_loc]
@@ -16697,6 +23498,40 @@ br_run:
     mov [br_stat], rax
     jmp .draw
 .fok:
+    mov dword [br_frag], 0
+    lea rsi, [url_tmp]              ; split off a #fragment
+.fs:
+    mov al, [rsi]
+    test al, al
+    jz .nofrag
+    cmp al, '#'
+    je .frag
+    inc rsi
+    jmp .fs
+.frag:
+    mov byte [rsi], 0
+    inc rsi
+    mov rdi, rsi
+    call strlen
+    mov ecx, eax
+    test ecx, ecx
+    jnz .fh
+    mov dword [br_top], 0
+    jmp .nofrag
+.fh:
+    call css_hash
+    or eax, 0x80000000
+    mov [br_frag], eax
+.nofrag:
+    lea rsi, [url_tmp]
+    lea rdi, [br_loc]
+    call strcmp
+    jne .newpage
+    cmp byte [url_tmp], 0
+    je .newpage
+    call br_jump                    ; the same page: only scroll
+    jmp .draw
+.newpage:
     call br_hist_push
     lea rsi, [url_tmp]
     lea rdi, [br_loc]
@@ -16704,33 +23539,16075 @@ br_run:
     jmp .loadit
 
 ; ------------------------------------------------------------- data ---------
-misc_str:
-ms_dash  db "-", 0
-ms_dd    db "--", 0
-ms_sq    db "'", 0
-ms_dq    db 34, 0
-ms_star  db "*", 0
-ms_ell   db "...", 0
-ms_c     db "(c)", 0
-ms_r     db "(R)", 0
-ms_la    db "<<", 0
-ms_ra    db ">>", 0
-ms_dot   db ".", 0
-ms_rarr  db "->", 0
-ms_larr  db "<-", 0
-ms_eur   db "EUR", 0
-ms_tm    db "(TM)", 0
-ms_deg   db "deg", 0
-ms_pm    db "+-", 0
-ms_half  db "1/2", 0
-ms_x     db "x", 0
-ms_gbp   db "GBP", 0
 
 ; ---- end browser.inc
+; ---- begin py1.inc
+; =============================================================================
+;  Python subset interpreter - part 1: memory, values, errors, printing, names
+;
+;  Values are tagged 64-bit words:  xxx1 = small integer (n<<2|1, 62 bits)
+;                                   0x02 None, 0x06 False, 0x0A True
+;                                   aligned pointer = heap object, dword type at +0:
+;       1 str   [type][len] bytes NUL
+;       2 list  [type][len][cap][pad][items*]       4 tuple (same layout)
+;       3 range [type][pad] start stop step (int64)
+;       5 dict  [type][len][cap][pad][pairs*]  (key,value, 16 bytes each)
+;  Everything lives in a bump heap that is thrown away when the program ends.
+;  Strings are byte strings (UTF-8 passes through unchanged, len() counts bytes).
+; =============================================================================
+PY         equ 0x5400000
+PY_SYM     equ PY                   ; 1000 variables * 24 bytes: name ptr, name len, pad, value
+PY_FN      equ PY+0x8000            ; 128 functions * 32 bytes
+PYV        equ PY+0xC000            ; interpreter variables
+PY_SB      equ PY+0x10000           ; string builder scratch (64 KB)
+PY_SBEND   equ PY+0x20000
+PY_STK     equ PY+0x100000          ; own machine stack (1 MB), top = PY_STKTOP
+PY_STKTOP  equ PY+0x200000
+PY_HEAP    equ PY+0x200000
+PY_HEAPEND equ PY+0x1200000
+PY_MAXSYM  equ 1000
+PY_MAXFN   equ 128
+PY_MAXDEPTH equ 300
+
+PYV_HP     equ PYV+0
+PYV_SRC    equ PYV+8
+PYV_ERRMSG equ PYV+16
+PYV_ERRPOS equ PYV+24
+PYV_SP0    equ PYV+32
+PYV_NSYM   equ PYV+40
+PYV_FBASE  equ PYV+48
+PYV_G0     equ PYV+56
+PYV_FDEPTH equ PYV+64
+PYV_NFN    equ PYV+72
+PYV_SKIP   equ PYV+80
+PYV_DEPTH  equ PYV+88
+PYV_FLOW   equ PYV+96              ; 0 normal, 1 break, 2 continue, 3 return
+PYV_RET    equ PYV+104
+PYV_TICK   equ PYV+112
+PYV_SUBB   equ PYV+120             ; last subscript: container, index, valid flag
+PYV_SUBI   equ PYV+128
+PYV_SUBV   equ PYV+136
+PYV_SBP    equ PYV+144
+PYV_BUSY   equ PYV+152
+PYV_OLDSP  equ PYV+160
+PYV_NAMEP  equ PYV+168             ; bare name just parsed (for assignment targets)
+PYV_NAMEL  equ PYV+176
+PYV_T0     equ PYV+184             ; scratch qwords for builtins
+PYV_T1     equ PYV+192
+PYV_T2     equ PYV+200
+PYV_T3     equ PYV+208
+PYV_EBUF   equ PYV+0x100           ; error text (256)
+PYV_NUMB   equ PYV+0x200           ; number text (64)
+
+PY_NONE    equ 2
+PY_FALSE   equ 6
+PY_TRUE    equ 10
+
+%macro PERR 1
+    lea rdi, [%1]
+    jmp py_error
+%endmacro
+
+; ---- errors -----------------------------------------------------------------------------------
+py_error:                           ; rdi = message (NUL terminated), rsi = source position
+    mov [PYV_ERRMSG], rdi
+    mov [PYV_ERRPOS], rsi
+    mov rax, [PYV_CATCH]
+    test rax, rax
+    jnz .catch
+    mov rsp, [PYV_SP0]
+    jmp py_exit_err
+.catch:
+    mov rsp, rax
+    jmp py_caught
+
+; ---- heap ------------------------------------------------------------------------------------
+py_alloc:                           ; ecx = bytes -> rax = zeroed 8-byte aligned block
+    push rdi
+    mov ecx, ecx
+    add rcx, 7
+    and rcx, -8
+    mov rax, [PYV_HP]
+    lea rdx, [rax+rcx]
+    cmp rdx, PY_HEAPEND
+    ja .oom
+    mov [PYV_HP], rdx
+    mov rdi, rax
+    push rax
+    shr ecx, 3
+    xor eax, eax
+    rep stosq
+    pop rax
+    pop rdi
+    ret
+.oom:
+    PERR pe_mem
+
+py_newstr:                          ; rsi = bytes, ecx = length -> rax = str object
+    push rsi
+    push rcx
+    add ecx, 9
+    call py_alloc
+    pop rcx
+    pop rsi
+    mov dword [rax], 1
+    mov [rax+4], ecx
+    lea rdi, [rax+8]
+    push rax
+    rep movsb
+    mov byte [rdi], 0
+    pop rax
+    ret
+
+py_newlist:                         ; ecx = capacity, edx = type (2 list, 4 tuple) -> rax
+    push rcx
+    push rdx
+    mov ecx, 24
+    call py_alloc
+    pop rdx
+    pop rcx
+    mov [rax], edx
+    mov dword [rax+4], 0
+    cmp ecx, 1
+    jae .c
+    mov ecx, 1
+.c: mov [rax+8], ecx
+    push rax
+    push rcx
+    shl ecx, 3
+    call py_alloc
+    mov rdx, rax
+    pop rcx
+    pop rax
+    mov [rax+16], rdx
+    ret
+
+py_lappend:                         ; rax = list/tuple, rdx = value (rax kept)
+    push rcx
+    push rsi
+    push rdi
+    push rbx
+    push r8
+    mov r8, rax
+    mov ecx, [r8+4]
+    cmp ecx, [r8+8]
+    jb .st
+    push rdx
+    mov ecx, [r8+8]
+    lea ebx, [rcx+rcx]
+    cmp ebx, 4
+    jae .g
+    mov ebx, 4
+.g: mov ecx, ebx
+    shl ecx, 3
+    call py_alloc
+    mov rdi, rax
+    mov rsi, [r8+16]
+    mov ecx, [r8+4]
+    push rdi
+    rep movsq
+    pop rdi
+    mov [r8+16], rdi
+    mov [r8+8], ebx
+    pop rdx
+.st:
+    mov ecx, [r8+4]
+    mov rdi, [r8+16]
+    mov [rdi+rcx*8], rdx
+    inc ecx
+    mov [r8+4], ecx
+    mov rax, r8
+    pop r8
+    pop rbx
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; ---- small helpers on values -----------------------------------------------------------------
+py_mkint:                           ; rax = raw int64 -> tagged (error when it does not fit 62 bits)
+    mov rdx, 0x2000000000000000
+    add rdx, rax
+    shr rdx, 62
+    jnz .big
+    lea rax, [rax*4+1]
+    ret
+.big:
+    PERR pe_big
+
+py_truthy:                          ; rax = value -> eax = 1/0, ZF set when false
+    test al, 1
+    jz .nint
+    cmp rax, 1
+    setne al
+    movzx eax, al
+    jmp .r
+.nint:
+    test al, 2
+    jz .heap
+    cmp rax, PY_TRUE
+    sete al
+    movzx eax, al
+    jmp .r
+.heap:
+    mov edx, [rax]
+    cmp edx, 3
+    je .rng
+    cmp dword [rax+4], 0
+    setne al
+    movzx eax, al
+    jmp .r
+.rng:
+    mov rdx, [rax+8]
+    cmp rdx, [rax+16]
+    setne al
+    movzx eax, al
+.r: test eax, eax
+    ret
+
+; integer value of an int or a bool (rax tagged) -> rax raw; CF=1 when it is neither
+py_asint:
+    test al, 1
+    jz .n
+    sar rax, 2
+    clc
+    ret
+.n: cmp rax, PY_TRUE
+    jne .f
+    mov eax, 1
+    clc
+    ret
+.f: cmp rax, PY_FALSE
+    jne .no
+    xor eax, eax
+    clc
+    ret
+.no:
+    stc
+    ret
+
+; ---- output ------------------------------------------------------------------------------------
+py_puts:                            ; rsi = bytes, ecx = length
+    push rax
+    push rcx
+    push rsi
+.l: test ecx, ecx
+    jz .d
+    mov al, [rsi]
+    call py_out
+    inc rsi
+    dec ecx
+    jmp .l
+.d: pop rsi
+    pop rcx
+    pop rax
+    ret
+
+py_putz:                            ; rsi = NUL terminated text
+    push rax
+    push rsi
+.l: mov al, [rsi]
+    test al, al
+    jz .d
+    call py_out
+    inc rsi
+    jmp .l
+.d: pop rsi
+    pop rax
+    ret
+
+py_putint:                          ; rax = raw int64
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rbx, rax
+    test rax, rax
+    jns .p
+    neg rax
+.p: mov ecx, 10
+    lea rdi, [PYV_NUMB+63]
+.l: xor edx, edx
+    div rcx
+    add dl, '0'
+    mov [rdi], dl
+    dec rdi
+    test rax, rax
+    jnz .l
+    test rbx, rbx
+    jns .n
+    mov byte [rdi], '-'
+    dec rdi
+.n: inc rdi
+    mov rsi, rdi
+    lea rcx, [PYV_NUMB+64]
+    sub rcx, rdi
+    call py_puts
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+py_puthex2:                         ; al = byte -> two hex digits
+    push rax
+    push rax
+    shr al, 4
+    call .d
+    pop rax
+    and al, 15
+    call .d
+    pop rax
+    ret
+.d: cmp al, 10
+    jb .n
+    add al, 'a'-10-'0'
+.n: add al, '0'
+    jmp py_out
+
+; str() / repr() of any value. edx = 0 str, 1 repr
+py_putval:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    mov r12, rax
+    mov r13d, edx
+    test al, 1
+    jz .nint
+    sar rax, 2
+    call py_putint
+    jmp .out
+.nint:
+    test al, 2
+    jz .heap
+    lea rsi, [ps_none]
+    cmp r12, PY_NONE
+    je .z
+    lea rsi, [ps_false]
+    cmp r12, PY_FALSE
+    je .z
+    lea rsi, [ps_true]
+.z: call py_putz
+    jmp .out
+.heap:
+    mov eax, [r12]
+    cmp eax, 1
+    je .str
+    cmp eax, 2
+    je .list
+    cmp eax, 4
+    je .tuple
+    cmp eax, 3
+    je .range
+    cmp eax, 5
+    je .dict
+    lea rsi, [ps_func]
+    jmp .z
+.str:
+    lea rsi, [r12+8]
+    mov ecx, [r12+4]
+    test r13d, r13d
+    jnz .rstr
+    call py_puts
+    jmp .out
+.rstr:
+    call py_putrepr
+    jmp .out
+.list:
+    mov al, '['
+    call py_out
+    xor ebx, ebx
+.ll:
+    cmp ebx, [r12+4]
+    jae .le
+    test ebx, ebx
+    jz .l1
+    lea rsi, [ps_comma]
+    call py_putz
+.l1:
+    mov rax, [r12+16]
+    mov rax, [rax+rbx*8]
+    mov edx, 1
+    call py_putval
+    inc ebx
+    jmp .ll
+.le:
+    mov al, ']'
+    call py_out
+    jmp .out
+.tuple:
+    mov al, '('
+    call py_out
+    xor ebx, ebx
+.tl:
+    cmp ebx, [r12+4]
+    jae .te
+    test ebx, ebx
+    jz .t1
+    lea rsi, [ps_comma]
+    call py_putz
+.t1:
+    mov rax, [r12+16]
+    mov rax, [rax+rbx*8]
+    mov edx, 1
+    call py_putval
+    inc ebx
+    jmp .tl
+.te:
+    cmp dword [r12+4], 1
+    jne .tc
+    mov al, ','
+    call py_out
+.tc:
+    mov al, ')'
+    call py_out
+    jmp .out
+.range:
+    lea rsi, [ps_range]
+    call py_putz
+    mov rax, [r12+8]
+    call py_putint
+    lea rsi, [ps_comma]
+    call py_putz
+    mov rax, [r12+16]
+    call py_putint
+    cmp qword [r12+24], 1
+    je .rc
+    lea rsi, [ps_comma]
+    call py_putz
+    mov rax, [r12+24]
+    call py_putint
+.rc:
+    mov al, ')'
+    call py_out
+    jmp .out
+.dict:
+    mov al, '{'
+    call py_out
+    xor ebx, ebx
+.dl:
+    cmp ebx, [r12+4]
+    jae .de
+    test ebx, ebx
+    jz .d1
+    lea rsi, [ps_comma]
+    call py_putz
+.d1:
+    mov rax, [r12+16]
+    mov r14, rbx
+    shl r14, 4
+    add rax, r14
+    mov r14, [rax+8]
+    mov rax, [rax]
+    mov edx, 1
+    call py_putval
+    lea rsi, [ps_colon]
+    call py_putz
+    mov rax, r14
+    mov edx, 1
+    call py_putval
+    inc ebx
+    jmp .dl
+.de:
+    mov al, '}'
+    call py_out
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+py_putrepr:                         ; rsi = bytes, ecx = length: quoted like Python
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    mov bl, "'"
+    mov rdx, rsi
+    mov r8d, ecx
+    xor r9d, r9d                    ; r9b: saw ', r9 bit 8: saw "
+.s: test r8d, r8d
+    jz .sd
+    mov al, [rdx]
+    cmp al, "'"
+    jne .s1
+    or r9d, 1
+.s1:
+    cmp al, '"'
+    jne .s2
+    or r9d, 2
+.s2:
+    inc rdx
+    dec r8d
+    jmp .s
+.sd:
+    cmp r9d, 1
+    jne .q
+    mov bl, '"'
+.q: mov al, bl
+    call py_out
+.l: test ecx, ecx
+    jz .e
+    mov al, [rsi]
+    inc rsi
+    dec ecx
+    cmp al, bl
+    je .esc
+    cmp al, '\'
+    je .esc
+    cmp al, 10
+    je .nl
+    cmp al, 9
+    je .tb
+    cmp al, 13
+    je .cr
+    cmp al, 32
+    jb .hx
+    cmp al, 127
+    je .hx
+    call py_out
+    jmp .l
+.esc:
+    push rax
+    mov al, '\'
+    call py_out
+    pop rax
+    call py_out
+    jmp .l
+.nl:
+    mov al, 'n'
+    jmp .bs
+.tb:
+    mov al, 't'
+    jmp .bs
+.cr:
+    mov al, 'r'
+.bs:
+    push rax
+    mov al, '\'
+    call py_out
+    pop rax
+    call py_out
+    jmp .l
+.hx:
+    push rax
+    mov al, '\'
+    call py_out
+    mov al, 'x'
+    call py_out
+    pop rax
+    call py_puthex2
+    jmp .l
+.e: mov al, bl
+    call py_out
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ---- identifiers and names ---------------------------------------------------------------------
+py_identlen:                        ; rsi = text -> ecx = length of the identifier here (0 = none)
+    xor ecx, ecx
+    mov al, [rsi]
+    cmp al, '_'
+    je .l
+    cmp al, 0x80
+    jae .l
+    or al, 0x20
+    cmp al, 'a'
+    jb .no
+    cmp al, 'z'
+    ja .no
+.l: mov al, [rsi+rcx]
+    cmp al, '_'
+    je .n
+    cmp al, 0x80
+    jae .n
+    cmp al, '0'
+    jb .e
+    cmp al, '9'
+    jbe .n
+    or al, 0x20
+    cmp al, 'a'
+    jb .e
+    cmp al, 'z'
+    ja .e
+.n: inc ecx
+    jmp .l
+.e: ret
+.no:
+    xor ecx, ecx
+    ret
+
+; compare: rsi = a, rdi = b, ecx = n -> ZF=1 when equal (preserves everything)
+py_memeq:
+    push rcx
+    push rsi
+    push rdi
+    test ecx, ecx
+    jz .eq
+    repe cmpsb
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+.eq:
+    pop rdi
+    pop rsi
+    pop rcx
+    xor eax, eax
+    ret
+
+; keyword at the cursor? rdi = NUL terminated keyword; ZF=1 and rsi advanced when it matches whole word
+py_kw:
+    push rcx
+    push rdi
+    push rax
+    xor ecx, ecx
+.l: mov al, [rdi+rcx]
+    test al, al
+    jz .end
+    cmp al, [rsi+rcx]
+    jne .no
+    inc ecx
+    jmp .l
+.end:
+    mov al, [rsi+rcx]
+    cmp al, '_'
+    je .no
+    cmp al, 0x80
+    jae .no
+    cmp al, '0'
+    jb .yes
+    cmp al, '9'
+    jbe .no
+    or al, 0x20
+    cmp al, 'a'
+    jb .yes
+    cmp al, 'z'
+    ja .yes
+.no:
+    pop rax
+    pop rdi
+    pop rcx
+    or al, 1                        ; ZF = 0
+    ret
+.yes:
+    add rsi, rcx
+    pop rax
+    pop rdi
+    pop rcx
+    xor eax, eax                    ; ZF = 1
+    ret
+
+py_lookup:                          ; rdi = name, ecx = length, edx = 1 local only -> rax = entry or 0
+    push rbx
+    push r8
+    push r9
+    push r10
+    push rsi
+    mov r8, rdi
+    mov r9d, ecx
+    mov rbx, [PYV_NSYM]
+    mov r10, [PYV_FBASE]
+.loc:
+    cmp rbx, r10
+    jbe .glob
+    dec rbx
+    lea rax, [rbx+rbx*2]
+    lea rax, [PY_SYM+rax*8]
+    cmp [rax+8], r9d
+    jne .loc
+    mov rsi, [rax]
+    mov rdi, r8
+    mov ecx, r9d
+    call py_memeq
+    jne .loc
+    jmp .found
+.glob:
+    test edx, edx
+    jnz .none
+    cmp qword [PYV_FDEPTH], 0
+    je .none
+    mov rbx, [PYV_G0]
+.g1:
+    test rbx, rbx
+    jz .none
+    dec rbx
+    lea rax, [rbx+rbx*2]
+    lea rax, [PY_SYM+rax*8]
+    cmp [rax+8], r9d
+    jne .g1
+    mov rsi, [rax]
+    mov rdi, r8
+    mov ecx, r9d
+    call py_memeq
+    jne .g1
+    jmp .found
+.none:
+    xor eax, eax
+.found:
+    mov rdi, r8
+    mov ecx, r9d
+    pop rsi
+    pop r10
+    pop r9
+    pop r8
+    pop rbx
+    ret
+
+py_setvar:                          ; rdi = name, ecx = length, rax = value (local scope)
+    push rbx
+    push rdx
+    push r8
+    mov r8, rax
+    mov edx, 1
+    call py_lookup
+    test rax, rax
+    jnz .have
+    mov rbx, [PYV_NSYM]
+    cmp rbx, PY_MAXSYM
+    jae .many
+    lea rax, [rbx+rbx*2]
+    lea rax, [PY_SYM+rax*8]
+    mov [rax], rdi
+    mov [rax+8], ecx
+    mov dword [rax+12], 0
+    inc rbx
+    mov [PYV_NSYM], rbx
+    jmp .st
+.have:
+    cmp dword [rax+12], 0
+    je .st
+    mov rax, [rax+16]               ; global alias
+.st:
+    mov [rax+16], r8
+    mov rax, r8
+    pop r8
+    pop rdx
+    pop rbx
+    ret
+.many:
+    PERR pe_vars
+
+py_fnfind:                          ; rdi = name, ecx = length -> rax = function entry or 0
+    push rbx
+    push rsi
+    push r8
+    mov r8, rdi
+    mov ebx, [PYV_NFN]
+.l: test ebx, ebx
+    jz .no
+    dec ebx
+    mov eax, ebx
+    shl eax, 5
+    lea rax, [PY_FN+rax]
+    cmp [rax+8], ecx
+    jne .l
+    mov rsi, [rax]
+    mov rdi, r8
+    call py_memeq
+    jne .l
+    jmp .r
+.no:
+    xor eax, eax
+.r: mov rdi, r8
+    pop r8
+    pop rsi
+    pop rbx
+    ret
+
+
+; ---- end py1.inc
+; ---- begin py2.inc
+; =============================================================================
+;  Python subset interpreter - part 2: expressions
+;  Parse functions: rsi = cursor in/out, rax = value out. They may clobber rcx rdx rdi r8-r11
+;  and keep rbx rbp r12-r15.  PYV_SKIP > 0 means "parse only, do not evaluate".
+; =============================================================================
+PYV_CAP    equ PYV+216              ; 1 while str()/repr() output is captured into the builder
+PYV_VSP    equ PYV+224              ; argument stack pointer
+PYV_KWN    equ PYV+232              ; keyword arguments in use
+PYV_KWB    equ PYV+240              ; first keyword of the current call
+PYV_KW     equ PYV+0x300            ; 16 keywords * 24 bytes
+PY_VS      equ PY+0x30000           ; argument stack (192 KB)
+PY_VSEND   equ PY+0x60000
+
+py_out:                             ; al = character: to the program output or into the string builder
+    cmp qword [PYV_CAP], 0
+    je py_ext_putc
+    push rdx
+    mov rdx, [PYV_SBP]
+    cmp rdx, PY_SBEND-2
+    jae .full
+    mov [rdx], al
+    inc rdx
+    mov [PYV_SBP], rdx
+    pop rdx
+    ret
+.full:
+    PERR pe_long
+
+py_ws:                              ; skips blanks (and line ends inside brackets); keeps rax
+    push rax
+    call py_ws0
+    pop rax
+    ret
+py_ws0:
+.l: mov al, [rsi]
+    cmp al, ' '
+    je .s
+    cmp al, 9
+    je .s
+    cmp al, '\'
+    jne .n
+    cmp byte [rsi+1], 10
+    jne .d
+    add rsi, 2
+    jmp .l
+.n: cmp qword [PYV_DEPTH], 0
+    je .d
+    cmp al, 10
+    je .s
+    cmp al, 13
+    je .s
+    cmp al, '#'
+    jne .d
+.c: inc rsi
+    mov al, [rsi]
+    test al, al
+    jz .d
+    cmp al, 10
+    jne .c
+    jmp .l
+.s: inc rsi
+    jmp .l
+.d: ret
+
+; ---- number ----------------------------------------------------------------------------------
+py_number:                          ; rsi at a digit -> rax tagged
+    xor eax, eax
+    cmp byte [rsi], '0'
+    jne .dec
+    mov dl, [rsi+1]
+    or dl, 0x20
+    cmp dl, 'x'
+    jne .dec
+    add rsi, 2
+.h: movzx edx, byte [rsi]
+    cmp dl, '_'
+    je .hs
+    cmp dl, '9'
+    jbe .hd
+    or dl, 0x20
+    cmp dl, 'f'
+    ja .hdone
+    sub dl, 'a'-10-'0'
+.hd:
+    sub dl, '0'
+    cmp dl, 15
+    ja .hdone
+    shl rax, 4
+    add rax, rdx
+    mov rcx, rax
+    shr rcx, 60
+    jnz .big
+.hs:
+    inc rsi
+    jmp .h
+.hdone:
+    jmp py_mkint
+.dec:
+.d: movzx edx, byte [rsi]
+    cmp dl, '_'
+    je .ds
+    sub edx, '0'
+    cmp edx, 9
+    ja .ddone
+    mov rcx, rax
+    shr rcx, 59
+    jnz .big
+    lea rax, [rax+rax*4]
+    lea rax, [rdx+rax*2]
+.ds:
+    inc rsi
+    jmp .d
+.ddone:
+    mov dl, [rsi]
+    cmp dl, '.'
+    je .flt
+    or dl, 0x20
+    cmp dl, 'e'
+    je .flt
+    jmp py_mkint
+.flt:
+    PERR pe_float
+.big:
+    PERR pe_big
+
+; ---- string literals (also f-strings) --------------------------------------------------------
+; rsi at the opening quote, edx = 1 for an f-string -> rax = str object
+py_string:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r14d, edx                   ; f-string?
+    mov r12, [PYV_SBP]              ; builder start (restored at the end)
+    mov bl, [rsi]
+    xor r13d, r13d                  ; triple quoted?
+    cmp byte [rsi+1], bl
+    jne .one
+    cmp byte [rsi+2], bl
+    jne .one
+    mov r13d, 1
+    add rsi, 3
+    jmp .loop
+.one:
+    inc rsi
+.loop:
+    mov al, [rsi]
+    test al, al
+    jz .unterm
+    cmp al, bl
+    jne .notq
+    test r13d, r13d
+    jz .done1
+    cmp byte [rsi+1], bl
+    jne .lit
+    cmp byte [rsi+2], bl
+    jne .lit
+    add rsi, 3
+    jmp .fin
+.done1:
+    inc rsi
+    jmp .fin
+.notq:
+    cmp al, 10
+    jne .nonl
+    test r13d, r13d
+    jz .unterm
+.nonl:
+    cmp al, '\'
+    je .esc
+    test r14d, r14d
+    jz .lit
+    cmp al, '{'
+    je .brace
+    cmp al, '}'
+    jne .lit
+    inc rsi                         ; "}}" -> "}"
+    cmp byte [rsi], '}'
+    jne .badf
+.lit:
+    mov rdx, [PYV_SBP]
+    cmp rdx, PY_SBEND-2
+    jae .long
+    mov [rdx], al
+    inc rdx
+    mov [PYV_SBP], rdx
+    inc rsi
+    jmp .loop
+.esc:
+    mov al, [rsi+1]
+    add rsi, 2
+    cmp al, 'n'
+    jne .e1
+    mov al, 10
+    jmp .lit2
+.e1:
+    cmp al, 't'
+    jne .e2
+    mov al, 9
+    jmp .lit2
+.e2:
+    cmp al, 'r'
+    jne .e3
+    mov al, 13
+    jmp .lit2
+.e3:
+    cmp al, '0'
+    jne .e4
+    xor eax, eax
+    jmp .lit2
+.e4:
+    cmp al, 10
+    je .loop                        ; backslash-newline: line continuation inside the string
+    cmp al, '\'
+    je .lit2
+    cmp al, "'"
+    je .lit2
+    cmp al, '"'
+    je .lit2
+    cmp al, 'x'
+    jne .e5
+    movzx eax, byte [rsi]
+    call py_hexval
+    mov ecx, eax
+    movzx eax, byte [rsi+1]
+    call py_hexval
+    shl ecx, 4
+    or eax, ecx
+    add rsi, 2
+    jmp .lit2
+.e5:
+    mov ah, al                      ; unknown escape: keep the backslash
+    mov al, '\'
+    mov rdx, [PYV_SBP]
+    mov [rdx], al
+    inc rdx
+    mov [PYV_SBP], rdx
+    mov al, ah
+.lit2:
+    mov rdx, [PYV_SBP]
+    cmp rdx, PY_SBEND-2
+    jae .long
+    mov [rdx], al
+    inc rdx
+    mov [PYV_SBP], rdx
+    jmp .loop
+.brace:
+    cmp byte [rsi+1], '{'
+    jne .expr
+    add rsi, 2
+    mov al, '{'
+    jmp .lit2
+.expr:
+    inc rsi
+    push r12
+    call py_expr                    ; the expression ends at '}', '!' or ':'
+    pop r12
+    mov r15, rax
+    and r14d, 1                     ; bit1 of r14: repr
+    call py_ws
+    cmp byte [rsi], '!'
+    jne .nobang
+    cmp byte [rsi+1], 'r'
+    jne .badf
+    or r14d, 2
+    add rsi, 2
+.nobang:
+    xor r8d, r8d                    ; width
+    mov r9d, ' '                    ; fill
+    xor r10d, r10d                  ; align: 0 default, '<' '>' '^'
+    xor r11d, r11d                  ; zero flag
+    cmp byte [rsi], ':'
+    jne .nospec
+    inc rsi
+    movzx eax, byte [rsi+1]
+    cmp al, '<'
+    je .fa
+    cmp al, '>'
+    je .fa
+    cmp al, '^'
+    je .fa
+    jmp .a1
+.fa:
+    movzx r9d, byte [rsi]
+    mov r10d, eax
+    add rsi, 2
+    jmp .w
+.a1:
+    movzx eax, byte [rsi]
+    cmp al, '<'
+    je .a2
+    cmp al, '>'
+    je .a2
+    cmp al, '^'
+    jne .w
+.a2:
+    mov r10d, eax
+    inc rsi
+.w: cmp byte [rsi], '0'
+    jne .wd
+    mov r11d, 1
+    inc rsi
+.wd:
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .wend
+    imul r8d, r8d, 10
+    add r8d, eax
+    inc rsi
+    jmp .wd
+.wend:
+    cmp byte [rsi], 'd'
+    je .skipc
+    cmp byte [rsi], 's'
+    jne .nospec
+.skipc:
+    inc rsi
+.nospec:
+    cmp byte [rsi], '}'
+    jne .badf
+    inc rsi
+    ; text of the value at the end of the builder
+    mov rax, r15
+    mov r15, [PYV_SBP]              ; start of this field
+    mov edx, r14d
+    shr edx, 1
+    and r14d, 1
+    cmp qword [PYV_SKIP], 0
+    jne .loop
+    mov qword [PYV_CAP], 1
+    push r12
+    call py_putval
+    pop r12
+    mov qword [PYV_CAP], 0
+    ; padding
+    mov rcx, [PYV_SBP]
+    sub rcx, r15                    ; length of the text
+    cmp ecx, r8d
+    jae .loop
+    mov edx, r8d
+    sub edx, ecx                    ; pad count
+    test r10d, r10d
+    jnz .al
+    ; default: numbers right, text left; zero flag pads numbers with zeros
+    mov r10d, '<'
+    mov rax, [PYV_SBP]
+    cmp rax, r15
+    je .al
+    movzx eax, byte [r15]
+    cmp al, '-'
+    je .num
+    sub eax, '0'
+    cmp eax, 9
+    ja .al
+.num:
+    mov r10d, '>'
+    test r11d, r11d
+    jz .al
+    mov r9d, '0'
+.al:
+    ; shift the text and fill: left align pads after, right before, center split
+    mov rdi, [PYV_SBP]
+    lea rax, [rdi+rdx]
+    cmp rax, PY_SBEND-2
+    jae .long
+    cmp r10d, '<'
+    jne .notl
+    mov ecx, edx
+    mov al, r9b
+    rep stosb
+    mov [PYV_SBP], rdi
+    jmp .loop
+.notl:
+    push rdx                        ; total pad
+    push rsi                        ; cursor
+    cmp r10d, '^'
+    jne .right
+    shr edx, 1                      ; left part = pad/2
+.right:
+    ; move text up by edx bytes
+    mov rcx, [PYV_SBP]
+    sub rcx, r15
+    lea rsi, [r15+rcx-1]
+    lea rdi, [rsi+rdx]
+    std
+    rep movsb
+    cld
+    mov rdi, r15
+    mov ecx, edx
+    mov al, r9b
+    rep stosb
+    mov rdi, [PYV_SBP]
+    add rdi, rdx
+    mov ecx, [rsp+8]
+    sub ecx, edx                    ; right part (centre only)
+    mov al, r9b
+    rep stosb
+    mov [PYV_SBP], rdi
+    pop rsi
+    add rsp, 8
+    jmp .loop
+.fin:
+    mov rcx, [PYV_SBP]
+    sub rcx, r12
+    mov r13, rsi                    ; keep the cursor
+    mov rsi, r12
+    call py_newstr
+    mov rsi, r13
+    mov [PYV_SBP], r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.unterm:
+    PERR pe_unterm
+.badf:
+    PERR pe_fstr
+.long:
+    PERR pe_long
+
+py_hexval:                          ; al = hex digit -> eax value (error when not a digit)
+    movzx eax, al
+    cmp al, '9'
+    jbe .d
+    or al, 0x20
+    sub al, 'a'-10-'0'
+.d: sub al, '0'
+    cmp al, 15
+    ja .bad
+    ret
+.bad:
+    PERR pe_syntax
+
+; ---- atoms -------------------------------------------------------------------------------------
+py_atom:
+    call py_ws
+    movzx eax, byte [rsi]
+    cmp al, '0'
+    jb .nn
+    cmp al, '9'
+    jbe .num
+.nn:
+    cmp al, '"'
+    je .str
+    cmp al, "'"
+    je .str
+    cmp al, '('
+    je .paren
+    cmp al, '['
+    je .list
+    cmp al, '{'
+    je .dict
+    call py_identlen
+    test ecx, ecx
+    jz .bad
+    ; string prefixes: f"..", r"..", b".." not supported except f
+    cmp ecx, 1
+    jne .name
+    mov al, [rsi]
+    or al, 0x20
+    cmp al, 'f'
+    jne .name
+    mov al, [rsi+1]
+    cmp al, '"'
+    je .fstr
+    cmp al, "'"
+    jne .name
+.fstr:
+    inc rsi
+    mov edx, 1
+    call py_string
+    ret
+.name:
+    mov rdi, rsi
+    ; constants
+    push rcx
+    lea rdi, [kw_True]
+    call py_kw
+    jne .n2
+    pop rcx
+    mov eax, PY_TRUE
+    jmp .atomend
+.n2:
+    lea rdi, [kw_False]
+    call py_kw
+    jne .n3
+    pop rcx
+    mov eax, PY_FALSE
+    jmp .atomend
+.n3:
+    lea rdi, [kw_None]
+    call py_kw
+    jne .n4
+    pop rcx
+    mov eax, PY_NONE
+    jmp .atomend
+.n4:
+    pop rcx
+    lea rdi, [k_lambda]
+    call py_kw
+    je .lambda
+    push rsi
+    lea rdi, [py_reserved]
+    call py_isreserved
+    jc .syn
+    pop rsi
+    mov rdi, rsi                    ; name pointer
+    add rsi, rcx                    ; behind the name
+    push rdi
+    push rcx
+    call py_ws
+    cmp byte [rsi], '('
+    pop rcx
+    pop rdi
+    je .call
+    ; variable
+    cmp qword [PYV_SKIP], 0
+    jne .nonev
+    xor edx, edx
+    call py_lookup
+    test rax, rax
+    jz .undef
+    cmp dword [rax+12], 0
+    je .vv
+    mov rax, [rax+16]               ; global alias
+.vv:
+    mov rax, [rax+16]
+    mov qword [PYV_SUBV], 0
+    ret
+.nonev:
+    mov eax, PY_NONE
+    ret
+.lambda:
+    call py_lambda
+    mov qword [PYV_SUBV], 0
+    ret
+.call:
+    inc rsi
+    call py_docall
+    mov qword [PYV_SUBV], 0
+    ret
+.undef:
+    call py_mkfref                  ; a def'd function or a builtin used as a value
+    test rax, rax
+    jz .undef2
+    mov qword [PYV_SUBV], 0
+    ret
+.undef2:
+    jmp py_nameerr
+.syn:
+    pop rsi
+    PERR pe_syntax
+.num:
+    call py_number
+.atomend:
+    mov qword [PYV_SUBV], 0
+    ret
+.str:
+    xor edx, edx
+    call py_string
+    ; neighbouring literals are joined: "a" "b"
+    mov qword [PYV_SUBV], 0
+    ret
+.paren:
+    inc rsi
+    inc qword [PYV_DEPTH]
+    call py_ws
+    cmp byte [rsi], ')'
+    jne .pe
+    inc rsi
+    dec qword [PYV_DEPTH]
+    xor ecx, ecx
+    mov edx, 4
+    call py_newlist
+    ret
+.pe:
+    call py_expr
+    call py_ws
+    cmp byte [rsi], ','
+    jne .pclose
+    ; tuple
+    push rax
+    mov ecx, 4
+    mov edx, 4
+    call py_newlist
+    pop rdx
+    mov r8, rax
+    mov rax, r8
+    call py_lappend
+.tl:
+    call py_ws
+    cmp byte [rsi], ','
+    jne .tdone
+    inc rsi
+    call py_ws
+    cmp byte [rsi], ')'
+    je .tdone
+    push r8
+    call py_expr
+    pop r8
+    mov rdx, rax
+    mov rax, r8
+    call py_lappend
+    jmp .tl
+.tdone:
+    mov rax, r8
+.pclose:
+    push rax
+    call py_ws
+    cmp byte [rsi], ')'
+    jne .badp
+    inc rsi
+    dec qword [PYV_DEPTH]
+    pop rax
+    mov qword [PYV_SUBV], 0
+    ret
+.badp:
+    PERR pe_syntax
+.list:
+    inc rsi
+    inc qword [PYV_DEPTH]
+    call py_ws
+    call py_has_for
+    test rax, rax
+    jz .nocomp
+    mov rdx, rax
+    call py_comp
+    push rax
+    call py_ws
+    cmp byte [rsi], ']'
+    jne .badp2
+    inc rsi
+    dec qword [PYV_DEPTH]
+    pop rax
+    mov qword [PYV_SUBV], 0
+    ret
+.badp2:
+    PERR pe_syntax
+.nocomp:
+    mov ecx, 4
+    mov edx, 2
+    call py_newlist
+    mov r8, rax
+.ll:
+    call py_ws
+    cmp byte [rsi], ']'
+    je .lend
+    push r8
+    call py_expr
+    pop r8
+    mov rdx, rax
+    mov rax, r8
+    call py_lappend
+    call py_ws
+    cmp byte [rsi], ','
+    jne .ll
+    inc rsi
+    jmp .ll
+.lend:
+    inc rsi
+    dec qword [PYV_DEPTH]
+    mov rax, r8
+    mov qword [PYV_SUBV], 0
+    ret
+.dict:
+    inc rsi
+    inc qword [PYV_DEPTH]
+    call py_newdict
+    mov r8, rax
+.dl:
+    call py_ws
+    cmp byte [rsi], '}'
+    je .dend
+    push r8
+    call py_expr
+    push rax
+    call py_ws
+    cmp byte [rsi], ':'
+    jne .badd
+    inc rsi
+    call py_expr
+    mov rdx, rax
+    pop rcx
+    pop r8
+    mov rax, r8
+    push r8
+    call py_dset                    ; rax = dict, rcx = key, rdx = value
+    pop r8
+    call py_ws
+    cmp byte [rsi], ','
+    jne .dl
+    inc rsi
+    jmp .dl
+.dend:
+    inc rsi
+    dec qword [PYV_DEPTH]
+    mov rax, r8
+    mov qword [PYV_SUBV], 0
+    ret
+.badd:
+    PERR pe_syntax
+.bad:
+    PERR pe_syntax
+
+py_nameerr:                         ; rdi = name, ecx = length
+    push rsi
+    lea rsi, [pe_name1]
+    lea rdx, [PYV_EBUF]
+    mov r8, rdx
+.c1:
+    mov al, [rsi]
+    test al, al
+    jz .c2
+    mov [rdx], al
+    inc rdx
+    inc rsi
+    jmp .c1
+.c2:
+    mov rsi, rdi
+    cmp ecx, 100
+    jbe .cl
+    mov ecx, 100
+.cl:
+    test ecx, ecx
+    jz .c3
+    mov al, [rsi]
+    mov [rdx], al
+    inc rdx
+    inc rsi
+    dec ecx
+    jmp .cl
+.c3:
+    lea rsi, [pe_name2]
+.c4:
+    mov al, [rsi]
+    mov [rdx], al
+    inc rdx
+    inc rsi
+    test al, al
+    jnz .c4
+    pop rsi
+    mov rdi, r8
+    jmp py_error
+
+py_isreserved:                      ; rsi = word at the cursor -> CF=1 when it is a keyword that cannot be a name
+    push rsi
+    push rdi
+    push rcx
+    lea rdi, [py_reserved]
+.n: cmp byte [rdi], 0
+    je .no
+    call py_kw
+    je .yes
+.sk:
+    cmp byte [rdi], 0
+    je .nx
+    inc rdi
+    jmp .sk
+.nx:
+    inc rdi
+    jmp .n
+.no:
+    pop rcx
+    pop rdi
+    pop rsi
+    clc
+    ret
+.yes:
+    pop rcx
+    pop rdi
+    pop rsi
+    stc
+    ret
+
+; ---- postfix: calls on values, indexing, slicing, attribute methods ----------------------------
+py_postfix:
+    call py_atom
+.l: push rax
+    call py_ws
+    mov al, [rsi]
+    cmp al, '('
+    je .callv
+    cmp al, '['
+    je .idx
+    cmp al, '.'
+    je .dot
+    pop rax
+    ret
+.idx:
+    inc rsi
+    inc qword [PYV_DEPTH]
+    call py_ws
+    mov r8d, PY_NONE
+    cmp byte [rsi], ':'
+    je .slice0
+    call py_expr
+    mov r8, rax
+    call py_ws
+    cmp byte [rsi], ':'
+    je .slice0
+    ; plain index
+    cmp byte [rsi], ']'
+    jne .badx
+    inc rsi
+    dec qword [PYV_DEPTH]
+    pop rdx                         ; container
+    cmp qword [PYV_SKIP], 0
+    jne .skipi
+    mov [PYV_SUBB], rdx
+    mov [PYV_SUBI], r8
+    cmp qword [PYV_LEND], 0
+    je .doget
+    call py_ws
+    cmp rsi, [PYV_LEND]
+    jb .doget
+    mov qword [PYV_SUBV], 2         ; assignment target: do not read the item
+    mov eax, PY_NONE
+    jmp .l
+.doget:
+    mov rax, r8
+    call py_getitem
+    mov qword [PYV_SUBV], 1
+    jmp .l
+.callv:
+    mov rdx, [rsp]
+    inc rsi
+    call py_callv
+    add rsp, 8
+    mov qword [PYV_SUBV], 0
+    jmp .l
+.skipi:
+    mov eax, PY_NONE
+    jmp .l
+.slice0:
+    ; r8 = start (or None); cursor at ':'
+    inc rsi
+    call py_ws
+    mov r9d, PY_NONE
+    mov r10d, PY_NONE
+    cmp byte [rsi], ']'
+    je .sl2
+    cmp byte [rsi], ':'
+    je .sl3
+    push r8
+    call py_expr
+    pop r8
+    mov r9, rax
+    call py_ws
+.sl3:
+    cmp byte [rsi], ':'
+    jne .sl2
+    inc rsi
+    call py_ws
+    cmp byte [rsi], ']'
+    je .sl2
+    push r8
+    push r9
+    call py_expr
+    pop r9
+    pop r8
+    mov r10, rax
+    call py_ws
+.sl2:
+    cmp byte [rsi], ']'
+    jne .badx
+    inc rsi
+    dec qword [PYV_DEPTH]
+    pop rdx
+    cmp qword [PYV_SKIP], 0
+    jne .skipi
+    mov rax, rdx
+    call py_slice                   ; rax = object, r8 start, r9 stop, r10 step
+    mov qword [PYV_SUBV], 0
+    jmp .l
+.dot:
+    inc rsi
+    call py_identlen
+    test ecx, ecx
+    jz .badx
+    mov rdi, rsi
+    add rsi, rcx
+    push rdi
+    push rcx
+    call py_ws
+    cmp byte [rsi], '('
+    jne .badx
+    inc rsi
+    pop rcx
+    pop rdi
+    pop rax                         ; receiver
+    call py_domethod
+    mov qword [PYV_SUBV], 0
+    jmp .l
+.badx:
+    PERR pe_syntax
+
+; ---- operators ---------------------------------------------------------------------------------
+py_power:
+    call py_postfix
+    call py_ws
+    cmp byte [rsi], '*'
+    jne .r
+    cmp byte [rsi+1], '*'
+    jne .r
+    add rsi, 2
+    push rax
+    call py_factor                  ; right associative, binds tighter than unary on its left
+    mov rdx, rax
+    pop rax
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    mov r8d, '^'
+    xchg rax, rdx                   ; rdx = right, rax = left -> call convention rdx=left rax=right
+    xchg rax, rdx
+    mov r9, rax                     ; left
+    mov rax, rdx                    ; right
+    mov rdx, r9
+    jmp py_binop
+.sk:
+    mov eax, PY_NONE
+.r: ret
+
+py_factor:
+    call py_ws
+    mov al, [rsi]
+    cmp al, '-'
+    je .neg
+    cmp al, '+'
+    je .pos
+    jmp py_power
+.neg:
+    inc rsi
+    call py_factor
+    cmp qword [PYV_SKIP], 0
+    jne .r
+    call py_asint
+    jc .te
+    neg rax
+    jmp py_mkint
+.pos:
+    inc rsi
+    call py_factor
+    cmp qword [PYV_SKIP], 0
+    jne .r
+    call py_asint
+    jc .te
+    jmp py_mkint
+.te:
+    PERR pe_uop
+.r: ret
+
+py_term:
+    call py_factor
+.l: call py_ws
+    movzx r8d, byte [rsi]
+    cmp r8d, '*'
+    je .star
+    cmp r8d, '/'
+    je .slash
+    cmp r8d, '%'
+    je .pct
+    ret
+.star:
+    cmp byte [rsi+1], '*'
+    je .ret
+    cmp byte [rsi+1], '='
+    je .ret
+    inc rsi
+    jmp .go
+.slash:
+    cmp byte [rsi+1], '/'
+    jne .tdiv
+    cmp byte [rsi+2], '='
+    je .ret
+    add rsi, 2
+    mov r8d, 'F'                    ; floor division
+    jmp .go
+.tdiv:
+    cmp byte [rsi+1], '='
+    je .ret
+    PERR pe_fdiv
+.pct:
+    cmp byte [rsi+1], '='
+    je .ret
+    inc rsi
+.go:
+    push r8
+    push rax
+    call py_factor
+    pop rdx
+    pop r8
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    call py_binop
+    jmp .l
+.sk:
+    mov eax, PY_NONE
+    jmp .l
+.ret:
+    ret
+
+py_sum:
+    call py_term
+.l: call py_ws
+    movzx r8d, byte [rsi]
+    cmp r8d, '+'
+    je .op
+    cmp r8d, '-'
+    jne .ret
+.op:
+    cmp byte [rsi+1], '='
+    je .ret
+    inc rsi
+    push r8
+    push rax
+    call py_term
+    pop rdx
+    pop r8
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    call py_binop
+    jmp .l
+.sk:
+    mov eax, PY_NONE
+    jmp .l
+.ret:
+    ret
+
+; comparison chain: a < b <= c ...   (== != < > <= >= in, not in, is, is not)
+py_cmp:
+    call py_sum
+    push rbx
+    push r12
+    push r13
+    mov r13, rax                    ; left operand
+    xor r12d, r12d
+.l: call py_ws
+    movzx eax, byte [rsi]
+    xor ebx, ebx                    ; operator code
+    cmp al, '<'
+    jne .c1
+    cmp byte [rsi+1], '='
+    jne .lt
+    mov ebx, 'L'                    ; <=
+    add rsi, 2
+    jmp .have
+.lt:
+    mov ebx, '<'
+    inc rsi
+    jmp .have
+.c1:
+    cmp al, '>'
+    jne .c2
+    cmp byte [rsi+1], '='
+    jne .gt
+    mov ebx, 'G'                    ; >=
+    add rsi, 2
+    jmp .have
+.gt:
+    mov ebx, '>'
+    inc rsi
+    jmp .have
+.c2:
+    cmp al, '='
+    jne .c3
+    cmp byte [rsi+1], '='
+    jne .done
+    mov ebx, 'e'
+    add rsi, 2
+    jmp .have
+.c3:
+    cmp al, '!'
+    jne .c4
+    cmp byte [rsi+1], '='
+    jne .done
+    mov ebx, 'n'
+    add rsi, 2
+    jmp .have
+.c4:
+    lea rdi, [kw_in]
+    call py_kw
+    jne .c5
+    mov ebx, 'i'
+    jmp .have
+.c5:
+    lea rdi, [kw_not]
+    push rsi
+    call py_kw
+    jne .c6
+    call py_ws
+    lea rdi, [kw_in]
+    call py_kw
+    jne .c6x
+    add rsp, 8
+    mov ebx, 'N'
+    jmp .have
+.c6x:
+    pop rsi
+    jmp .done
+.c6:
+    pop rsi
+    lea rdi, [kw_is]
+    call py_kw
+    jne .done
+    mov ebx, 's'
+    call py_ws
+    lea rdi, [kw_not]
+    call py_kw
+    jne .have
+    mov ebx, 'S'
+.have:
+    push rbx
+    push r13
+    push r12
+    call py_sum
+    pop r12
+    pop rdx                         ; left
+    pop r8                          ; operator
+    mov r13, rax                    ; becomes the next left operand
+    cmp qword [PYV_SKIP], 0
+    jne .skip
+    mov r9, rax                     ; right
+    mov rax, r9
+    call py_compare                 ; rdx = left, rax = right, r8d = op -> eax = 0/1
+    mov r12d, eax
+    test eax, eax
+    jnz .more
+    ; chain failed: parse the rest in skip mode
+    inc qword [PYV_SKIP]
+    call py_ws
+.rest:
+    call py_cmp_rest
+    dec qword [PYV_SKIP]
+    xor eax, eax
+    jmp .out
+.more:
+    mov r12d, 1
+    jmp .l
+.skip:
+    jmp .l
+.done:
+    test r12d, r12d
+    jz .nocmp
+    mov eax, PY_TRUE
+    jmp .out
+.nocmp:
+    mov rax, r13
+    jmp .fin
+.out:
+    test eax, eax
+    mov eax, PY_FALSE
+    jz .fin
+    mov eax, PY_TRUE
+.fin:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+py_cmp_rest:                        ; skip the remaining operators/operands of a failed chain
+.l: call py_ws
+    mov al, [rsi]
+    cmp al, '<'
+    je .op
+    cmp al, '>'
+    je .op
+    cmp al, '='
+    jne .c1
+    cmp byte [rsi+1], '='
+    jne .no
+    jmp .op
+.c1:
+    cmp al, '!'
+    jne .c2
+    cmp byte [rsi+1], '='
+    jne .no
+    jmp .op
+.c2:
+    lea rdi, [kw_in]
+    push rsi
+    call py_kw
+    je .opk
+    pop rsi
+    push rsi
+    lea rdi, [kw_not]
+    call py_kw
+    je .opn
+    pop rsi
+    push rsi
+    lea rdi, [kw_is]
+    call py_kw
+    je .opis
+    pop rsi
+.no:
+    ret
+.op:
+    inc rsi
+    cmp byte [rsi], '='
+    jne .opr
+    inc rsi
+    jmp .opr
+.opk:
+    add rsp, 8
+    jmp .opr
+.opn:
+    add rsp, 8
+    call py_ws
+    lea rdi, [kw_in]
+    call py_kw
+    jmp .opr
+.opis:
+    add rsp, 8
+    call py_ws
+    lea rdi, [kw_not]
+    call py_kw
+.opr:
+    call py_sum
+    jmp .l
+
+py_not:
+    call py_ws
+    lea rdi, [kw_not]
+    push rsi
+    call py_kw
+    jne .no
+    add rsp, 8
+    call py_not
+    cmp qword [PYV_SKIP], 0
+    jne .r
+    call py_truthy
+    mov eax, PY_TRUE
+    jnz .nf
+    ret
+.nf:
+    mov eax, PY_FALSE
+.r: ret
+.no:
+    pop rsi
+    jmp py_cmp
+
+py_and:
+    call py_not
+.l: push rax
+    call py_ws
+    lea rdi, [kw_and]
+    call py_kw
+    jne .out
+    pop rax
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    push rax
+    call py_truthy
+    pop rax
+    jz .short
+    call py_not
+    jmp .l
+.short:
+    push rax
+    inc qword [PYV_SKIP]
+    call py_not
+    dec qword [PYV_SKIP]
+    pop rax
+    jmp .l
+.sk:
+    call py_not
+    jmp .l
+.out:
+    pop rax
+    ret
+
+py_or:
+    call py_and
+.l: push rax
+    call py_ws
+    lea rdi, [kw_or]
+    call py_kw
+    jne .out
+    pop rax
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    push rax
+    call py_truthy
+    pop rax
+    jnz .short
+    call py_and
+    jmp .l
+.short:
+    push rax
+    inc qword [PYV_SKIP]
+    call py_and
+    dec qword [PYV_SKIP]
+    pop rax
+    jmp .l
+.sk:
+    call py_and
+    jmp .l
+.out:
+    pop rax
+    ret
+
+; scan ahead for a conditional expression:  value if cond else value
+; -> rax = position just behind the 'if' (0 when there is none at the same nesting level)
+py_scan_if:
+    push rsi
+    push rbx
+    push rcx
+    xor ebx, ebx                    ; nesting
+.l: movzx eax, byte [rsi]
+    test al, al
+    jz .no
+    cmp al, 10
+    je .nl
+    cmp al, '#'
+    je .no
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, '{'
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    cmp al, '}'
+    je .c
+    test ebx, ebx
+    jnz .n
+    cmp al, ','
+    je .no
+    cmp al, ':'
+    je .no
+    cmp al, ';'
+    je .no
+    cmp al, '='
+    jne .w
+    cmp byte [rsi+1], '='
+    jne .no
+    add rsi, 2
+    jmp .l
+.w: cmp al, 'f'
+    jne .w2
+    cmp byte [rsi+1], 'o'
+    jne .n
+    cmp byte [rsi+2], 'r'
+    jne .n
+    cmp byte [rsi+3], ' '
+    jne .n
+    cmp byte [rsi-1], ' '
+    jne .n
+    jmp .no                         ; a comprehension: "for" ends the element expression
+.w2:
+    cmp al, 'i'
+    jne .n
+    cmp byte [rsi+1], 'f'
+    jne .n
+    cmp rsi, [rsp+16]
+    je .n
+    mov cl, [rsi-1]
+    cmp cl, ' '
+    jne .n
+    mov cl, [rsi+2]
+    cmp cl, ' '
+    je .yes
+    cmp cl, '('
+    je .yes
+    cmp cl, '['
+    je .yes
+    cmp cl, '-'
+    jne .n
+.yes:
+    lea rax, [rsi+2]
+    jmp .r
+.o: inc ebx
+    jmp .n
+.c: dec ebx
+    js .no
+    jmp .n
+.nl:
+    test ebx, ebx
+    jz .no
+.n: inc rsi
+    jmp .l
+.q: mov cl, al
+    inc rsi
+.qq:
+    mov al, [rsi]
+    test al, al
+    jz .no
+    cmp al, '\'
+    jne .q2
+    add rsi, 2
+    jmp .qq
+.q2:
+    cmp al, cl
+    je .qe
+    inc rsi
+    jmp .qq
+.qe:
+    inc rsi
+    jmp .l
+.no:
+    xor eax, eax
+.r: pop rcx
+    pop rbx
+    pop rsi
+    ret
+
+py_expr:
+    call py_ws
+    mov r8, rsi
+    call py_scan_if
+    test rax, rax
+    jnz .tern
+    jmp py_or
+.tern:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsi                    ; start of the value
+    mov rsi, rax                    ; condition
+    call py_or
+    mov r13, rsi
+    call py_truthy
+    pushfq
+    pop rbx
+    call py_ws
+    lea rdi, [kw_else]
+    call py_kw
+    jne .bad
+    test rbx, 0x40                  ; ZF of py_truthy: set when false
+    jnz .else
+    ; true: evaluate the first value, then skip the else part
+    mov r14, rsi
+    mov rsi, r12
+    call py_or
+    push rax
+    mov rsi, r14
+    inc qword [PYV_SKIP]
+    call py_expr
+    dec qword [PYV_SKIP]
+    pop rax
+    jmp .out
+.else:
+    call py_expr
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.bad:
+    PERR pe_syntax
+
+; expression list: a, b, c  -> tuple when there is a comma
+py_exprlist:
+    call py_expr
+    push rax
+    call py_ws
+    cmp byte [rsi], ','
+    jne .one
+    mov ecx, 4
+    mov edx, 4
+    call py_newlist
+    mov r8, rax
+    pop rdx
+    mov rax, r8
+    call py_lappend
+.l: call py_ws
+    cmp byte [rsi], ','
+    jne .done
+    inc rsi
+    call py_ws
+    mov al, [rsi]
+    cmp al, '='
+    je .done
+    cmp al, 10
+    je .done
+    cmp al, 13
+    je .done
+    test al, al
+    jz .done
+    cmp al, ':'
+    je .done
+    cmp al, ')'
+    je .done
+    cmp al, '#'
+    je .done
+    push r8
+    call py_expr
+    pop r8
+    mov rdx, rax
+    mov rax, r8
+    call py_lappend
+    jmp .l
+.done:
+    mov rax, r8
+    ret
+.one:
+    pop rax
+    ret
+
+
+; ---- end py2.inc
+; ---- begin py3.inc
+; =============================================================================
+;  Python subset interpreter - part 3: objects and operators
+;  (equality, ordering, + - * // % **, indexing, slices, dicts, iteration, str())
+;  Helpers keep rsi (the source cursor) and rbx rbp r12-r15 unless they say otherwise.
+; =============================================================================
+PY_CHR     equ PY+0xE000            ; cache of one-character strings (256 pointers)
+
+; ---- one-character strings (cached) ---------------------------------------------------------------
+py_chr1:                            ; al = byte -> rax = str object
+    push rcx
+    push rdx
+    push rsi
+    movzx edx, al
+    mov rax, [PY_CHR+rdx*8]
+    test rax, rax
+    jnz .o
+    push rdx
+    lea rsi, [PYV_NUMB]
+    mov [rsi], dl
+    mov ecx, 1
+    call py_newstr
+    pop rdx
+    mov [PY_CHR+rdx*8], rax
+.o: pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; ---- equality: rdx = a, rax = b -> eax = 1 / 0 -------------------------------------------------------
+py_eq:
+    cmp rdx, rax
+    je .same
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rdx
+    mov r9, rax
+    mov rax, r8
+    call py_asint
+    jc .anon
+    mov rbx, rax
+    mov rax, r9
+    call py_asint
+    jc .no
+    cmp rax, rbx
+    jne .no
+    jmp .yes
+.anon:
+    test r8b, 3
+    jnz .no
+    test r9b, 3
+    jnz .no
+    mov eax, [r8]
+    cmp eax, [r9]
+    jne .no
+    cmp eax, 1
+    je .str
+    cmp eax, 2
+    je .seq
+    cmp eax, 4
+    je .seq
+    cmp eax, 3
+    je .rng
+    cmp eax, 5
+    je .dict
+    jmp .no
+.str:
+    mov ecx, [r8+4]
+    cmp ecx, [r9+4]
+    jne .no
+    lea rsi, [r8+8]
+    lea rdi, [r9+8]
+    test ecx, ecx
+    jz .yes
+    repe cmpsb
+    jne .no
+    jmp .yes
+.rng:
+    mov rax, [r8+8]
+    cmp rax, [r9+8]
+    jne .no
+    mov rax, [r8+16]
+    cmp rax, [r9+16]
+    jne .no
+    mov rax, [r8+24]
+    cmp rax, [r9+24]
+    jne .no
+    jmp .yes
+.seq:
+    mov ecx, [r8+4]
+    cmp ecx, [r9+4]
+    jne .no
+    xor r10d, r10d
+.sl:
+    cmp r10d, [r8+4]
+    jae .yes
+    mov rax, [r8+16]
+    mov rdx, [rax+r10*8]
+    mov rax, [r9+16]
+    mov rax, [rax+r10*8]
+    call py_eq
+    test eax, eax
+    jz .no
+    inc r10d
+    jmp .sl
+.dict:
+    mov ecx, [r8+4]
+    cmp ecx, [r9+4]
+    jne .no
+    xor r10d, r10d
+.dl:
+    cmp r10d, [r8+4]
+    jae .yes
+    mov rax, r10
+    shl rax, 4
+    add rax, [r8+16]
+    mov rcx, [rax]
+    mov rbx, [rax+8]
+    mov rax, r9
+    call py_dget
+    test rax, rax
+    jz .no
+    mov rdx, rbx
+    call py_eq
+    test eax, eax
+    jz .no
+    inc r10d
+    jmp .dl
+.yes:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+.same:
+    mov eax, 1
+    ret
+.no:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    xor eax, eax
+    ret
+
+; ---- ordering: rdx = a, rax = b -> rax = -1 / 0 / 1 (TypeError when they cannot be compared) ---------------
+py_cmp3:
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rdx
+    mov r9, rax
+    mov rax, r8
+    call py_asint
+    jc .anon
+    mov rbx, rax
+    mov rax, r9
+    call py_asint
+    jc .bad
+    xor edx, edx
+    cmp rbx, rax
+    je .z
+    jl .lt
+    mov eax, 1
+    jmp .out
+.lt:
+    mov rax, -1
+    jmp .out
+.z: xor eax, eax
+    jmp .out
+.anon:
+    test r8b, 3
+    jnz .bad
+    test r9b, 3
+    jnz .bad
+    mov eax, [r8]
+    cmp eax, [r9]
+    jne .bad
+    cmp eax, 1
+    je .str
+    cmp eax, 2
+    je .seq
+    cmp eax, 4
+    je .seq
+.bad:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_unord
+.str:
+    mov ecx, [r8+4]
+    mov edx, [r9+4]
+    cmp ecx, edx
+    jbe .m
+    mov ecx, edx
+.m: lea rsi, [r8+8]
+    lea rdi, [r9+8]
+    test ecx, ecx
+    jz .lens
+    repe cmpsb
+    je .lens
+    jb .lt
+    mov eax, 1
+    jmp .out
+.lens:
+    mov ecx, [r8+4]
+    xor eax, eax
+    cmp ecx, [r9+4]
+    je .out
+    jb .lt
+    mov eax, 1
+    jmp .out
+.seq:
+    xor r10d, r10d
+.sq:
+    mov ecx, [r8+4]
+    cmp r10d, ecx
+    jae .sqe
+    cmp r10d, [r9+4]
+    jae .sqe
+    mov rax, [r8+16]
+    mov rdx, [rax+r10*8]
+    mov rax, [r9+16]
+    mov rax, [rax+r10*8]
+    call py_eq
+    test eax, eax
+    jnz .sqn
+    mov rax, [r8+16]
+    mov rdx, [rax+r10*8]
+    mov rax, [r9+16]
+    mov rax, [rax+r10*8]
+    call py_cmp3
+    jmp .out
+.sqn:
+    inc r10d
+    jmp .sq
+.sqe:
+    mov ecx, [r8+4]
+    xor eax, eax
+    cmp ecx, [r9+4]
+    je .out
+    jb .lt
+    mov eax, 1
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; ---- membership: rdx = item, rax = container -> eax = 1 / 0 ---------------------------------------------------
+py_in:
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rdx                     ; item
+    mov r9, rax                     ; container
+    test r9b, 3
+    jnz .bad
+    mov eax, [r9]
+    cmp eax, 1
+    je .str
+    cmp eax, 2
+    je .seq
+    cmp eax, 4
+    je .seq
+    cmp eax, 5
+    je .dict
+    cmp eax, 3
+    je .rng
+.bad:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_notit
+.str:
+    test r8b, 3
+    jnz .bad
+    cmp dword [r8], 1
+    jne .bad
+    mov r10d, [r8+4]
+    test r10d, r10d
+    jz .yes
+    mov ecx, [r9+4]
+    sub ecx, r10d
+    jl .no
+    inc ecx                         ; start positions to try
+    lea rbx, [r9+8]
+.sp:
+    lea rsi, [r8+8]
+    mov rdi, rbx
+    push rcx
+    mov ecx, r10d
+    repe cmpsb
+    pop rcx
+    je .yes
+    inc rbx
+    dec ecx
+    jnz .sp
+    jmp .no
+.seq:
+    xor r10d, r10d
+.sl:
+    cmp r10d, [r9+4]
+    jae .no
+    mov rax, [r9+16]
+    mov rax, [rax+r10*8]
+    mov rdx, r8
+    call py_eq
+    test eax, eax
+    jnz .yes
+    inc r10d
+    jmp .sl
+.dict:
+    mov rax, r9
+    mov rcx, r8
+    call py_dget
+    test rax, rax
+    jnz .yes
+    jmp .no
+.rng:
+    mov rax, r8
+    call py_asint
+    jc .no
+    mov rcx, [r9+24]
+    mov rdx, rax
+    sub rdx, [r9+8]                 ; offset from start
+    cmp rcx, 0
+    jl .neg
+    test rdx, rdx
+    js .no
+    cmp rax, [r9+16]
+    jge .no
+    jmp .stp
+.neg:
+    test rdx, rdx
+    jg .no
+    cmp rax, [r9+16]
+    jle .no
+.stp:
+    mov rax, rdx
+    cqo
+    idiv rcx
+    test rdx, rdx
+    jnz .no
+.yes:
+    mov eax, 1
+    jmp .out
+.no:
+    xor eax, eax
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; ---- comparison operators: rdx = left, rax = right, r8d = operator code -> eax = 0 / 1 ---------------------------
+py_compare:
+    push rbx
+    mov ebx, r8d
+    cmp ebx, 'e'
+    je .eq
+    cmp ebx, 'n'
+    je .ne
+    cmp ebx, 'i'
+    je .in
+    cmp ebx, 'N'
+    je .nin
+    cmp ebx, 's'
+    je .is
+    cmp ebx, 'S'
+    je .isn
+    call py_cmp3
+    cmp ebx, '<'
+    je .lt
+    cmp ebx, '>'
+    je .gt
+    cmp ebx, 'L'
+    je .le
+    ; 'G'
+    cmp rax, 0
+    setge al
+    jmp .r
+.lt:
+    cmp rax, 0
+    setl al
+    jmp .r
+.gt:
+    cmp rax, 0
+    setg al
+    jmp .r
+.le:
+    cmp rax, 0
+    setle al
+    jmp .r
+.eq:
+    call py_eq
+    pop rbx
+    ret
+.ne:
+    call py_eq
+    xor eax, 1
+    pop rbx
+    ret
+.in:
+    xchg rax, rdx                   ; py_in: rdx = item, rax = container
+    xchg rax, rdx
+    call py_in
+    pop rbx
+    ret
+.nin:
+    call py_in
+    xor eax, 1
+    pop rbx
+    ret
+.is:
+    cmp rdx, rax
+    sete al
+    jmp .r
+.isn:
+    cmp rdx, rax
+    setne al
+.r: movzx eax, al
+    pop rbx
+    ret
+
+; ---- dictionaries ------------------------------------------------------------------------------------------------
+py_newdict:                         ; -> rax
+    mov ecx, 1
+    mov edx, 5
+    call py_newlist
+    jmp py_dinit                    ; a dict keeps 16-byte pairs: its own storage
+
+; the pair storage of a dict holds cap * 16 bytes; py_newlist allocated cap * 8 only, so a dict allocates its own
+py_dinit:                           ; rax = dict -> rax (storage for 8 pairs)
+    push rcx
+    push rdx
+    push rax
+    mov ecx, 8*16
+    call py_alloc
+    mov rdx, rax
+    pop rax
+    mov [rax+16], rdx
+    mov dword [rax+8], 8
+    pop rdx
+    pop rcx
+    ret
+
+py_dfind:                           ; rax = dict, rcx = key -> rax = pair address or 0 (clobbers rcx rdx)
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov r8, rax
+    mov r9, rcx
+    xor ebx, ebx
+.l: cmp ebx, [r8+4]
+    jae .no
+    mov rax, rbx
+    shl rax, 4
+    add rax, [r8+16]
+    mov rsi, rax
+    mov rdx, [rax]
+    mov rax, r9
+    call py_eq
+    test eax, eax
+    jnz .yes
+    inc ebx
+    jmp .l
+.yes:
+    mov rax, rsi
+    jmp .o
+.no:
+    xor eax, eax
+.o: pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+py_dget:                            ; rax = dict, rcx = key -> rax = value or 0
+    call py_dfind
+    test rax, rax
+    jz .o
+    mov rax, [rax+8]
+.o: ret
+
+py_dset:                            ; rax = dict, rcx = key, rdx = value -> rax = dict
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rax
+    mov r9, rcx
+    mov r10, rdx
+    cmp qword [r8+16], 0
+    jne .have
+    mov rax, r8
+    call py_dinit
+.have:
+    mov rax, r8
+    mov rcx, r9
+    call py_dfind
+    test rax, rax
+    jz .new
+    mov [rax+8], r10
+    jmp .o
+.new:
+    mov ecx, [r8+4]
+    cmp ecx, [r8+8]
+    jb .st
+    ; grow: double the storage
+    mov ebx, ecx
+    shl ebx, 1
+    mov ecx, ebx
+    shl ecx, 4
+    call py_alloc
+    mov rdi, rax
+    mov rsi, [r8+16]
+    mov ecx, [r8+4]
+    shl ecx, 1
+    push rdi
+    rep movsq
+    pop rdi
+    mov [r8+16], rdi
+    mov [r8+8], ebx
+.st:
+    mov ecx, [r8+4]
+    mov rdi, rcx
+    shl rdi, 4
+    add rdi, [r8+16]
+    mov [rdi], r9
+    mov [rdi+8], r10
+    inc ecx
+    mov [r8+4], ecx
+.o: mov rax, r8
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+py_ddel:                            ; rax = dict, rcx = key -> eax = 1 when removed
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    mov r8, rax
+    call py_dfind
+    test rax, rax
+    jz .no
+    mov rdi, rax
+    mov ecx, [r8+4]
+    mov rbx, rdi
+    sub rbx, [r8+16]
+    shr rbx, 4                      ; index of the pair
+    sub ecx, ebx
+    dec ecx
+    shl ecx, 1                      ; qwords behind it
+    lea rsi, [rdi+16]
+    rep movsq
+    dec dword [r8+4]
+    mov eax, 1
+    jmp .o
+.no:
+    xor eax, eax
+.o: pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; ---- length and iteration -----------------------------------------------------------------------------------------------
+py_rnglen:                          ; rax = range -> rax = number of items
+    push rcx
+    push rdx
+    mov rcx, [rax+24]
+    mov rdx, [rax+16]
+    sub rdx, [rax+8]                ; stop - start
+    cmp rcx, 0
+    jl .neg
+    test rdx, rdx
+    jle .z
+    lea rax, [rdx+rcx-1]
+    jmp .d
+.neg:
+    test rdx, rdx
+    jge .z
+    neg rdx
+    mov rax, rcx
+    neg rax
+    mov rcx, rax
+    lea rax, [rdx+rcx-1]
+.d: cqo
+    idiv rcx
+    pop rdx
+    pop rcx
+    ret
+.z: xor eax, eax
+    pop rdx
+    pop rcx
+    ret
+
+py_len:                             ; rax = object -> rax = raw length (TypeError when it has none)
+    test al, 3
+    jnz .bad
+    mov edx, [rax]
+    cmp edx, 3
+    je py_rnglen
+    cmp edx, 1
+    je .l
+    cmp edx, 2
+    je .l
+    cmp edx, 4
+    je .l
+    cmp edx, 5
+    je .l
+.bad:
+    PERR pe_nolen
+.l: mov eax, [rax+4]
+    ret
+
+; py_iter_get: rax = object, rcx = index -> CF=1 when the sequence is over, else rax = item
+py_iter_get:
+    push rdx
+    test al, 3
+    jnz .bad
+    mov edx, [rax]
+    cmp edx, 2
+    je .seq
+    cmp edx, 4
+    je .seq
+    cmp edx, 1
+    je .str
+    cmp edx, 5
+    je .dict
+    cmp edx, 3
+    je .rng
+.bad:
+    pop rdx
+    PERR pe_notit
+.seq:
+    cmp ecx, [rax+4]
+    jae .end
+    mov rax, [rax+16]
+    mov rax, [rax+rcx*8]
+    jmp .ok
+.str:
+    cmp ecx, [rax+4]
+    jae .end
+    mov al, [rax+8+rcx]
+    call py_chr1
+    jmp .ok
+.dict:
+    cmp ecx, [rax+4]
+    jae .end
+    shl rcx, 4
+    add rcx, [rax+16]
+    mov rax, [rcx]
+    jmp .ok
+.rng:
+    push rcx
+    push rax
+    call py_rnglen
+    mov rdx, rax
+    pop rax
+    pop rcx
+    cmp rcx, rdx
+    jae .end
+    mov rdx, [rax+24]
+    imul rdx, rcx
+    add rdx, [rax+8]
+    mov rax, rdx
+    call py_mkint
+.ok:
+    pop rdx
+    clc
+    ret
+.end:
+    pop rdx
+    stc
+    ret
+
+; ---- str() / repr() as a string object ----------------------------------------------------------------------------------
+py_tostr:                           ; rax = value, edx = 0 str / 1 repr -> rax = str object
+    push rsi
+    push rcx
+    push r12
+    test al, 3
+    jnz .conv
+    cmp dword [rax], 1
+    jne .conv
+    test edx, edx
+    jnz .conv
+    jmp .done                       ; str(str) is the same object
+.conv:
+    mov r12, [PYV_SBP]
+    mov qword [PYV_CAP], 1
+    call py_putval
+    mov qword [PYV_CAP], 0
+    mov rcx, [PYV_SBP]
+    sub rcx, r12
+    mov rsi, r12
+    mov [PYV_SBP], r12
+    call py_newstr
+.done:
+    pop r12
+    pop rcx
+    pop rsi
+    ret
+
+; ---- concatenation helpers ----------------------------------------------------------------------------------------------------
+py_strcat:                          ; rdx = a (str), rax = b (str) -> rax = new str
+    push rsi
+    push rdi
+    push rcx
+    push r8
+    push r9
+    mov r8, rdx
+    mov r9, rax
+    mov ecx, [r8+4]
+    add ecx, [r9+4]
+    add ecx, 9
+    call py_alloc
+    mov dword [rax], 1
+    mov ecx, [r8+4]
+    add ecx, [r9+4]
+    mov [rax+4], ecx
+    lea rdi, [rax+8]
+    lea rsi, [r8+8]
+    mov ecx, [r8+4]
+    rep movsb
+    lea rsi, [r9+8]
+    mov ecx, [r9+4]
+    rep movsb
+    pop r9
+    pop r8
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
+
+py_seqcat:                          ; rdx = a, rax = b (both list or both tuple) -> rax = new sequence
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rdx
+    mov r9, rax
+    mov ecx, [r8+4]
+    add ecx, [r9+4]
+    mov edx, [r8]
+    call py_newlist
+    mov r10, rax
+    mov rdi, [r10+16]
+    mov rsi, [r8+16]
+    mov ecx, [r8+4]
+    rep movsq
+    mov rsi, [r9+16]
+    mov ecx, [r9+4]
+    rep movsq
+    mov ecx, [r8+4]
+    add ecx, [r9+4]
+    mov [r10+4], ecx
+    mov rax, r10
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+py_strrep:                          ; rdx = str, rcx = count (raw) -> rax = new str
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov r8, rdx
+    test rcx, rcx
+    jg .go
+    xor ecx, ecx
+.go:
+    mov r9, rcx
+    mov eax, [r8+4]
+    imul rax, rcx
+    cmp rax, 1000000
+    ja .long
+    lea rcx, [rax+9]
+    call py_alloc
+    mov dword [rax], 1
+    mov rcx, [r8+4]
+    and ecx, 0xFFFFFFFF
+    imul rcx, r9
+    mov [rax+4], ecx
+    lea rdi, [rax+8]
+    push rax
+.rl:
+    test r9, r9
+    jz .rd
+    lea rsi, [r8+8]
+    mov ecx, [r8+4]
+    rep movsb
+    dec r9
+    jmp .rl
+.rd:
+    pop rax
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    ret
+.long:
+    PERR pe_long
+
+py_seqrep:                          ; rdx = list/tuple, rcx = count (raw) -> rax = new sequence
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rdx
+    test rcx, rcx
+    jg .go
+    xor ecx, ecx
+.go:
+    mov r9, rcx
+    mov eax, [r8+4]
+    imul rax, rcx
+    cmp rax, 1000000
+    ja .long
+    mov ecx, eax
+    mov edx, [r8]
+    call py_newlist
+    mov r10, rax
+    mov rdi, [r10+16]
+.rl:
+    test r9, r9
+    jz .rd
+    mov rsi, [r8+16]
+    mov ecx, [r8+4]
+    rep movsq
+    dec r9
+    jmp .rl
+.rd:
+    mov eax, [r8+4]
+    mov ecx, [r10+8]
+    ; length = items copied = cap when cap was set exactly; recompute from the pointer
+    mov rax, rdi
+    sub rax, [r10+16]
+    shr eax, 3
+    mov [r10+4], eax
+    mov rax, r10
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+.long:
+    PERR pe_long
+
+; ---- binary operators: rdx = left, rax = right, r8d = + - * F % ^ -> rax ----------------------------------------------------
+py_binop:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdx
+    mov r13, rax
+    mov ebx, r8d
+    mov rax, r12
+    call py_asint
+    jc .lother
+    mov r14, rax                    ; left raw
+    mov rax, r13
+    call py_asint
+    jc .lint_rother
+    mov rcx, rax                    ; right raw
+    mov rax, r14
+    cmp ebx, '+'
+    je .add
+    cmp ebx, '-'
+    je .sub
+    cmp ebx, '*'
+    je .mul
+    cmp ebx, '^'
+    je .pow
+    test rcx, rcx
+    jz .zero
+    cmp ebx, 'F'
+    je .fdiv
+    ; modulo (floor)
+    cqo
+    idiv rcx
+    mov rax, rdx
+    test rax, rax
+    jz .mk
+    xor rdx, rcx
+    jns .mk
+    add rax, rcx
+    jmp .mk
+.fdiv:
+    cqo
+    idiv rcx
+    test rdx, rdx
+    jz .mk
+    xor rdx, rcx
+    jns .mk
+    dec rax
+    jmp .mk
+.add:
+    add rax, rcx
+    jo .big
+    jmp .mk
+.sub:
+    sub rax, rcx
+    jo .big
+    jmp .mk
+.mul:
+    imul rax, rcx
+    jo .big
+    jmp .mk
+.pow:
+    test rcx, rcx
+    js .negp
+    mov rdx, rax                    ; base
+    mov eax, 1
+.pl:
+    test rcx, rcx
+    jz .mk
+    test cl, 1
+    jz .ps
+    imul rax, rdx
+    jo .big
+.ps:
+    shr rcx, 1
+    jz .mk
+    imul rdx, rdx
+    jo .big
+    jmp .pl
+.mk:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    jmp py_mkint
+.big:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    PERR pe_big
+.zero:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    PERR pe_zero
+.negp:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    PERR pe_negp
+; ---- left is an int, right is not: int * str / list / tuple
+.lint_rother:
+    cmp ebx, '*'
+    jne .typeerr
+    test r13b, 3
+    jnz .typeerr
+    mov rcx, r14
+    mov rdx, r13
+    mov eax, [r13]
+    cmp eax, 1
+    je .rstr
+    cmp eax, 2
+    je .rseq
+    cmp eax, 4
+    je .rseq
+    jmp .typeerr
+.rstr:
+    call py_strrep
+    jmp .out
+.rseq:
+    call py_seqrep
+    jmp .out
+.lother:
+    test r12b, 3
+    jnz .typeerr
+    mov eax, [r12]
+    cmp eax, 1
+    je .lstr
+    cmp eax, 2
+    je .lseq
+    cmp eax, 4
+    je .lseq
+    jmp .typeerr
+.lstr:
+    cmp ebx, '+'
+    je .scat
+    cmp ebx, '*'
+    je .smul
+    cmp ebx, '%'
+    je .sfmt
+    jmp .typeerr
+.scat:
+    test r13b, 3
+    jnz .typeerr
+    cmp dword [r13], 1
+    jne .typeerr
+    mov rdx, r12
+    mov rax, r13
+    call py_strcat
+    jmp .out
+.smul:
+    mov rax, r13
+    call py_asint
+    jc .typeerr
+    mov rcx, rax
+    mov rdx, r12
+    call py_strrep
+    jmp .out
+.sfmt:
+    mov rdx, r12
+    mov rax, r13
+    call py_strfmt
+    jmp .out
+.lseq:
+    cmp ebx, '+'
+    je .qcat
+    cmp ebx, '*'
+    jne .typeerr
+    mov rax, r13
+    call py_asint
+    jc .typeerr
+    mov rcx, rax
+    mov rdx, r12
+    call py_seqrep
+    jmp .out
+.qcat:
+    test r13b, 3
+    jnz .typeerr
+    mov eax, [r13]
+    cmp eax, [r12]
+    jne .typeerr
+    mov rdx, r12
+    mov rax, r13
+    call py_seqcat
+    jmp .out
+.typeerr:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    PERR pe_type
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- "text %d" % value ---------------------------------------------------------------------------------------------------------
+; rdx = format string, rax = value (a tuple gives several arguments) -> rax = new str
+py_strfmt:
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    mov r12, rdx
+    mov r13, rax
+    mov r14, [PYV_SBP]              ; builder start
+    mov qword [PYV_CAP], 1
+    ; arguments: a tuple is spread, anything else is one argument
+    xor r10d, r10d                  ; argument index
+    mov r9d, 1
+    test r13b, 3
+    jnz .one
+    cmp dword [r13], 4
+    jne .one
+    mov r9d, [r13+4]
+.one:
+    xor r11d, r11d                  ; position in the format
+.l: cmp r11d, [r12+4]
+    jae .end
+    mov al, [r12+8+r11]
+    inc r11d
+    cmp al, '%'
+    je .pct
+.lit:
+    call py_out
+    jmp .l
+.pct:
+    cmp r11d, [r12+4]
+    jae .bad
+    mov al, [r12+8+r11]
+    cmp al, '%'
+    jne .spec
+    inc r11d
+    jmp .lit
+.spec:
+    xor r8d, r8d                    ; width
+    xor ebx, ebx                    ; flags: 1 zero pad, 2 left align
+.fl:
+    mov al, [r12+8+r11]
+    cmp al, '0'
+    jne .f2
+    or ebx, 1
+    jmp .fn
+.f2:
+    cmp al, '-'
+    jne .wd
+    or ebx, 2
+.fn:
+    inc r11d
+    cmp r11d, [r12+4]
+    jb .fl
+    jmp .bad
+.wd:
+    movzx eax, byte [r12+8+r11]
+    sub eax, '0'
+    cmp eax, 9
+    ja .conv
+    imul r8d, r8d, 10
+    add r8d, eax
+    inc r11d
+    cmp r11d, [r12+4]
+    jb .wd
+    jmp .bad
+.conv:
+    movzx edi, byte [r12+8+r11]
+    inc r11d
+    cmp r10d, r9d
+    jae .bad
+    ; the argument
+    mov rax, r13
+    cmp r9d, 1
+    jne .tup
+    test r13b, 3
+    jnz .have
+    cmp dword [r13], 4
+    jne .have
+.tup:
+    mov rax, [r13+16]
+    mov rax, [rax+r10*8]
+.have:
+    inc r10d
+    mov rsi, [PYV_SBP]              ; start of this field
+    push rsi
+    cmp edi, 's'
+    je .s
+    cmp edi, 'r'
+    je .r
+    cmp edi, 'd'
+    je .d
+    cmp edi, 'i'
+    je .d
+    cmp edi, 'x'
+    je .x
+    cmp edi, 'X'
+    je .xu
+    cmp edi, 'c'
+    je .c
+    pop rsi
+    jmp .bad
+.s: xor edx, edx
+    jmp .txt
+.r: mov edx, 1
+.txt:
+    mov qword [PYV_CAP], 1
+    call py_putval
+
+    jmp .pad
+.d: call py_asint
+    jc .bad2
+    mov qword [PYV_CAP], 1
+    call py_putint
+
+    jmp .pad
+.x:
+.xu:
+    call py_asint
+    jc .bad2
+    mov qword [PYV_CAP], 1
+    mov rdx, rax
+    test rdx, rdx
+    jns .xp
+    mov al, '-'
+    call py_out
+    neg rdx
+.xp:
+    mov rax, rdx
+    call py_puthexnum
+
+    cmp edi, 'X'
+    jne .pad
+    mov rax, [PYV_SBP]
+    mov rdx, [rsp]
+.up:
+    cmp rdx, rax
+    jae .pad
+    cmp byte [rdx], 'a'
+    jb .un
+    cmp byte [rdx], 'f'
+    ja .un
+    sub byte [rdx], 32
+.un:
+    inc rdx
+    jmp .up
+.c: mov rdx, rax
+    call py_asint
+    jc .cs
+    mov qword [PYV_CAP], 1
+    call py_out
+
+    jmp .pad
+.cs:
+    mov rax, rdx
+    xor edx, edx
+    mov qword [PYV_CAP], 1
+    call py_putval
+
+.pad:
+    pop rsi                         ; field start
+    mov rcx, [PYV_SBP]
+    sub rcx, rsi
+    mov edx, r8d
+    sub edx, ecx
+    jle .l
+    ; pad: shift the text right (default) or fill behind it (left align)
+    mov rdi, [PYV_SBP]
+    lea rax, [rdi+rdx]
+    cmp rax, PY_SBEND-2
+    jae .long
+    test ebx, 2
+    jnz .left
+    push rcx
+    lea rsi, [rsi+rcx-1]
+    lea rdi, [rsi+rdx]
+    std
+    rep movsb
+    cld
+    pop rcx
+    mov rdi, [PYV_SBP]
+    sub rdi, rcx
+    mov al, ' '
+    test ebx, 1
+    jz .pf
+    mov al, '0'
+.pf:
+    mov ecx, edx
+    rep stosb
+    add rdi, rcx
+    mov rax, [PYV_SBP]
+    add rax, rdx
+    mov [PYV_SBP], rax
+    jmp .l
+.left:
+    mov ecx, edx
+    mov al, ' '
+    rep stosb
+    mov [PYV_SBP], rdi
+    jmp .l
+.end:
+    cmp r10d, r9d
+    jne .bad
+    mov rcx, [PYV_SBP]
+    sub rcx, r14
+    mov rsi, r14
+    mov [PYV_SBP], r14
+    mov qword [PYV_CAP], 0
+    call py_newstr
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+.bad2:
+    pop rsi
+.bad:
+    mov qword [PYV_CAP], 0
+    PERR pe_fmt
+.long:
+    PERR pe_long
+
+py_puthexnum:                       ; rax = non-negative raw number -> hex digits
+    push rax
+    push rcx
+    push rdx
+    xor ecx, ecx
+    mov rdx, rax
+.c: inc ecx
+    shr rdx, 4
+    jnz .c
+.d: dec ecx
+    mov rdx, [rsp+16]
+    shl ecx, 2
+    shr rdx, cl
+    shr ecx, 2
+    and edx, 15
+    mov al, dl
+    cmp al, 10
+    jb .n
+    add al, 'a'-10-'0'
+.n: add al, '0'
+    call py_out
+    test ecx, ecx
+    jnz .d
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ---- indexing: rax = index, [PYV_SUBB] = container -> rax = item ------------------------------------------------------------
+py_getitem:
+    push rbx
+    push rcx
+    push rdx
+    mov rbx, [PYV_SUBB]
+    test bl, 3
+    jnz .noidx
+    mov edx, [rbx]
+    cmp edx, 5
+    je .dict
+    mov rcx, rax
+    mov rax, rcx
+    call py_asint
+    jc .idxt
+    mov rcx, rax                    ; raw index
+    cmp edx, 3
+    je .rng
+    mov eax, [rbx+4]
+    test rcx, rcx
+    jns .pos
+    add rcx, rax
+.pos:
+    test rcx, rcx
+    js .oob
+    cmp rcx, rax
+    jae .oob
+    cmp edx, 1
+    je .str
+    cmp edx, 2
+    je .seq
+    cmp edx, 4
+    jne .noidx
+.seq:
+    mov rax, [rbx+16]
+    mov rax, [rax+rcx*8]
+    jmp .o
+.str:
+    mov al, [rbx+8+rcx]
+    call py_chr1
+    jmp .o
+.rng:
+    mov rax, rbx
+    push rcx
+    call py_rnglen
+    pop rcx
+    test rcx, rcx
+    jns .rp
+    add rcx, rax
+.rp:
+    test rcx, rcx
+    js .oob
+    cmp rcx, rax
+    jae .oob
+    mov rax, [rbx+24]
+    imul rax, rcx
+    add rax, [rbx+8]
+    pop rdx
+    pop rcx
+    pop rbx
+    jmp py_mkint
+.dict:
+    mov rcx, rax
+    mov rax, rbx
+    call py_dget
+    test rax, rax
+    jz .nokey
+.o: pop rdx
+    pop rcx
+    pop rbx
+    ret
+.oob:
+    pop rdx
+    pop rcx
+    pop rbx
+    PERR pe_idx
+.nokey:
+    pop rdx
+    pop rcx
+    pop rbx
+    PERR pe_key
+.noidx:
+    pop rdx
+    pop rcx
+    pop rbx
+    PERR pe_noidx
+.idxt:
+    pop rdx
+    pop rcx
+    pop rbx
+    PERR pe_idxt
+
+; py_setitem: rdx = container, rcx = index, rax = value
+py_setitem:
+    push rbx
+    push rsi
+    push r8
+    push r9
+    mov r8, rax
+    mov r9, rdx
+    test r9b, 3
+    jnz .noset
+    mov ebx, [r9]
+    cmp ebx, 5
+    je .dict
+    cmp ebx, 2
+    jne .noset
+    mov rax, rcx
+    call py_asint
+    jc .idxt
+    mov rcx, rax
+    mov eax, [r9+4]
+    test rcx, rcx
+    jns .pos
+    add rcx, rax
+.pos:
+    test rcx, rcx
+    js .oob
+    cmp rcx, rax
+    jae .oob
+    mov rax, [r9+16]
+    mov [rax+rcx*8], r8
+    jmp .o
+.dict:
+    mov rax, r9
+    mov rdx, r8
+    call py_dset
+.o: pop r9
+    pop r8
+    pop rsi
+    pop rbx
+    ret
+.oob:
+    pop r9
+    pop r8
+    pop rsi
+    pop rbx
+    PERR pe_idx
+.idxt:
+    pop r9
+    pop r8
+    pop rsi
+    pop rbx
+    PERR pe_idxt
+.noset:
+    pop r9
+    pop r8
+    pop rsi
+    pop rbx
+    PERR pe_noset
+
+; ---- slices: rax = object, r8 = start, r9 = stop, r10 = step (None = omitted) -> rax -------------------------------------------
+py_slice:
+    push rbx
+    push rsi
+    push rdi
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rax
+    test r15b, 3
+    jnz .bad
+    mov eax, [r15]
+    cmp eax, 1
+    je .okt
+    cmp eax, 2
+    je .okt
+    cmp eax, 4
+    je .okt
+    cmp eax, 3
+    jne .bad
+    mov rax, r15
+    call py_rnglen
+    jmp .gotn
+.okt:
+    mov eax, [r15+4]
+.gotn:
+    mov r14, rax                    ; length n
+    ; step
+    mov r11d, 1
+    cmp r10, PY_NONE
+    je .st
+    mov rax, r10
+    call py_asint
+    jc .bad
+    mov r11, rax
+    test r11, r11
+    jz .zstep
+.st:
+    ; start / stop as raw numbers, with Python's clamping rules
+    test r11, r11
+    jg .fwd
+    ; negative step
+    mov r12, r14
+    dec r12                         ; default start n-1
+    cmp r8, PY_NONE
+    je .ns1
+    mov rax, r8
+    call py_asint
+    jc .bad
+    mov r12, rax
+    test r12, r12
+    jns .ns0
+    add r12, r14
+.ns0:
+    cmp r12, r14
+    jl .ns1
+    lea r12, [r14-1]
+.ns1:
+    mov r13, -1                     ; default stop: before index 0
+    cmp r9, PY_NONE
+    je .ns3
+    mov rax, r9
+    call py_asint
+    jc .bad
+    mov r13, rax
+    test r13, r13
+    jns .ns2
+    add r13, r14
+.ns2:
+    cmp r13, -1
+    jge .ns3
+    mov r13, -1
+.ns3:
+    cmp r13, r14
+    jl .go
+    lea r13, [r14-1]
+    jmp .go
+.fwd:
+    xor r12d, r12d
+    cmp r8, PY_NONE
+    je .fs1
+    mov rax, r8
+    call py_asint
+    jc .bad
+    mov r12, rax
+    test r12, r12
+    jns .fs0
+    add r12, r14
+    jns .fs0
+    xor r12d, r12d
+.fs0:
+    cmp r12, r14
+    jle .fs1
+    mov r12, r14
+.fs1:
+    mov r13, r14
+    cmp r9, PY_NONE
+    je .go
+    mov rax, r9
+    call py_asint
+    jc .bad
+    mov r13, rax
+    test r13, r13
+    jns .fs2
+    add r13, r14
+    jns .fs2
+    xor r13d, r13d
+.fs2:
+    cmp r13, r14
+    jle .go
+    mov r13, r14
+.go:
+    ; count the items
+    xor ecx, ecx
+    mov rax, r12
+.cn:
+    test r11, r11
+    jg .cp
+    cmp rax, r13
+    jle .cd
+    jmp .cc
+.cp:
+    cmp rax, r13
+    jge .cd
+.cc:
+    inc ecx
+    add rax, r11
+    jmp .cn
+.cd:
+    mov ebx, ecx                    ; items
+    mov eax, [r15]
+    cmp eax, 1
+    je .mkstr
+    mov edx, eax
+    cmp eax, 3
+    jne .mkseq
+    mov edx, 2
+.mkseq:
+    mov ecx, ebx
+    call py_newlist
+    mov rdi, [rax+16]
+    mov [rax+4], ebx
+    mov rsi, rax
+    mov rax, r12
+.sq:
+    test ebx, ebx
+    jz .sqd
+    cmp dword [r15], 3
+    je .sr
+    mov rcx, [r15+16]
+    mov rcx, [rcx+rax*8]
+    jmp .sp
+.sr:
+    push rax
+    mov rcx, [r15+24]
+    imul rcx, rax
+    add rcx, [r15+8]
+    mov rax, rcx
+    call py_mkint
+    mov rcx, rax
+    pop rax
+.sp:
+    mov [rdi], rcx
+    add rdi, 8
+    add rax, r11
+    dec ebx
+    jmp .sq
+.sqd:
+    mov rax, rsi
+    jmp .out
+.mkstr:
+    lea ecx, [rbx+9]
+    call py_alloc
+    mov dword [rax], 1
+    mov [rax+4], ebx
+    lea rdi, [rax+8]
+    mov rsi, r12
+    mov rdx, rax
+.ss:
+    test ebx, ebx
+    jz .ssd
+    mov cl, [r15+8+rsi]
+    mov [rdi], cl
+    inc rdi
+    add rsi, r11
+    dec ebx
+    jmp .ss
+.ssd:
+    mov rax, rdx
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+.bad:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_noidx
+.zstep:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_slstep
+
+
+; ---- end py3.inc
+; ---- begin py4.inc
+; =============================================================================
+;  Python subset interpreter - part 4: statements, blocks, functions, comprehensions, entry points
+;  Direct source interpretation: loops re-run the body from its source position,
+;  PYV_SKIP > 0 means "parse only, execute nothing".
+; =============================================================================
+PYV_LEND   equ PYV+0x500            ; end of the assignment target being parsed (0 = none)
+PYV_REPL   equ PYV+0x510            ; 1 = echo expression statements
+PYV_NKW    equ PYV+0x518            ; number of keyword arguments in use
+PYV_CATCH  equ PYV+0x528            ; innermost try frame (0 = none)
+PYV_TRYFD  equ PYV+0x530
+PYV_TRYNS  equ PYV+0x538
+PYV_SRC0   equ PYV+0x540            ; start of the program text (for line numbers)
+PYV_INITED equ PYV+0x548
+PYV_BUF    equ PYV+0x600            ; 256 bytes of scratch text
+PYV_KWT    equ PYV+0x800            ; 12 keyword arguments * 24 bytes: name ptr, name len, value
+PY_MAXKW   equ 12
+
+; ---- strings and line scanning --------------------------------------------------------------------
+py_skipstr:                         ; rsi at an opening quote -> rsi behind the closing quote
+    push rax
+    push rcx
+    mov cl, [rsi]
+    cmp [rsi+1], cl
+    jne .one
+    cmp [rsi+2], cl
+    jne .one
+    add rsi, 3
+.t: mov al, [rsi]
+    test al, al
+    jz .o
+    cmp al, '\'
+    jne .t0
+    cmp byte [rsi+1], 0
+    je .o
+    add rsi, 2
+    jmp .t
+.t0:
+    cmp al, cl
+    jne .t1
+    cmp [rsi+1], cl
+    jne .t1
+    cmp [rsi+2], cl
+    jne .t1
+    add rsi, 3
+    jmp .o
+.t1:
+    inc rsi
+    jmp .t
+.one:
+    inc rsi
+.s: mov al, [rsi]
+    test al, al
+    jz .o
+    cmp al, 10
+    je .o
+    cmp al, '\'
+    jne .s0
+    cmp byte [rsi+1], 0
+    je .o
+    add rsi, 2
+    jmp .s
+.s0:
+    cmp al, cl
+    jne .s1
+    inc rsi
+    jmp .o
+.s1:
+    inc rsi
+    jmp .s
+.o: pop rcx
+    pop rax
+    ret
+
+; r8b = 0: skip the rest of the line (through the newline)   ':' : skip through the ':' that ends a header
+;       1: stop AT the first ';', '#' or newline outside brackets
+py_skipscan:
+    push rax
+    push rbx
+    xor ebx, ebx
+.l: movzx eax, byte [rsi]
+    test al, al
+    jz .done
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, '{'
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    cmp al, '}'
+    je .c
+    cmp al, 10
+    je .nl
+    cmp al, '\'
+    je .bs
+    test ebx, ebx
+    jnz .n
+    cmp al, '#'
+    je .cm
+    cmp al, ';'
+    jne .n1
+    cmp r8b, 1
+    je .done
+    jmp .n
+.n1:
+    cmp al, ':'
+    jne .n
+    cmp r8b, ':'
+    jne .n
+    inc rsi
+    jmp .done
+.n: inc rsi
+    jmp .l
+.o: inc ebx
+    jmp .n
+.c: test ebx, ebx
+    jz .n
+    dec ebx
+    jmp .n
+.q: call py_skipstr
+    jmp .l
+.bs:
+    cmp byte [rsi+1], 10
+    jne .n
+    add rsi, 2
+    jmp .l
+.cm:
+    cmp r8b, 1
+    je .done
+.c2:
+    mov al, [rsi]
+    test al, al
+    jz .done
+    cmp al, 10
+    je .l
+    inc rsi
+    jmp .c2
+.nl:
+    test ebx, ebx
+    jnz .n
+    cmp r8b, 1
+    je .done
+    cmp r8b, ':'
+    je .nocolon
+    inc rsi
+    jmp .done
+.nocolon:
+    PERR pe_syntax
+.done:
+    pop rbx
+    pop rax
+    ret
+
+py_skiphdr:                         ; rsi in a header -> rsi behind its ':'
+    push r8
+    mov r8d, ':'
+    call py_skipscan
+    pop r8
+    ret
+py_skipeol:                         ; rsi in a line -> rsi at the start of the next line
+    push r8
+    xor r8d, r8d
+    call py_skipscan
+    pop r8
+    ret
+py_stmtend:                         ; rsi -> rax = end of the simple statement (';', '#', newline, NUL)
+    push r8
+    push rsi
+    mov r8d, 1
+    call py_skipscan
+    mov rax, rsi
+    pop rsi
+    pop r8
+    ret
+
+; after a simple statement: CF=1 when another statement follows on the same line (after ';')
+py_endstmt:
+    call py_ws
+    mov al, [rsi]
+    cmp al, ';'
+    je .semi
+    cmp al, '#'
+    jne .c0
+.cm:
+    mov al, [rsi]
+    test al, al
+    jz .eof
+    cmp al, 10
+    je .nl
+    inc rsi
+    jmp .cm
+.c0:
+    test al, al
+    jz .eof
+    cmp al, 13
+    je .cr
+    cmp al, 10
+    je .nl
+    PERR pe_syntax
+.cr:
+    inc rsi
+    cmp byte [rsi], 10
+    jne .eof
+.nl:
+    inc rsi
+.eof:
+    clc
+    ret
+.semi:
+    inc rsi
+    call py_ws
+    mov al, [rsi]
+    test al, al
+    jz .eof
+    cmp al, 10
+    je .nl
+    cmp al, '#'
+    je .cm
+    stc
+    ret
+
+; rsi = start of a line -> rsi = start of the next line that holds code, ecx = its indent (-1 at the end),
+; rdx = its first character
+py_nextline:
+.l: xor ecx, ecx
+    mov rdx, rsi
+.i: mov al, [rdx]
+    cmp al, ' '
+    jne .i1
+    inc ecx
+    inc rdx
+    jmp .i
+.i1:
+    cmp al, 9
+    jne .i2
+    or ecx, 7
+    inc ecx
+    inc rdx
+    jmp .i
+.i2:
+    cmp al, 13
+    jne .icr
+    inc rdx
+    jmp .i
+.icr:
+    test al, al
+    jz .eof
+    cmp al, 10
+    je .blank
+    cmp al, '#'
+    jne .ret
+.cm:
+    mov al, [rdx]
+    test al, al
+    jz .eof
+    cmp al, 10
+    je .blank
+    inc rdx
+    jmp .cm
+.blank:
+    lea rsi, [rdx+1]
+    jmp .l
+.eof:
+    mov rsi, rdx
+    mov ecx, -1
+.ret:
+    ret
+
+; ---- blocks -----------------------------------------------------------------------------------------
+; rsi just behind the ':' of a header whose line has indent edx -> rsi at the start of the line behind the body
+py_suite:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edx
+    xor r14d, r14d                  ; 1: break/continue/return made the rest of the block skip
+    call py_ws
+    mov al, [rsi]
+    cmp al, '#'
+    je .blk
+    cmp al, 10
+    je .blk
+    cmp al, 13
+    je .blk
+    test al, al
+    jz .noblock
+    mov edx, r12d                   ; body on the same line
+    call py_stmt
+    jmp .out
+.blk:
+.sk:
+    mov al, [rsi]
+    test al, al
+    jz .noblock
+    inc rsi
+    cmp al, 10
+    jne .sk
+    call py_nextline
+    cmp ecx, -1
+    je .noblock
+    cmp ecx, r12d
+    jbe .noblock
+    mov r13d, ecx
+.st:
+    mov rsi, rdx
+    mov edx, r13d
+    call py_stmt
+    test r14d, r14d
+    jnz .nx
+    cmp qword [PYV_FLOW], 0
+    je .nx
+    cmp qword [PYV_SKIP], 0
+    jne .nx
+    inc qword [PYV_SKIP]
+    mov r14d, 1
+.nx:
+    call py_nextline
+    cmp ecx, -1
+    je .end
+    cmp ecx, r13d
+    je .st
+    ja .badind
+    cmp ecx, r12d
+    ja .baddent
+.end:
+    test r14d, r14d
+    jz .out
+    dec qword [PYV_SKIP]
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.noblock:
+    PERR pe_noblock
+.badind:
+    mov rsi, rdx
+    PERR pe_indent
+.baddent:
+    mov rsi, rdx
+    PERR pe_dedent
+
+; ---- one statement -------------------------------------------------------------------------------------------------
+; rsi = first character, edx = indent of its line -> rsi = start of the next line
+py_stmt:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edx
+    inc qword [PYV_TICK]
+    test qword [PYV_TICK], 127
+    jnz .nt
+    call py_ext_break
+    jnc .nt
+    PERR pe_intr
+.nt:
+    lea rdi, [k_if]
+    call py_kw
+    je .if
+    lea rdi, [k_while]
+    call py_kw
+    je .while
+    lea rdi, [k_for]
+    call py_kw
+    je .for
+    lea rdi, [k_def]
+    call py_kw
+    je .def
+    lea rdi, [k_try]
+    call py_kw
+    je .try
+    lea rdi, [k_else]
+    call py_kw
+    je .stray
+    lea rdi, [k_elif]
+    call py_kw
+    je .stray
+    lea rdi, [k_except]
+    call py_kw
+    je .stray
+    lea rdi, [k_finally]
+    call py_kw
+    je .stray
+    lea rdi, [k_class]
+    call py_kw
+    je .unsup
+    lea rdi, [k_with]
+    call py_kw
+    je .unsup
+    cmp qword [PYV_SKIP], 0
+    je .simple
+    call py_skipeol
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.stray:
+    PERR pe_syntax
+.unsup:
+    PERR pe_unsup
+
+; ---- if / elif / else ---------------------------------------------------------------------------------------------
+.if:
+    xor r13d, r13d                  ; a branch has run
+.ifc:
+    cmp qword [PYV_SKIP], 0
+    jne .ifskip
+    test r13d, r13d
+    jnz .ifskip
+    call py_expr
+    call py_truthy
+    jz .iffalse
+    call py_colon
+    mov r13d, 1
+    mov edx, r12d
+    call py_suite
+    jmp .ifnext
+.iffalse:
+    call py_colon
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+    jmp .ifnext
+.ifskip:
+    call py_skiphdr
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+.ifnext:
+    call py_nextline
+    cmp ecx, r12d
+    jne .ret
+    mov r14, rsi                    ; line start (if no elif/else follows)
+    mov rsi, rdx
+    lea rdi, [k_elif]
+    call py_kw
+    je .ifc
+    lea rdi, [k_else]
+    call py_kw
+    jne .ifdone
+    call py_colon
+    cmp qword [PYV_SKIP], 0
+    jne .elseskip
+    test r13d, r13d
+    jnz .elseskip
+    mov edx, r12d
+    call py_suite
+    jmp .ret
+.elseskip:
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+    jmp .ret
+.ifdone:
+    mov rsi, r14
+    jmp .ret
+
+; ---- while ---------------------------------------------------------------------------------------------------------
+.while:
+    mov r13, rsi                    ; the condition
+.wl:
+    mov rsi, r13
+    cmp qword [PYV_SKIP], 0
+    jne .wskip
+    call py_expr
+    call py_truthy
+    jz .wfalse
+    call py_colon
+    mov edx, r12d
+    call py_suite
+    mov rax, [PYV_FLOW]
+    cmp eax, 1
+    je .wbrk
+    cmp eax, 3
+    je .ret
+    mov qword [PYV_FLOW], 0
+    inc qword [PYV_TICK]
+    test qword [PYV_TICK], 127
+    jnz .wl
+    call py_ext_break
+    jnc .wl
+    PERR pe_intr
+.wbrk:
+    mov qword [PYV_FLOW], 0
+    jmp .ret
+.wfalse:
+    call py_colon
+    jmp .wsk2
+.wskip:
+    call py_skiphdr
+.wsk2:
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+    jmp .ret
+
+; ---- for ---------------------------------------------------------------------------------------------------------------
+.for:
+    cmp qword [PYV_SKIP], 0
+    jne .fskip
+    call py_ws
+    mov r13, rsi                    ; targets
+    call py_findin
+    mov r14, rax                    ; the 'in'
+    lea rsi, [rax+2]
+    call py_expr
+    mov rbx, rax                    ; iterable
+    call py_colon
+    mov r15, rsi                    ; body
+    xor ebp, ebp
+.fl:
+    mov rax, rbx
+    mov rcx, rbp
+    call py_iter_get
+    jc .fend
+    inc rbp
+    mov rsi, r13
+    push qword [PYV_LEND]
+    mov [PYV_LEND], r14
+    call py_assign
+    pop qword [PYV_LEND]
+    mov rsi, r15
+    mov edx, r12d
+    call py_suite
+    mov rax, [PYV_FLOW]
+    cmp eax, 1
+    je .wbrk
+    cmp eax, 3
+    je .ret
+    mov qword [PYV_FLOW], 0
+    inc qword [PYV_TICK]
+    test qword [PYV_TICK], 127
+    jnz .fl
+    call py_ext_break
+    jnc .fl
+    PERR pe_intr
+.fend:
+    mov rsi, r15
+    jmp .wsk2
+.fskip:
+    call py_skiphdr
+    jmp .wsk2
+
+; ---- def ---------------------------------------------------------------------------------------------------------------
+.def:
+    call py_ws
+    call py_identlen
+    test ecx, ecx
+    jz .stray
+    mov r13, rsi
+    mov r14d, ecx
+    add rsi, rcx
+    call py_ws
+    cmp byte [rsi], '('
+    jne .stray
+    lea r15, [rsi+1]                ; parameters
+    call py_skiphdr
+    mov rbx, rsi                    ; behind the ':'
+    cmp qword [PYV_SKIP], 0
+    jne .defsk
+    mov rdi, r13
+    mov ecx, r14d
+    call py_fnfind
+    test rax, rax
+    jnz .defhave
+    mov ecx, [PYV_NFN]
+    cmp ecx, PY_MAXFN
+    jae .toomany
+    mov eax, ecx
+    inc ecx
+    mov [PYV_NFN], ecx
+    shl eax, 5
+    lea rax, [PY_FN+rax]
+.defhave:
+    mov [rax], r13
+    mov [rax+8], r14d
+    mov [rax+12], r12d
+    mov [rax+16], r15
+    mov [rax+24], rbx
+.defsk:
+    mov rsi, rbx
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+    jmp .ret
+.toomany:
+    PERR pe_vars
+
+
+; ---- try / except / else / finally ------------------------------------------------------------------------------
+.try:
+    call py_colon
+    cmp qword [PYV_SKIP], 0
+    jne .tryskip
+    mov r15, rsi                    ; start of the body
+    mov edx, r12d
+    call py_protect
+    mov ebx, 0
+    adc ebx, 0                      ; ebx = 1 when the body failed
+    jnc .tc1
+    mov rsi, r15                    ; find the end of the failed body
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+.tc1:
+    xor r13d, r13d                  ; an except clause has handled the error
+    jmp .tcl
+.tryskip:
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+    xor ebx, ebx
+    xor r13d, r13d
+.tcl:
+    call py_nextline
+    cmp ecx, r12d
+    jne .tend
+    mov r14, rsi                    ; line start
+    mov rsi, rdx
+    lea rdi, [k_except]
+    call py_kw
+    je .texc
+    lea rdi, [k_else]
+    call py_kw
+    je .telse
+    lea rdi, [k_finally]
+    call py_kw
+    je .tfin
+    mov rsi, r14
+.tend:
+    test ebx, ebx
+    jz .ret
+    test r13d, r13d
+    jnz .ret
+    cmp qword [PYV_SKIP], 0
+    jne .ret
+    mov r15, rsi                    ; unhandled: the error goes on after 'finally'
+    mov rdi, [PYV_ERRMSG]
+    mov rsi, [PYV_ERRPOS]
+    jmp py_error
+.texc:
+    call py_ws
+    cmp qword [PYV_SKIP], 0
+    jne .exhdr
+    test ebx, ebx
+    jz .exhdr
+    test r13d, r13d
+    jnz .exhdr
+    cmp byte [rsi], ':'
+    jne .exty
+    mov eax, 1
+    jmp .exgo
+.exty:
+    call py_exc_match
+.exgo:
+    call py_colon
+    test eax, eax
+    jz .exnot
+    mov r13d, 1
+    mov qword [PYV_FLOW], 0
+    mov edx, r12d
+    call py_suite
+    jmp .tcl
+.exhdr:
+    call py_skiphdr
+    jmp .exsk
+.exnot:
+.exsk:
+    inc qword [PYV_SKIP]
+    mov edx, r12d
+    call py_suite
+    dec qword [PYV_SKIP]
+    jmp .tcl
+.telse:
+    call py_colon
+    cmp qword [PYV_SKIP], 0
+    jne .exsk
+    test ebx, ebx
+    jnz .exsk
+    cmp qword [PYV_FLOW], 0
+    jne .exsk
+    mov edx, r12d
+    call py_suite
+    jmp .tcl
+.tfin:
+    call py_colon
+    cmp qword [PYV_SKIP], 0
+    jne .exsk
+    push qword [PYV_FLOW]
+    push qword [PYV_RET]
+    mov qword [PYV_FLOW], 0
+    mov edx, r12d
+    call py_suite
+    pop rax
+    pop rdx
+    cmp qword [PYV_FLOW], 0
+    jne .tcl                        ; 'finally' did its own return/break
+    mov [PYV_RET], rax
+    mov [PYV_FLOW], rdx
+    jmp .tcl
+
+; ---- simple statements ------------------------------------------------------------------------------------------------
+.simple:
+.sl:
+    call py_ws
+    lea rdi, [k_pass]
+    call py_kw
+    je .sdone
+    lea rdi, [k_break]
+    call py_kw
+    je .sbreak
+    lea rdi, [k_continue]
+    call py_kw
+    je .scont
+    lea rdi, [k_return]
+    call py_kw
+    je .sreturn
+    lea rdi, [k_global]
+    call py_kw
+    je .sglobal
+    lea rdi, [k_nonlocal]
+    call py_kw
+    je .sglobal
+    lea rdi, [k_del]
+    call py_kw
+    je .sdel
+    lea rdi, [k_assert]
+    call py_kw
+    je .sassert
+    lea rdi, [k_raise]
+    call py_kw
+    je .sraise
+    lea rdi, [k_import]
+    call py_kw
+    je .simp
+    lea rdi, [k_from]
+    call py_kw
+    je .simp
+    jmp .sexpr
+.simp:
+    PERR pe_import
+.sdone:
+    call py_endstmt
+    jnc .ret
+    cmp qword [PYV_FLOW], 0
+    je .sl
+    call py_skipeol
+    jmp .ret
+.sbreak:
+    mov qword [PYV_FLOW], 1
+    jmp .sdone
+.scont:
+    mov qword [PYV_FLOW], 2
+    jmp .sdone
+.sreturn:
+    cmp qword [PYV_FDEPTH], 0
+    je .retout
+    call py_ws
+    mov eax, PY_NONE
+    mov cl, [rsi]
+    test cl, cl
+    jz .rset
+    cmp cl, 10
+    je .rset
+    cmp cl, 13
+    je .rset
+    cmp cl, ';'
+    je .rset
+    cmp cl, '#'
+    je .rset
+    call py_exprlist
+.rset:
+    mov [PYV_RET], rax
+    mov qword [PYV_FLOW], 3
+    jmp .sdone
+.retout:
+    PERR pe_retout
+.sglobal:
+.gl:
+    call py_ws
+    call py_identlen
+    test ecx, ecx
+    jz .stray
+    mov rdi, rsi
+    add rsi, rcx
+    push rsi
+    call py_declglobal
+    pop rsi
+    call py_ws
+    cmp byte [rsi], ','
+    jne .sdone
+    inc rsi
+    jmp .gl
+.sdel:
+    call py_ws
+    call py_stmtend
+    mov [PYV_LEND], rax
+    call py_postfix
+    mov qword [PYV_LEND], 0
+    cmp qword [PYV_SUBV], 2
+    jne .stray
+    mov rax, [PYV_SUBB]
+    mov rcx, [PYV_SUBI]
+    call py_delitem
+    jmp .sdone
+.sassert:
+    call py_expr
+    call py_truthy
+    jz .afail
+    call py_ws
+    cmp byte [rsi], ','
+    jne .sdone
+    inc rsi
+    inc qword [PYV_SKIP]
+    call py_expr
+    dec qword [PYV_SKIP]
+    jmp .sdone
+.afail:
+    xor eax, eax
+    call py_ws
+    cmp byte [rsi], ','
+    jne .af2
+    inc rsi
+    call py_expr
+.af2:
+    lea rdi, [s_assert]
+    mov ecx, 14
+    jmp py_raise
+.sraise:
+    call py_ws
+    call py_identlen
+    test ecx, ecx
+    jnz .rn
+    mov rdi, [PYV_ERRMSG]
+    test rdi, rdi
+    jz .stray
+    jmp py_error
+.rn:
+    mov r13, rsi
+    mov r14d, ecx
+    add rsi, rcx
+    call py_ws
+    xor eax, eax
+    cmp byte [rsi], '('
+    jne .rr
+    inc rsi
+    call py_ws
+    cmp byte [rsi], ')'
+    je .rc
+    call py_expr
+    call py_ws
+.rc:
+    cmp byte [rsi], ')'
+    jne .stray
+    inc rsi
+.rr:
+    mov rdi, r13
+    mov ecx, r14d
+    jmp py_raise
+.sexpr:
+    mov r13, rsi                    ; start of the statement
+    call py_find_assign             ; eax = 0 none, 1 '=', 2 augmented; rdx = position of '=', ecx = operator
+    test eax, eax
+    jz .eonly
+    cmp eax, 2
+    je .aug
+    xor r14d, r14d
+.coll:
+    push rdx
+    inc r14d
+    lea rsi, [rdx+1]
+    call py_find_assign
+    cmp eax, 1
+    je .coll
+    test eax, eax
+    jnz .stray
+    call py_exprlist                ; the value
+    mov r15, rax
+    mov rbx, rsi                    ; end of the statement
+    mov ebp, 1
+.asl:
+    mov eax, r14d
+    sub eax, ebp
+    mov rdx, [rsp+rax*8]            ; end of target i
+    cmp ebp, 1
+    jne .asn
+    mov rsi, r13
+    jmp .asg
+.asn:
+    mov eax, r14d
+    sub eax, ebp
+    inc eax
+    mov rsi, [rsp+rax*8]
+    inc rsi
+.asg:
+    mov [PYV_LEND], rdx
+    mov rax, r15
+    call py_assign
+    mov qword [PYV_LEND], 0
+    inc ebp
+    cmp ebp, r14d
+    jbe .asl
+    mov eax, r14d
+    lea rsp, [rsp+rax*8]
+    mov rsi, rbx
+    jmp .sdone
+.aug:
+    mov r14, rdx                    ; the '='
+    mov r15d, ecx                   ; operator
+    lea rbx, [rdx-1]
+    cmp r15d, 'F'
+    je .a2
+    cmp r15d, '^'
+    jne .a1
+.a2:
+    dec rbx
+.a1:                                ; rbx = end of the target
+    mov rsi, r13
+    call py_ws
+    call py_identlen
+    test ecx, ecx
+    jz .augsub
+    lea rax, [rsi+rcx]
+.ab:
+    cmp byte [rax], ' '
+    jne .ab2
+    inc rax
+    jmp .ab
+.ab2:
+    cmp rax, rbx
+    jne .augsub
+    mov rbp, rsi                    ; a plain name
+    mov r13d, ecx
+    mov qword [PYV_LEND], 0
+    call py_postfix
+    push rax
+    lea rsi, [r14+1]
+    call py_exprlist
+    pop rdx
+    mov r8d, r15d
+    call py_binop
+    mov rdi, rbp
+    mov ecx, r13d
+    call py_setvar
+    jmp .sdone
+.augsub:
+    mov rsi, r13
+    mov qword [PYV_LEND], 0
+    call py_postfix
+    cmp qword [PYV_SUBV], 1
+    jne .stray
+    push qword [PYV_SUBB]
+    push qword [PYV_SUBI]
+    push rax
+    lea rsi, [r14+1]
+    call py_exprlist
+    pop rdx
+    mov r8d, r15d
+    call py_binop
+    pop rcx
+    pop rdx
+    call py_setitem
+    jmp .sdone
+.eonly:
+    mov rsi, r13
+    call py_exprlist
+    cmp qword [PYV_REPL], 0
+    je .sdone
+    cmp qword [PYV_FDEPTH], 0
+    jne .sdone
+    cmp eax, PY_NONE
+    je .sdone
+    push rsi
+    mov edx, 1
+    call py_putval
+    mov al, 10
+    call py_out
+    pop rsi
+    jmp .sdone
+
+; ---- helpers for statements ------------------------------------------------------------------------------------------------
+py_colon:
+    call py_ws
+    cmp byte [rsi], ':'
+    jne .bad
+    inc rsi
+    ret
+.bad:
+    PERR pe_syntax
+
+py_isid:                            ; al -> CF=1 when it can be part of an identifier
+    cmp al, '_'
+    je .y
+    cmp al, 0x80
+    jae .y
+    cmp al, '0'
+    jb .n
+    cmp al, '9'
+    jbe .y
+    or al, 0x20
+    cmp al, 'a'
+    jb .n
+    cmp al, 'z'
+    ja .n
+.y: stc
+    ret
+.n: clc
+    ret
+
+py_findin:                          ; rsi = start of the loop targets -> rax = position of the 'in' keyword
+    push rbx
+    push rcx
+    push rsi
+    xor ebx, ebx
+.l: movzx eax, byte [rsi]
+    test al, al
+    jz .bad
+    cmp al, 10
+    je .bad
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    test ebx, ebx
+    jnz .n
+    cmp al, 'i'
+    jne .n
+    cmp byte [rsi+1], 'n'
+    jne .n
+    mov al, [rsi-1]
+    call py_isid
+    jc .n
+    mov al, [rsi+2]
+    call py_isid
+    jc .n
+    mov rax, rsi
+    jmp .r
+.o: inc ebx
+    jmp .n
+.c: dec ebx
+.n: inc rsi
+    jmp .l
+.q: call py_skipstr
+    jmp .l
+.bad:
+    pop rsi
+    PERR pe_syntax
+.r: pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; scan a simple statement for '=': eax = 0 none, 1 plain assignment, 2 augmented ('=' at rdx, ecx = operator char)
+; rsi is preserved
+py_find_assign:
+    push rsi
+    push rbx
+    xor ebx, ebx
+.l: movzx eax, byte [rsi]
+    test al, al
+    jz .none
+    cmp al, 10
+    je .nl
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, '{'
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    cmp al, '}'
+    je .c
+    test ebx, ebx
+    jnz .n
+    cmp al, '#'
+    je .none
+    cmp al, ';'
+    je .none
+    cmp al, '='
+    jne .n
+    cmp byte [rsi+1], '='
+    jne .one
+    add rsi, 2
+    jmp .l
+.one:
+    movzx ecx, byte [rsi-1]
+    cmp cl, '<'
+    je .n
+    cmp cl, '>'
+    je .n
+    cmp cl, '!'
+    je .n
+    cmp cl, ':'
+    je .n
+    cmp cl, '+'
+    je .aug
+    cmp cl, '-'
+    je .aug
+    cmp cl, '%'
+    je .aug
+    cmp cl, '*'
+    je .star
+    cmp cl, '/'
+    je .slash
+    mov rdx, rsi
+    mov eax, 1
+    jmp .r
+.star:
+    cmp byte [rsi-2], '*'
+    jne .aug
+    mov ecx, '^'
+    jmp .aug
+.slash:
+    cmp byte [rsi-2], '/'
+    jne .aug
+    mov ecx, 'F'
+.aug:
+    mov rdx, rsi
+    mov eax, 2
+    jmp .r
+.o: inc ebx
+    jmp .n
+.c: test ebx, ebx
+    jz .n
+    dec ebx
+.n: inc rsi
+    jmp .l
+.nl:
+    test ebx, ebx
+    jz .none
+    jmp .n
+.q: call py_skipstr
+    jmp .l
+.none:
+    xor eax, eax
+.r: pop rbx
+    pop rsi
+    ret
+
+; matching close bracket: rsi at an opening bracket -> rax = position of its partner (0 when none on this line)
+py_matchclose:
+    push rbx
+    push rsi
+    xor ebx, ebx
+.l: movzx eax, byte [rsi]
+    test al, al
+    jz .no
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, '{'
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    cmp al, '}'
+    je .c
+.n: inc rsi
+    jmp .l
+.o: inc ebx
+    jmp .n
+.c: dec ebx
+    jnz .n
+    mov rax, rsi
+    jmp .r
+.q: call py_skipstr
+    jmp .l
+.no:
+    xor eax, eax
+.r: pop rsi
+    pop rbx
+    ret
+
+; end of one item of a target list: rsi = start, r13 = limit -> rax = position of the next top-level ',' or the limit
+py_tend:
+    push rbx
+    push rsi
+    xor ebx, ebx
+.l: cmp rsi, r13
+    jae .lim
+    movzx eax, byte [rsi]
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    test ebx, ebx
+    jnz .n
+    cmp al, ','
+    je .comma
+.n: inc rsi
+    jmp .l
+.o: inc ebx
+    jmp .n
+.c: dec ebx
+    jmp .n
+.q: call py_skipstr
+    jmp .l
+.lim:
+    mov rax, r13
+    jmp .r
+.comma:
+    mov rax, rsi
+.r: pop rsi
+    pop rbx
+    ret
+
+; ---- assignment to targets: names, items, tuples ----------------------------------------------------------------------
+; rsi = start of the target text, rax = value, [PYV_LEND] = end of the target
+py_assign:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rax
+    call py_ws
+    mov r13, [PYV_LEND]
+    mov al, [rsi]
+    cmp al, '('
+    je .br
+    cmp al, '['
+    je .br
+.nb:
+    call py_tend                    ; a top-level comma before the end?
+    cmp rax, r13
+    jb .bare
+    call py_assign1
+    jmp .out
+.bare:
+    xor ebx, ebx
+    jmp .unpack
+.br:
+    call py_matchclose
+    test rax, rax
+    jz .nb
+    lea rdx, [rax+1]
+.bw:
+    cmp byte [rdx], ' '
+    jne .bw2
+    inc rdx
+    jmp .bw
+.bw2:
+    cmp rdx, r13
+    jne .nb                         ; something follows the bracket: an item target like (x)[0]
+    mov r13, rax                    ; limit = the closing bracket
+    inc rsi
+    xor ebx, ebx
+.unpack:
+    ; items between rsi and r13
+.item:
+    call py_ws
+    cmp rsi, r13
+    jae .fin
+    call py_tend
+    mov r14, rax                    ; end of this item
+    mov rax, r12
+    mov ecx, ebx
+    call py_iter_get
+    jc .few
+    inc ebx
+    push qword [PYV_LEND]
+    mov [PYV_LEND], r14
+    push r13
+    call py_assign
+    pop r13
+    pop qword [PYV_LEND]
+    mov rsi, r14
+    cmp rsi, r13
+    jae .fin
+    cmp byte [rsi], ','
+    jne .fin
+    inc rsi
+    jmp .item
+.fin:
+    mov rax, r12
+    mov ecx, ebx
+    call py_iter_get
+    jnc .many
+    mov rsi, [PYV_LEND]
+    jmp .out
+.few:
+    PERR pe_few
+.many:
+    PERR pe_many
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+py_assign1:                         ; one target; rsi = start, r12 = value, r13 = end
+    call py_ws
+    call py_identlen
+    test ecx, ecx
+    jz .item
+    lea rax, [rsi+rcx]
+.b: cmp byte [rax], ' '
+    jne .b2
+    inc rax
+    jmp .b
+.b2:
+    cmp rax, r13
+    jb .item
+    mov rdi, rsi
+    mov rax, r12
+    push r13
+    call py_setvar
+    pop rsi
+    ret
+.item:
+    mov qword [PYV_SUBV], 0
+    call py_postfix
+    cmp qword [PYV_SUBV], 2
+    jne .bad
+    mov rdx, [PYV_SUBB]
+    mov rcx, [PYV_SUBI]
+    mov rax, r12
+    call py_setitem
+    mov rsi, r13
+    ret
+.bad:
+    PERR pe_target
+
+; del x[i]: rax = container, rcx = index
+py_delitem:
+    push rbx
+    push rsi
+    push rdi
+    mov rbx, rax
+    test bl, 3
+    jnz .bad
+    mov edx, [rbx]
+    cmp edx, 5
+    je .dict
+    cmp edx, 2
+    jne .bad
+    mov rax, rcx
+    call py_asint
+    jc .bad
+    mov rcx, rax
+    mov eax, [rbx+4]
+    test rcx, rcx
+    jns .p
+    add rcx, rax
+.p: test rcx, rcx
+    js .oob
+    cmp rcx, rax
+    jae .oob
+    mov rdi, [rbx+16]
+    lea rdi, [rdi+rcx*8]
+    lea rsi, [rdi+8]
+    mov rdx, rax
+    sub rdx, rcx
+    dec rdx
+    mov rcx, rdx
+    rep movsq
+    dec dword [rbx+4]
+    jmp .o
+.dict:
+    mov rax, rbx
+    call py_ddel
+    test eax, eax
+    jz .key
+.o: pop rdi
+    pop rsi
+    pop rbx
+    ret
+.bad:
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_noset
+.oob:
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_idx
+.key:
+    pop rdi
+    pop rsi
+    pop rbx
+    PERR pe_key
+
+; global x: the name x in a function refers to the global x
+py_declglobal:                      ; rdi = name, ecx = length
+    push rbx
+    push rdx
+    cmp qword [PYV_FDEPTH], 0
+    je .o
+    xor edx, edx
+    call py_lookup
+    test rax, rax
+    jz .none
+    cmp dword [rax+12], 0
+    jne .o                          ; already an alias
+    mov rbx, [PYV_NSYM]
+    cmp rbx, PY_MAXSYM
+    jae .many
+    mov rdx, rax
+    lea rax, [rbx+rbx*2]
+    lea rax, [PY_SYM+rax*8]
+    mov [rax], rdi
+    mov [rax+8], ecx
+    mov dword [rax+12], 1
+    mov [rax+16], rdx
+    inc rbx
+    mov [PYV_NSYM], rbx
+.o: pop rdx
+    pop rbx
+    ret
+.none:
+    pop rdx
+    pop rbx
+    PERR pe_gnone
+.many:
+    PERR pe_vars
+
+; raise: rdi = exception name, ecx = its length, rax = message object or 0
+py_raise:
+    push rsi
+    lea rdx, [PYV_EBUF]
+    mov rsi, rdi
+    cmp ecx, 60
+    jbe .c1
+    mov ecx, 60
+.c1:
+    rep movsb
+    test rax, rax
+    jz .end
+    mov byte [rdx], ':'
+    mov byte [rdx+1], ' '
+    add rdx, 2
+    push rdx
+    xor edx, edx
+    call py_tostr
+    pop rdx
+    mov ecx, [rax+4]
+    cmp ecx, 180
+    jbe .c2
+    mov ecx, 180
+.c2:
+    lea rsi, [rax+8]
+    mov rdi, rdx
+    rep movsb
+    mov rdx, rdi
+.end:
+    mov byte [rdx], 0
+    pop rsi
+    lea rdi, [PYV_EBUF]
+    jmp py_error
+
+; ---- try support -----------------------------------------------------------------------------------------------------
+py_protect:                         ; rsi = body (behind ':'), edx = header indent -> CF=1 when the body raised an error
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push qword [PYV_CATCH]
+    push qword [PYV_TRYFD]
+    push qword [PYV_TRYNS]
+    push qword [PYV_FBASE]
+    push qword [PYV_FDEPTH]
+    push qword [PYV_G0]
+    push qword [PYV_DEPTH]
+    push qword [PYV_SKIP]
+    push qword [PYV_NSYM]
+    mov [PYV_CATCH], rsp
+    mov rax, [PYV_FDEPTH]
+    mov [PYV_TRYFD], rax
+    mov qword [PYV_TRYNS], -1
+    call py_suite
+    pop rax                         ; saved NSYM: not needed after a good run
+    mov rdx, -1
+    xor r8d, r8d                    ; no error
+    jmp py_caught.restore
+py_caught:                          ; py_error lands here with rsp = the catch frame
+    mov rdx, [PYV_TRYNS]
+    pop rax
+    mov r8d, 1                      ; error
+.restore:
+    pop qword [PYV_SKIP]
+    pop qword [PYV_DEPTH]
+    pop qword [PYV_G0]
+    pop qword [PYV_FDEPTH]
+    pop qword [PYV_FBASE]
+    pop qword [PYV_TRYNS]
+    pop qword [PYV_TRYFD]
+    pop qword [PYV_CATCH]
+    cmp rdx, -1
+    je .k
+    mov [PYV_NSYM], rdx
+.k: test r8d, r8d
+    jz .good
+    mov qword [PYV_FLOW], 0
+    mov qword [PYV_LEND], 0
+.good:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    add r8d, -1                     ; CF = 1 when there was an error
+    ret
+
+; ---- except clauses: does the current error match? ----------------------------------------------------------------
+; rsi = behind 'except' (blanks skipped) -> eax = 1 when matched; rsi at the ':'.  'as name' binds the message.
+py_exc_match:
+    push rbx
+    push r12
+    xor r12d, r12d
+    call py_ws
+    cmp byte [rsi], '('
+    jne .one
+    inc rsi
+.lst:
+    call py_ws
+    call py_exc_one
+    or r12d, eax
+    call py_ws
+    cmp byte [rsi], ','
+    jne .cl
+    inc rsi
+    jmp .lst
+.cl:
+    cmp byte [rsi], ')'
+    jne .bad
+    inc rsi
+    jmp .as
+.one:
+    call py_exc_one
+    or r12d, eax
+.as:
+    call py_ws
+    lea rdi, [k_as]
+    call py_kw
+    jne .out
+    call py_ws
+    call py_identlen
+    test ecx, ecx
+    jz .bad
+    mov rdi, rsi
+    add rsi, rcx
+    test r12d, r12d
+    jz .out
+    push rsi
+    push rdi
+    push rcx
+    call py_errstr
+    pop rcx
+    pop rdi
+    call py_setvar
+    pop rsi
+.out:
+    mov eax, r12d
+    pop r12
+    pop rbx
+    ret
+.bad:
+    PERR pe_syntax
+
+py_exc_one:                         ; rsi at an exception name -> eax = 1 when it matches the current error; rsi behind it
+    push rbx
+    push rdx
+    push rdi
+    push r8
+    call py_identlen
+    test ecx, ecx
+    jz .bad
+    mov r8, rsi
+    add rsi, rcx
+    push rsi
+    ; Exception / BaseException catch everything
+    mov rsi, r8
+    lea rdi, [k_exception]
+    call py_kw
+    je .yes
+    mov rsi, r8
+    lea rdi, [k_baseexc]
+    call py_kw
+    je .yes
+    ; the type name of the error: the text before ':'
+    mov rdi, [PYV_ERRMSG]
+    xor edx, edx
+.t: mov al, [rdi+rdx]
+    test al, al
+    jz .tz
+    cmp al, ':'
+    je .tz
+    inc edx
+    jmp .t
+.tz:
+    cmp edx, ecx
+    jne .no
+    mov rsi, r8
+    mov ebx, ecx
+    call py_memeq
+    jne .no
+.yes:
+    mov eax, 1
+    jmp .o
+.no:
+    xor eax, eax
+.o: pop rsi
+    pop r8
+    pop rdi
+    pop rdx
+    pop rbx
+    ret
+.bad:
+    PERR pe_syntax
+
+py_errstr:                          ; -> rax = str object holding the text of the current error (behind "Name: ")
+    push rsi
+    push rcx
+    mov rsi, [PYV_ERRMSG]
+    mov rdi, rsi
+.f: mov al, [rdi]
+    test al, al
+    jz .nocolon
+    cmp al, ':'
+    je .colon
+    inc rdi
+    jmp .f
+.colon:
+    lea rsi, [rdi+1]
+    cmp byte [rsi], ' '
+    jne .len
+    inc rsi
+    jmp .len
+.nocolon:
+    mov rsi, [PYV_ERRMSG]
+.len:
+    xor ecx, ecx
+.l: cmp byte [rsi+rcx], 0
+    je .mk
+    inc ecx
+    jmp .l
+.mk:
+    call py_newstr
+    pop rcx
+    pop rsi
+    ret
+
+; ---- comprehensions ------------------------------------------------------------------------------------------------------------
+; rsi = start of an element expression -> rax = pointer to the 'for' that follows it at this bracket level, or 0
+py_has_for:
+    push rbx
+    push rsi
+    xor ebx, ebx
+.l: movzx eax, byte [rsi]
+    test al, al
+    jz .no
+    cmp al, '"'
+    je .q
+    cmp al, "'"
+    je .q
+    cmp al, '('
+    je .o
+    cmp al, '['
+    je .o
+    cmp al, '{'
+    je .o
+    cmp al, ')'
+    je .c
+    cmp al, ']'
+    je .c
+    cmp al, '}'
+    je .c
+    test ebx, ebx
+    jnz .n
+    cmp al, ','
+    je .no
+    cmp al, ';'
+    je .no
+    cmp al, '='
+    je .no
+    cmp al, 'f'
+    jne .n
+    cmp byte [rsi+1], 'o'
+    jne .n
+    cmp byte [rsi+2], 'r'
+    jne .n
+    mov al, [rsi+3]
+    cmp al, ' '
+    je .w
+    cmp al, 9
+    jne .n
+.w: mov al, [rsi-1]
+    call py_isid
+    jc .n
+    mov rax, rsi
+    jmp .r
+.o: inc ebx
+    jmp .n
+.c: test ebx, ebx
+    jz .no
+    dec ebx
+.n: inc rsi
+    jmp .l
+.q: call py_skipstr
+    jmp .l
+.no:
+    xor eax, eax
+.r: pop rsi
+    pop rbx
+    ret
+
+; rsi = element start, rdx = its 'for' -> rax = list, rsi = at the closing bracket
+py_comp:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rsi
+    mov rbp, rdx
+    mov rsi, rdx
+    inc qword [PYV_SKIP]
+    call py_comp_chain
+    dec qword [PYV_SKIP]
+    mov r13, rsi
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    mov ecx, 8
+    mov edx, 2
+    call py_newlist
+    mov r14, rax
+    mov rsi, rbp
+    call py_comp_chain
+    mov rsi, r13
+    mov rax, r14
+    jmp .o
+.sk:
+    mov eax, PY_NONE
+.o: pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; rsi at 'for'; r15 = element start, r14 = result list
+py_comp_chain:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    add rsi, 3
+    call py_ws
+    mov r12, rsi                    ; targets
+    call py_findin
+    mov r13, rax
+    lea rsi, [rax+2]
+    call py_or
+    mov rbx, rax                    ; iterable
+    cmp qword [PYV_SKIP], 0
+    jne .skip
+    mov rbp, rsi                    ; behind the iterable
+    push qword 0
+.it:
+    mov rax, rbx
+    mov rcx, [rsp]
+    call py_iter_get
+    jc .done
+    inc qword [rsp]
+    mov rsi, r12
+    push qword [PYV_LEND]
+    mov [PYV_LEND], r13
+    call py_assign
+    pop qword [PYV_LEND]
+    mov rsi, rbp
+    call py_comp_rest
+    jmp .it
+.done:
+    add rsp, 8
+    jmp .o
+.skip:
+    call py_comp_rest
+.o: pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+py_comp_rest:                       ; rsi behind the iterable / a condition: more clauses or the element
+.l: call py_ws
+    lea rdi, [k_if]
+    call py_kw
+    jne .nif
+    call py_or
+    cmp qword [PYV_SKIP], 0
+    jne .l
+    call py_truthy
+    jnz .l
+    ret
+.nif:
+    lea rdi, [k_for]
+    call py_kw
+    jne .elem
+    sub rsi, 3
+    jmp py_comp_chain
+.elem:
+    cmp qword [PYV_SKIP], 0
+    jne .r
+    push rsi
+    mov rsi, r15
+    call py_expr
+    mov rdx, rax
+    mov rax, r14
+    call py_lappend
+    pop rsi
+.r: ret
+
+; ---- running programs ------------------------------------------------------------------------------------------------------
+; py_init: forget everything (heap, variables, functions)
+py_init:
+    push rdi
+    push rcx
+    push rax
+    lea rdi, [PYV]
+    mov ecx, 0x2000/8
+    xor eax, eax
+    rep stosq
+    lea rdi, [PY_CHR]
+    mov ecx, 256
+    rep stosq
+    lea rax, [PY_HEAP]
+    mov [PYV_HP], rax
+    lea rax, [PY_SB]
+    mov [PYV_SBP], rax
+    lea rax, [PY_VS]
+    mov [PYV_VSP], rax
+    mov qword [PYV_INITED], 1
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+; py_exec: rdi = program text (NUL terminated), esi = 1 echo expression results (REPL)
+;          -> eax = 0 ok, 1 error (PYV_ERRMSG, PYV_ERRPOS), 2 = SystemExit/exit()
+; The text is copied into the interpreter heap, so functions defined here stay usable in later calls.
+py_exec:
+    push rbx
+    push rbp
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp qword [PYV_INITED], 0
+    jne .have
+    push rsi
+    push rdi
+    call py_init
+    pop rdi
+    pop rsi
+.have:
+    mov [PYV_REPL], rsi
+    mov [PYV_OLDSP], rsp
+    mov rsp, PY_STKTOP
+    mov [PYV_SP0], rsp
+    ; copy the text into the heap
+    mov rsi, rdi
+    xor ecx, ecx
+.len:
+    cmp byte [rsi+rcx], 0
+    je .cp
+    inc ecx
+    jmp .len
+.cp:
+    mov r12d, ecx
+    lea ecx, [rcx+2]
+    call py_alloc
+    mov rdi, rax
+    mov [PYV_SRC0], rax
+    mov [PYV_SRC], rax
+    mov ecx, r12d
+    rep movsb
+    mov byte [rdi], 0
+    mov rsi, [PYV_SRC0]
+    mov qword [PYV_ERRMSG], 0
+    mov qword [PYV_FLOW], 0
+    mov qword [PYV_SKIP], 0
+    mov qword [PYV_DEPTH], 0
+    mov qword [PYV_FDEPTH], 0
+    mov qword [PYV_FBASE], 0
+    mov qword [PYV_NKW], 0
+    mov qword [PYV_KWB], 0
+    mov qword [PYV_CATCH], 0
+    mov qword [PYV_LEND], 0
+    mov qword [PYV_CAP], 0
+    lea rax, [PY_VS]
+    mov [PYV_VSP], rax
+    lea rax, [PY_SB]
+    mov [PYV_SBP], rax
+.prog:
+    call py_nextline
+    cmp ecx, -1
+    je .ok
+    test ecx, ecx
+    jnz .badind
+    mov rsi, rdx
+    xor edx, edx
+    call py_stmt
+    jmp .prog
+.badind:
+    mov rsi, rdx
+    PERR pe_indent
+.ok:
+    mov rsp, [PYV_OLDSP]
+    xor eax, eax
+    jmp py_exit_err.leave
+py_exit_err:
+    mov rsp, [PYV_OLDSP]
+    mov eax, 1
+    mov rdi, [PYV_ERRMSG]
+    test rdi, rdi
+    jz .leave
+    cmp dword [rdi], 'Syst'
+    jne .leave
+    cmp dword [rdi+4], 'emEx'
+    jne .leave
+    mov eax, 2
+.leave:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbp
+    pop rbx
+    ret
+
+; line number (1-based) of the error position -> eax
+py_errline:
+    push rsi
+    push rcx
+    mov rsi, [PYV_SRC0]
+    mov rcx, [PYV_ERRPOS]
+    mov eax, 1
+    test rsi, rsi
+    jz .o
+    test rcx, rcx
+    jz .o
+.l: cmp rsi, rcx
+    jae .o
+    cmp byte [rsi], 10
+    jne .n
+    inc eax
+.n: inc rsi
+    jmp .l
+.o: pop rcx
+    pop rsi
+    ret
+
+; ---- text ------------------------------------------------------------------------------------------------------------------
+
+; ---- end py4.inc
+; ---- begin py5.inc
+; =============================================================================
+;  Python subset interpreter - part 5: calls, user functions, lambda, builtin functions
+;  Builtin handlers: rdx = argv (qwords on PY_VS), ecx = argc -> rax.  They may clobber every register.
+; =============================================================================
+%macro BI 2
+    db %1, 0
+    dq %2
+%endmacro
+
+; ---- arguments -------------------------------------------------------------------------------------------------
+py_args:                            ; rsi behind '(' -> eax = number of positional arguments (on PY_VS), rsi behind ')'
+    push rbx
+    push r12
+    push r13
+    xor ebx, ebx
+    inc qword [PYV_DEPTH]
+.l: call py_ws
+    cmp byte [rsi], ')'
+    je .end
+    call py_identlen
+    test ecx, ecx
+    jz .pos
+    lea rdi, [rsi+rcx]
+.k1:
+    cmp byte [rdi], ' '
+    jne .k2
+    inc rdi
+    jmp .k1
+.k2:
+    cmp byte [rdi], '='
+    jne .pos
+    cmp byte [rdi+1], '='
+    je .pos
+    mov r12, rsi                    ; keyword argument
+    mov r13d, ecx
+    lea rsi, [rdi+1]
+    call py_expr
+    cmp qword [PYV_SKIP], 0
+    jne .cm
+    mov rdx, [PYV_NKW]
+    cmp rdx, PY_MAXKW
+    jae .kfull
+    lea rcx, [rdx+rdx*2]
+    lea rcx, [PYV_KWT+rcx*8]
+    mov [rcx], r12
+    mov [rcx+8], r13
+    mov [rcx+16], rax
+    inc rdx
+    mov [PYV_NKW], rdx
+    jmp .cm
+.pos:
+    call py_has_for                 ; f(x for x in y)
+    test rax, rax
+    jz .p2
+    mov rdx, rax
+    call py_comp
+    jmp .app
+.p2:
+    call py_expr
+.app:
+    cmp qword [PYV_SKIP], 0
+    jne .cm
+    mov rdx, [PYV_VSP]
+    cmp rdx, PY_VSEND-8
+    jae .full
+    mov [rdx], rax
+    add rdx, 8
+    mov [PYV_VSP], rdx
+    inc ebx
+.cm:
+    call py_ws
+    cmp byte [rsi], ','
+    jne .l2
+    inc rsi
+    jmp .l
+.l2:
+    cmp byte [rsi], ')'
+    jne .bad
+.end:
+    inc rsi
+    dec qword [PYV_DEPTH]
+    mov eax, ebx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.kfull:
+    PERR pe_kwmany
+.full:
+    PERR pe_vsfull
+.bad:
+    PERR pe_syntax
+
+py_kwget:                           ; rdi = NUL terminated keyword name -> rax = value or 0
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    xor ecx, ecx
+.n: cmp byte [rdi+rcx], 0
+    je .e
+    inc ecx
+    jmp .n
+.e: mov rbx, [PYV_KWB]
+.l: cmp rbx, [PYV_NKW]
+    jae .no
+    lea rdx, [rbx+rbx*2]
+    lea rdx, [PYV_KWT+rdx*8]
+    cmp [rdx+8], rcx
+    jne .nx
+    mov rsi, [rdx]
+    call py_memeq
+    jne .nx
+    mov rax, [rdx+16]
+    jmp .o
+.nx:
+    inc rbx
+    jmp .l
+.no:
+    xor eax, eax
+.o: pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- call by name -----------------------------------------------------------------------------------------
+py_docall:                          ; rdi = name, ecx = length, rsi behind '(' -> rax = result
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13d, ecx
+    push qword [PYV_KWB]
+    mov rax, [PYV_NKW]
+    mov [PYV_KWB], rax
+    mov r14, [PYV_VSP]
+    call py_args
+    mov r15d, eax
+    mov eax, PY_NONE
+    cmp qword [PYV_SKIP], 0
+    jne .done
+    push rsi
+    push r14
+    mov rdi, r12
+    mov ecx, r13d
+    xor edx, edx
+    call py_lookup
+    test rax, rax
+    jz .nov
+    cmp dword [rax+12], 0
+    je .v1
+    mov rax, [rax+16]
+.v1:
+    mov rax, [rax+16]
+    test al, 3
+    jnz .notcall
+    mov edx, [rax]
+    cmp edx, 6
+    jb .notcall
+    cmp edx, 8
+    ja .notcall
+    mov rdx, r14
+    mov ecx, r15d
+    call py_callval
+    jmp .fin
+.nov:
+    mov rdi, r12
+    mov ecx, r13d
+    call py_fnfind
+    test rax, rax
+    jz .nofn
+    mov rdi, rax
+    mov r8, r14
+    mov r9d, r15d
+    call py_callfn
+    jmp .fin
+.nofn:
+    mov rdi, r12
+    mov ecx, r13d
+    call py_bfind
+    test rax, rax
+    jz .undef
+    mov rdx, r14
+    mov ecx, r15d
+    call [rax]
+.fin:
+    pop r14
+    pop rsi
+.done:
+    mov [PYV_VSP], r14
+    mov rcx, [PYV_KWB]
+    mov [PYV_NKW], rcx
+    pop qword [PYV_KWB]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.undef:
+    mov rdi, r12
+    mov ecx, r13d
+    jmp py_nameerr
+.notcall:
+    PERR pe_notcall
+
+; call a function value: rdx = callee, rsi behind '('  (used for f(1)(2), d["k"](x))
+py_callv:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdx
+    push qword [PYV_KWB]
+    mov rax, [PYV_NKW]
+    mov [PYV_KWB], rax
+    mov r14, [PYV_VSP]
+    call py_args
+    mov r15d, eax
+    mov eax, PY_NONE
+    cmp qword [PYV_SKIP], 0
+    jne .done
+    mov rax, r12
+    test al, 3
+    jnz .notcall
+    mov edx, [rax]
+    cmp edx, 6
+    jb .notcall
+    cmp edx, 8
+    ja .notcall
+    push rsi
+    push r14
+    mov rdx, r14
+    mov ecx, r15d
+    call py_callval
+    pop r14
+    pop rsi
+.done:
+    mov [PYV_VSP], r14
+    mov rcx, [PYV_KWB]
+    mov [PYV_NKW], rcx
+    pop qword [PYV_KWB]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.notcall:
+    PERR pe_notcall
+
+; rax = function object (6 def, 7 builtin, 8 lambda), rdx = argv, ecx = argc -> rax
+py_callval:
+    mov edi, [rax]
+    cmp edi, 6
+    je .user
+    cmp edi, 7
+    je .bi
+    jmp py_calllambda
+.user:
+    mov rdi, [rax+8]
+    mov r8, rdx
+    mov r9d, ecx
+    jmp py_callfn
+.bi:
+    mov rax, [rax+8]
+    jmp [rax]
+
+; call a function value with arguments given in a small array (used by sorted/map/filter ...)
+py_call1:                           ; rax = function object, rdx = single argument -> rax
+    push rsi
+    push r14
+    mov rcx, [PYV_VSP]
+    cmp rcx, PY_VSEND-16
+    jae .full
+    mov [rcx], rdx
+    lea r14, [rcx+8]
+    mov [PYV_VSP], r14
+    mov rdx, rcx
+    mov ecx, 1
+    push qword [PYV_KWB]
+    mov rdi, [PYV_NKW]
+    mov [PYV_KWB], rdi
+    mov rdi, rdx
+    push rdi
+    call py_callval
+    pop rdi
+    mov [PYV_VSP], rdi
+    pop qword [PYV_KWB]
+    pop r14
+    pop rsi
+    ret
+.full:
+    PERR pe_vsfull
+
+; ---- user functions -----------------------------------------------------------------------------------------------
+py_callfn:                          ; rdi = function entry, r8 = argv, r9d = argc -> rax
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rsi
+    mov r12, rdi
+    mov r13, r8
+    mov r14d, r9d
+    mov rax, [PYV_FDEPTH]
+    cmp rax, PY_MAXDEPTH
+    jae .rec
+    push qword [PYV_FBASE]
+    push qword [PYV_NSYM]
+    push qword [PYV_FDEPTH]
+    push qword [PYV_G0]
+    push qword [PYV_DEPTH]
+    push qword [PYV_LEND]
+    cmp qword [PYV_CATCH], 0
+    je .nt
+    mov rax, [PYV_FDEPTH]
+    cmp rax, [PYV_TRYFD]
+    jne .nt
+    mov rax, [PYV_NSYM]
+    mov [PYV_TRYNS], rax
+.nt:
+    cmp qword [PYV_FDEPTH], 0
+    jne .nest
+    mov rax, [PYV_NSYM]
+    mov [PYV_G0], rax
+.nest:
+    inc qword [PYV_FDEPTH]
+    mov rax, [PYV_NSYM]
+    mov [PYV_FBASE], rax
+    mov qword [PYV_DEPTH], 1
+    mov qword [PYV_LEND], 0
+    mov rsi, [r12+16]
+    xor ebp, ebp
+.p: call py_ws
+    cmp byte [rsi], ')'
+    je .pend
+    call py_identlen
+    test ecx, ecx
+    jz .badp
+    mov rbx, rsi
+    mov r15d, ecx
+    add rsi, rcx
+    xor eax, eax
+    cmp ebp, r14d
+    jae .nopos
+    mov rax, [r13+rbp*8]
+.nopos:
+    test rax, rax
+    jnz .have
+    mov rdx, [PYV_KWB]
+.kl:
+    cmp rdx, [PYV_NKW]
+    jae .have
+    lea r8, [rdx+rdx*2]
+    lea r8, [PYV_KWT+r8*8]
+    cmp [r8+8], r15
+    jne .kn
+    push rsi
+    mov rsi, [r8]
+    mov rdi, rbx
+    mov ecx, r15d
+    call py_memeq
+    pop rsi
+    jne .kn
+    mov rax, [r8+16]
+    jmp .have
+.kn:
+    inc rdx
+    jmp .kl
+.have:
+    push rax
+    call py_ws
+    cmp byte [rsi], '='
+    jne .nodef
+    inc rsi
+    pop rax
+    test rax, rax
+    jnz .skipdef
+    call py_expr
+    jmp .bind
+.skipdef:
+    push rax
+    inc qword [PYV_SKIP]
+    call py_expr
+    dec qword [PYV_SKIP]
+    pop rax
+    jmp .bind
+.nodef:
+    pop rax
+    test rax, rax
+    jz .missing
+.bind:
+    mov rdi, rbx
+    mov ecx, r15d
+    call py_setvar
+    inc ebp
+    call py_ws
+    cmp byte [rsi], ','
+    jne .p
+    inc rsi
+    jmp .p
+.pend:
+    cmp r14d, ebp
+    ja .toomany
+    mov rsi, [r12+24]
+    mov qword [PYV_DEPTH], 0
+    mov edx, [r12+12]
+    call py_suite
+    mov eax, PY_NONE
+    cmp qword [PYV_FLOW], 3
+    jne .nr
+    mov rax, [PYV_RET]
+.nr:
+    mov qword [PYV_FLOW], 0
+    mov qword [PYV_RET], 0
+    pop qword [PYV_LEND]
+    pop qword [PYV_DEPTH]
+    pop qword [PYV_G0]
+    pop qword [PYV_FDEPTH]
+    pop qword [PYV_NSYM]
+    pop qword [PYV_FBASE]
+    cmp qword [PYV_CATCH], 0
+    je .o2
+    mov rcx, [PYV_FDEPTH]
+    cmp rcx, [PYV_TRYFD]
+    jne .o2
+    mov qword [PYV_TRYNS], -1
+.o2:
+    pop rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.rec:
+    PERR pe_rec
+.badp:
+    PERR pe_syntax
+.missing:
+    PERR pe_missing
+.toomany:
+    PERR pe_toomany
+
+; ---- lambda ---------------------------------------------------------------------------------------------------------
+py_lambda:                          ; rsi behind 'lambda' -> rax = function object (type 8), rsi behind the body
+    push rbx
+    push r12
+    mov r12, rsi                    ; parameters
+    call py_skiphdr                 ; behind ':'  (parameters hold no colon)
+    mov rbx, rsi                    ; body
+    inc qword [PYV_SKIP]
+    call py_expr
+    dec qword [PYV_SKIP]
+    cmp qword [PYV_SKIP], 0
+    jne .sk
+    push rsi
+    mov ecx, 24
+    call py_alloc
+    pop rsi
+    mov dword [rax], 8
+    mov dword [rax+4], 1
+    mov [rax+8], r12
+    mov [rax+16], rbx
+    jmp .o
+.sk:
+    mov eax, PY_NONE
+.o: pop r12
+    pop rbx
+    ret
+
+py_calllambda:                      ; rax = lambda object, rdx = argv, ecx = argc -> rax
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rsi
+    mov r12, rax
+    mov r13, rdx
+    mov r14d, ecx
+    mov rax, [PYV_FDEPTH]
+    cmp rax, PY_MAXDEPTH
+    jae .rec
+    push qword [PYV_FBASE]
+    push qword [PYV_NSYM]
+    push qword [PYV_FDEPTH]
+    push qword [PYV_G0]
+    push qword [PYV_DEPTH]
+    push qword [PYV_LEND]
+    cmp qword [PYV_CATCH], 0
+    je .nt
+    mov rax, [PYV_FDEPTH]
+    cmp rax, [PYV_TRYFD]
+    jne .nt
+    mov rax, [PYV_NSYM]
+    mov [PYV_TRYNS], rax
+.nt:
+    cmp qword [PYV_FDEPTH], 0
+    jne .nest
+    mov rax, [PYV_NSYM]
+    mov [PYV_G0], rax
+.nest:
+    inc qword [PYV_FDEPTH]
+    mov rax, [PYV_NSYM]
+    mov [PYV_FBASE], rax
+    mov qword [PYV_DEPTH], 0
+    mov qword [PYV_LEND], 0
+    mov rsi, [r12+8]
+    xor ebp, ebp
+.p: call py_ws
+    cmp byte [rsi], ':'
+    je .pend
+    call py_identlen
+    test ecx, ecx
+    jz .bad
+    mov rbx, rsi
+    mov r15d, ecx
+    add rsi, rcx
+    cmp ebp, r14d
+    jae .missing
+    mov rax, [r13+rbp*8]
+    mov rdi, rbx
+    mov ecx, r15d
+    call py_setvar
+    inc ebp
+    call py_ws
+    cmp byte [rsi], ','
+    jne .p
+    inc rsi
+    jmp .p
+.pend:
+    cmp r14d, ebp
+    ja .toomany
+    mov rsi, [r12+16]
+    call py_expr
+    pop qword [PYV_LEND]
+    pop qword [PYV_DEPTH]
+    pop qword [PYV_G0]
+    pop qword [PYV_FDEPTH]
+    pop qword [PYV_NSYM]
+    pop qword [PYV_FBASE]
+    cmp qword [PYV_CATCH], 0
+    je .o2
+    mov rcx, [PYV_FDEPTH]
+    cmp rcx, [PYV_TRYFD]
+    jne .o2
+    mov qword [PYV_TRYNS], -1
+.o2:
+    pop rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.rec:
+    PERR pe_rec
+.bad:
+    PERR pe_syntax
+.missing:
+    PERR pe_missing
+.toomany:
+    PERR pe_toomany
+
+; ---- functions as values -----------------------------------------------------------------------------------------------
+py_mkfref:                          ; rdi = name, ecx = length -> rax = function object for a def or a builtin, else 0
+    push rdx
+    push r8
+    push r9
+    push rdi
+    push rcx
+    call py_fnfind
+    mov r9d, 6
+    test rax, rax
+    jnz .mk
+    mov rdi, [rsp+8]
+    mov ecx, [rsp]
+    call py_bfind
+    mov r9d, 7
+    test rax, rax
+    jz .no
+.mk:
+    mov r8, rax
+    mov ecx, 16
+    call py_alloc
+    mov [rax], r9d
+    mov dword [rax+4], 1
+    mov [rax+8], r8
+    jmp .o
+.no:
+    xor eax, eax
+.o: pop rcx
+    pop rdi
+    pop r9
+    pop r8
+    pop rdx
+    ret
+
+; builtin table lookup: rdi = name, ecx = length -> rax = address of the handler pointer, or 0 (rdi, ecx kept)
+py_bfind:
+    push rbx
+    push rsi
+    push rdx
+    mov rbx, rdi
+    mov edx, ecx
+    lea rsi, [py_btab]
+.l: cmp byte [rsi], 0
+    je .no
+    xor ecx, ecx
+.c: cmp byte [rsi+rcx], 0
+    je .e
+    inc ecx
+    jmp .c
+.e: cmp ecx, edx
+    jne .nx
+    push rsi
+    mov rdi, rbx
+    call py_memeq
+    pop rsi
+    je .yes
+.nx:
+    lea rsi, [rsi+rcx+9]
+    jmp .l
+.yes:
+    lea rax, [rsi+rcx+1]
+    jmp .o
+.no:
+    xor eax, eax
+.o: mov rdi, rbx
+    mov ecx, edx
+    pop rdx
+    pop rsi
+    pop rbx
+    ret
+
+; ---- helpers for builtins ------------------------------------------------------------------------------------------------
+py_argerr:
+    PERR pe_args
+
+py_needint:                         ; rax tagged -> rax raw (TypeError otherwise)
+    call py_asint
+    jc .bad
+    ret
+.bad:
+    PERR pe_needint
+
+py_bool:                            ; eax = 0/1 -> tagged bool
+    test eax, eax
+    mov eax, PY_FALSE
+    jz .r
+    mov eax, PY_TRUE
+.r: ret
+
+; a new list holding the items of any iterable: rax = iterable -> rax = list
+py_tolist:
+    push rbx
+    push rcx
+    push rdx
+    push r12
+    push r13
+    mov rbx, rax
+    mov ecx, 8
+    mov edx, 2
+    call py_newlist
+    mov r12, rax
+    xor r13d, r13d
+.l: mov rax, rbx
+    mov rcx, r13
+    call py_iter_get
+    jc .d
+    inc r13
+    mov rdx, rax
+    mov rax, r12
+    call py_lappend
+    jmp .l
+.d: mov rax, r12
+    pop r13
+    pop r12
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- builtin functions -------------------------------------------------------------------------------------------------------
+b_print:
+    mov r12, rdx
+    mov r13d, ecx
+    lea rdi, [s_sep]
+    call py_kwget
+    mov r14, rax
+    xor ebx, ebx
+.l: cmp ebx, r13d
+    jae .end
+    test ebx, ebx
+    jz .item
+    test r14, r14
+    jz .sp
+    cmp r14, PY_NONE
+    je .sp
+    mov rax, r14
+    xor edx, edx
+    call py_putval
+    jmp .item
+.sp:
+    mov al, ' '
+    call py_out
+.item:
+    mov rax, [r12+rbx*8]
+    xor edx, edx
+    call py_putval
+    inc ebx
+    jmp .l
+.end:
+    lea rdi, [s_end]
+    call py_kwget
+    test rax, rax
+    jz .nl
+    cmp rax, PY_NONE
+    je .nl
+    xor edx, edx
+    call py_putval
+    jmp .o
+.nl:
+    mov al, 10
+    call py_out
+.o: mov eax, PY_NONE
+    ret
+
+b_len:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    call py_len
+    jmp py_mkint
+
+b_str:
+    test ecx, ecx
+    jz .empty
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    xor edx, edx
+    jmp py_tostr
+.empty:
+    xor ecx, ecx
+    lea rsi, [PYV_NUMB]
+    jmp py_newstr
+
+b_repr:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    mov edx, 1
+    jmp py_tostr
+
+b_range:
+    cmp ecx, 1
+    jb py_argerr
+    cmp ecx, 3
+    ja py_argerr
+    mov r12, rdx
+    mov r13d, ecx
+    xor ebx, ebx                    ; start
+    mov r14d, 1                     ; step
+    mov rax, [r12]
+    call py_needint
+    mov r15, rax                    ; stop
+    cmp r13d, 1
+    je .mk
+    mov rbx, r15
+    mov rax, [r12+8]
+    call py_needint
+    mov r15, rax
+    cmp r13d, 3
+    jne .mk
+    mov rax, [r12+16]
+    call py_needint
+    mov r14, rax
+    test rax, rax
+    jz .zero
+.mk:
+    mov ecx, 32
+    call py_alloc
+    mov dword [rax], 3
+    mov [rax+8], rbx
+    mov [rax+16], r15
+    mov [rax+24], r14
+    ret
+.zero:
+    PERR pe_rzero
+
+b_int:
+    test ecx, ecx
+    jz .zero
+    mov r12, rdx
+    mov r13d, ecx
+    mov rax, [r12]
+    test al, 1
+    jnz .ret
+    cmp rax, PY_TRUE
+    je .one
+    cmp rax, PY_FALSE
+    je .zero
+    test al, 3
+    jnz .bad
+    cmp dword [rax], 1
+    jne .bad
+    mov r14d, 10
+    cmp r13d, 2
+    jb .parse
+    mov rax, [r12+8]
+    call py_needint
+    mov r14d, eax
+    cmp r14d, 2
+    jb .base
+    cmp r14d, 36
+    ja .base
+.parse:
+    mov rsi, [r12]
+    call py_parseint
+    jc .badlit
+    jmp py_mkint
+.ret:
+    ret
+.one:
+    mov eax, 5
+    ret
+.zero:
+    mov eax, 1
+    ret
+.bad:
+    PERR pe_intarg
+.badlit:
+    PERR pe_intlit
+.base:
+    PERR pe_base
+
+; rsi = str object, r14d = base -> rax = raw value, CF=1 when it is not a number
+py_parseint:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    mov ecx, [rsi+4]
+    lea rdi, [rsi+8]
+.sp:
+    test ecx, ecx
+    jz .bad
+    mov al, [rdi]
+    cmp al, ' '
+    je .s1
+    cmp al, 9
+    je .s1
+    cmp al, 10
+    jne .sg
+.s1:
+    inc rdi
+    dec ecx
+    jmp .sp
+.sg:
+    xor ebx, ebx                    ; negative
+    cmp al, '-'
+    jne .pl
+    mov ebx, 1
+    inc rdi
+    dec ecx
+    jmp .dg
+.pl:
+    cmp al, '+'
+    jne .dg
+    inc rdi
+    dec ecx
+.dg:
+    cmp r14d, 16
+    jne .nx
+    cmp ecx, 2
+    jb .nx
+    cmp byte [rdi], '0'
+    jne .nx
+    mov al, [rdi+1]
+    or al, 0x20
+    cmp al, 'x'
+    jne .nx
+    add rdi, 2
+    sub ecx, 2
+.nx:
+    test ecx, ecx
+    jz .bad
+    xor edx, edx                    ; value
+    xor esi, esi                    ; digits seen
+.d: test ecx, ecx
+    jz .end
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .tr
+    cmp al, 9
+    je .tr
+    cmp al, 10
+    je .tr
+    cmp al, '_'
+    je .us
+    cmp al, '9'
+    jbe .num
+    or al, 0x20
+    sub eax, 'a'-10
+    jmp .chk
+.num:
+    sub eax, '0'
+.chk:
+    cmp eax, r14d
+    jae .bad
+    imul rdx, r14
+    jo .bad
+    add rdx, rax
+    jo .bad
+    inc esi
+.us:
+    inc rdi
+    dec ecx
+    jmp .d
+.tr:
+    inc rdi                         ; only blanks may follow
+    dec ecx
+    jz .end
+    mov al, [rdi]
+    cmp al, ' '
+    je .tr
+    cmp al, 9
+    je .tr
+    cmp al, 10
+    je .tr
+    jmp .bad
+.end:
+    test esi, esi
+    jz .bad
+    mov rax, rdx
+    test ebx, ebx
+    jz .ok
+    neg rax
+.ok:
+    clc
+    jmp .o
+.bad:
+    stc
+.o: pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+b_abs:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    call py_needint
+    test rax, rax
+    jns .p
+    neg rax
+.p: jmp py_mkint
+
+b_input:
+    cmp ecx, 1
+    jb .go
+    mov rax, [rdx]
+    xor edx, edx
+    call py_putval
+.go:
+    call py_ext_input               ; -> rax = str object (no newline), or 0 at the end of the input
+    test rax, rax
+    jz .eof
+    ret
+.eof:
+    PERR pe_eof
+
+b_bool:
+    test ecx, ecx
+    jz .f
+    mov rax, [rdx]
+    call py_truthy
+    jmp py_bool
+.f: mov eax, PY_FALSE
+    ret
+
+b_chr:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    call py_needint
+    cmp rax, 0
+    jl .bad
+    cmp rax, 255
+    jbe .one
+    cmp rax, 0x10FFFF
+    ja .bad
+    lea rsi, [PYV_NUMB]             ; code points above 255 are written as UTF-8
+    cmp rax, 0x7FF
+    ja .three
+    mov edx, eax
+    shr eax, 6
+    or al, 0xC0
+    mov [rsi], al
+    and edx, 0x3F
+    or dl, 0x80
+    mov [rsi+1], dl
+    mov ecx, 2
+    jmp py_newstr
+.three:
+    cmp rax, 0xFFFF
+    ja .four
+    mov edx, eax
+    shr eax, 12
+    or al, 0xE0
+    mov [rsi], al
+    mov eax, edx
+    shr eax, 6
+    and al, 0x3F
+    or al, 0x80
+    mov [rsi+1], al
+    and edx, 0x3F
+    or dl, 0x80
+    mov [rsi+2], dl
+    mov ecx, 3
+    jmp py_newstr
+.four:
+    mov edx, eax
+    shr eax, 18
+    or al, 0xF0
+    mov [rsi], al
+    mov eax, edx
+    shr eax, 12
+    and al, 0x3F
+    or al, 0x80
+    mov [rsi+1], al
+    mov eax, edx
+    shr eax, 6
+    and al, 0x3F
+    or al, 0x80
+    mov [rsi+2], al
+    and edx, 0x3F
+    or dl, 0x80
+    mov [rsi+3], dl
+    mov ecx, 4
+    jmp py_newstr
+.one:
+    jmp py_chr1
+.bad:
+    PERR pe_chr
+
+b_ord:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    test al, 3
+    jnz .bad
+    cmp dword [rax], 1
+    jne .bad
+    mov ecx, [rax+4]
+    test ecx, ecx
+    jz .bad
+    movzx edx, byte [rax+8]
+    cmp edx, 0xC0
+    jb .one
+    cmp edx, 0xE0
+    jb .two
+    cmp edx, 0xF0
+    jb .three
+    and edx, 7
+    movzx esi, byte [rax+9]
+    and esi, 0x3F
+    shl edx, 6
+    or edx, esi
+    movzx esi, byte [rax+10]
+    and esi, 0x3F
+    shl edx, 6
+    or edx, esi
+    movzx esi, byte [rax+11]
+    and esi, 0x3F
+    shl edx, 6
+    or edx, esi
+    jmp .one
+.three:
+    and edx, 15
+    movzx esi, byte [rax+9]
+    and esi, 0x3F
+    shl edx, 6
+    or edx, esi
+    movzx esi, byte [rax+10]
+    and esi, 0x3F
+    shl edx, 6
+    or edx, esi
+    jmp .one
+.two:
+    and edx, 31
+    movzx esi, byte [rax+9]
+    and esi, 0x3F
+    shl edx, 6
+    or edx, esi
+.one:
+    mov eax, edx
+    jmp py_mkint
+.bad:
+    PERR pe_ord
+
+b_sum:
+    cmp ecx, 1
+    jb py_argerr
+    cmp ecx, 2
+    ja py_argerr
+    mov r12, rdx
+    mov r13d, ecx
+    mov ebx, 1                      ; start = 0
+    cmp r13d, 2
+    jne .st
+    mov rbx, [r12+8]
+.st:
+    xor r14d, r14d
+.l: mov rax, [r12]
+    mov rcx, r14
+    call py_iter_get
+    jc .d
+    inc r14
+    mov rdx, rbx
+    mov r8d, '+'
+    call py_binop
+    mov rbx, rax
+    jmp .l
+.d: mov rax, rbx
+    ret
+
+b_min:
+    mov r15d, -1
+    jmp py_minmax
+b_max:
+    mov r15d, 1
+py_minmax:                          ; r15d = 1 for max, -1 for min
+    test ecx, ecx
+    jz py_argerr
+    mov r12, rdx
+    mov r13d, ecx
+    lea rdi, [s_key]
+    call py_kwget
+    mov rbp, rax
+    cmp rbp, PY_NONE
+    jne .k1
+    xor ebp, ebp
+.k1:
+    cmp r13d, 1
+    jne .multi
+    mov rax, [r12]
+    call py_tolist
+    mov r12, [rax+16]
+    mov r13d, [rax+4]
+    test r13d, r13d
+    jz .empty
+.multi:
+    mov rbx, [r12]                  ; best item
+    mov rax, rbx
+    call py_keyof
+    push rax                        ; [rsp] = best key
+    mov r14d, 1
+.l: cmp r14d, r13d
+    jae .d
+    mov rax, [r12+r14*8]
+    push rax                        ; candidate
+    call py_keyof
+    mov rdx, rax
+    mov rax, [rsp+8]
+    push rdx
+    call py_cmp3                    ; rdx = candidate key, rax = best key -> order(candidate, best)
+    pop rdx
+    cmp r15d, 1
+    jne .min
+    cmp rax, 0
+    jle .nx
+    jmp .rep
+.min:
+    cmp rax, 0
+    jge .nx
+.rep:
+    mov [rsp+8], rdx
+    mov rbx, [rsp]
+.nx:
+    add rsp, 8
+    inc r14d
+    jmp .l
+.d: add rsp, 8
+    mov rax, rbx
+    ret
+.empty:
+    PERR pe_empty
+
+py_keyof:                           ; rax = item, rbp = key function or 0 -> rax = key
+    test rbp, rbp
+    jz .r
+    mov rdx, rax
+    mov rax, rbp
+    call py_call1
+.r: ret
+
+b_list:
+    test ecx, ecx
+    jz .empty
+    mov rax, [rdx]
+    jmp py_tolist
+.empty:
+    mov ecx, 4
+    mov edx, 2
+    jmp py_newlist
+
+b_tuple:
+    test ecx, ecx
+    jz .empty
+    mov rax, [rdx]
+    call py_tolist
+    mov dword [rax], 4
+    ret
+.empty:
+    mov ecx, 1
+    mov edx, 4
+    jmp py_newlist
+
+b_dict:
+    mov r12, rdx
+    mov r13d, ecx
+    call py_newdict
+    mov rbx, rax
+    test r13d, r13d
+    jz .kw
+    mov rax, [r12]
+    call py_tolist
+    mov r14, rax
+    xor r15d, r15d
+.l: cmp r15d, [r14+4]
+    jae .kw
+    mov rax, [r14+16]
+    mov rax, [rax+r15*8]
+    inc r15d
+    call py_tolist
+    cmp dword [rax+4], 2
+    jne .bad
+    mov rdx, [rax+16]
+    mov rcx, [rdx]
+    mov rdx, [rdx+8]
+    mov rax, rbx
+    call py_dset
+    jmp .l
+.kw:
+    mov r12, [PYV_KWB]
+.k: cmp r12, [PYV_NKW]
+    jae .o
+    lea rdx, [r12+r12*2]
+    lea rdx, [PYV_KWT+rdx*8]
+    push rdx
+    mov rsi, [rdx]
+    mov ecx, [rdx+8]
+    call py_newstr
+    pop rdx
+    mov rcx, rax
+    mov rdx, [rdx+16]
+    mov rax, rbx
+    call py_dset
+    inc r12
+    jmp .k
+.o: mov rax, rbx
+    ret
+.bad:
+    PERR pe_dictarg
+
+b_enumerate:
+    cmp ecx, 1
+    jb py_argerr
+    cmp ecx, 2
+    ja py_argerr
+    mov r12, rdx
+    xor ebx, ebx
+    cmp ecx, 2
+    jne .go
+    mov rax, [r12+8]
+    call py_needint
+    mov rbx, rax
+.go:
+    mov rax, [r12]
+    call py_tolist
+    mov r13, rax
+    mov ecx, [r13+4]
+    inc ecx
+    mov edx, 2
+    call py_newlist
+    mov r14, rax
+    xor r15d, r15d
+.l: cmp r15d, [r13+4]
+    jae .d
+    mov ecx, 2
+    mov edx, 4
+    call py_newlist
+    mov rbp, rax
+    lea rax, [rbx+r15]
+    call py_mkint
+    mov rdx, rax
+    mov rax, rbp
+    call py_lappend
+    mov rdx, [r13+16]
+    mov rdx, [rdx+r15*8]
+    mov rax, rbp
+    call py_lappend
+    mov rdx, rbp
+    mov rax, r14
+    call py_lappend
+    inc r15d
+    jmp .l
+.d: mov rax, r14
+    ret
+
+b_zip:
+    test ecx, ecx
+    jz .empty
+    mov r12, rdx
+    mov r13d, ecx
+    mov r15d, 0x7FFFFFFF
+    xor ebx, ebx
+.c: cmp ebx, r13d
+    jae .cd
+    mov rax, [r12+rbx*8]
+    call py_tolist
+    mov [r12+rbx*8], rax
+    mov edx, [rax+4]
+    cmp edx, r15d
+    jae .c1
+    mov r15d, edx
+.c1:
+    inc ebx
+    jmp .c
+.cd:
+    mov ecx, r15d
+    inc ecx
+    mov edx, 2
+    call py_newlist
+    mov r14, rax
+    xor ebx, ebx                    ; row
+.r: cmp ebx, r15d
+    jae .rd
+    mov ecx, r13d
+    mov edx, 4
+    call py_newlist
+    mov rbp, rax
+    xor ecx, ecx
+.cl:
+    cmp ecx, r13d
+    jae .cle
+    mov rax, [r12+rcx*8]
+    mov rax, [rax+16]
+    mov rdx, [rax+rbx*8]
+    mov rax, rbp
+    push rcx
+    call py_lappend
+    pop rcx
+    inc ecx
+    jmp .cl
+.cle:
+    mov rdx, rbp
+    mov rax, r14
+    call py_lappend
+    inc ebx
+    jmp .r
+.rd:
+    mov rax, r14
+    ret
+.empty:
+    mov ecx, 1
+    mov edx, 2
+    jmp py_newlist
+
+b_reversed:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    call py_tolist
+    mov r12, rax
+    mov r13d, [rax+4]
+    mov ecx, r13d
+    inc ecx
+    mov edx, 2
+    call py_newlist
+    mov r14, rax
+    mov ebx, r13d
+.l: test ebx, ebx
+    jz .d
+    dec ebx
+    mov rdx, [r12+16]
+    mov rdx, [rdx+rbx*8]
+    mov rax, r14
+    call py_lappend
+    jmp .l
+.d: mov rax, r14
+    ret
+
+b_any:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, [rdx]
+    xor r13d, r13d
+.l: mov rax, r12
+    mov rcx, r13
+    call py_iter_get
+    jc .no
+    inc r13
+    call py_truthy
+    jnz .yes
+    jmp .l
+.yes:
+    mov eax, PY_TRUE
+    ret
+.no:
+    mov eax, PY_FALSE
+    ret
+
+b_all:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, [rdx]
+    xor r13d, r13d
+.l: mov rax, r12
+    mov rcx, r13
+    call py_iter_get
+    jc .yes
+    inc r13
+    call py_truthy
+    jz .no
+    jmp .l
+.yes:
+    mov eax, PY_TRUE
+    ret
+.no:
+    mov eax, PY_FALSE
+    ret
+
+b_map:
+    cmp ecx, 2
+    jne py_argerr
+    mov r12, [rdx]
+    mov rax, [rdx+8]
+    call py_tolist
+    mov r13, rax
+    mov ecx, [r13+4]
+    inc ecx
+    mov edx, 2
+    call py_newlist
+    mov r14, rax
+    xor r15d, r15d
+.l: cmp r15d, [r13+4]
+    jae .d
+    mov rdx, [r13+16]
+    mov rdx, [rdx+r15*8]
+    mov rax, r12
+    call py_call1
+    mov rdx, rax
+    mov rax, r14
+    call py_lappend
+    inc r15d
+    jmp .l
+.d: mov rax, r14
+    ret
+
+b_filter:
+    cmp ecx, 2
+    jne py_argerr
+    mov r12, [rdx]
+    mov rax, [rdx+8]
+    call py_tolist
+    mov r13, rax
+    mov ecx, [r13+4]
+    inc ecx
+    mov edx, 2
+    call py_newlist
+    mov r14, rax
+    xor r15d, r15d
+.l: cmp r15d, [r13+4]
+    jae .d
+    mov rbx, [r13+16]
+    mov rbx, [rbx+r15*8]
+    inc r15d
+    mov rax, rbx
+    cmp r12, PY_NONE
+    je .t
+    mov rdx, rbx
+    mov rax, r12
+    call py_call1
+.t: call py_truthy
+    jz .l
+    mov rdx, rbx
+    mov rax, r14
+    call py_lappend
+    jmp .l
+.d: mov rax, r14
+    ret
+
+b_divmod:
+    cmp ecx, 2
+    jne py_argerr
+    mov r12, [rdx]
+    mov r13, [rdx+8]
+    mov ecx, 2
+    mov edx, 4
+    call py_newlist
+    mov r14, rax
+    mov rdx, r12
+    mov rax, r13
+    mov r8d, 'F'
+    call py_binop
+    mov rdx, rax
+    mov rax, r14
+    call py_lappend
+    mov rdx, r12
+    mov rax, r13
+    mov r8d, '%'
+    call py_binop
+    mov rdx, rax
+    mov rax, r14
+    jmp py_lappend
+
+b_pow:
+    cmp ecx, 2
+    jb py_argerr
+    cmp ecx, 3
+    ja py_argerr
+    mov r12, rdx
+    cmp ecx, 3
+    je .mod
+    mov rdx, [r12]
+    mov rax, [r12+8]
+    mov r8d, '^'
+    jmp py_binop
+.mod:
+    mov rax, [r12]
+    call py_needint
+    mov rbx, rax                    ; base
+    mov rax, [r12+8]
+    call py_needint
+    mov r14, rax                    ; exponent
+    mov rax, [r12+16]
+    call py_needint
+    mov r15, rax                    ; modulus
+    test r15, r15
+    jz .zero
+    test r14, r14
+    js .neg
+    mov rax, rbx
+    cqo
+    idiv r15
+    mov rbx, rdx
+    mov rax, 1
+    cqo
+    idiv r15
+    mov rbp, rdx
+.pl:
+    test r14, r14
+    jz .pd
+    test r14b, 1
+    jz .ps
+    mov rax, rbp
+    imul rax, rbx
+    jo .ovf
+    cqo
+    idiv r15
+    mov rbp, rdx
+.ps:
+    shr r14, 1
+    jz .pd
+    mov rax, rbx
+    imul rax, rbx
+    jo .ovf
+    cqo
+    idiv r15
+    mov rbx, rdx
+    jmp .pl
+.pd:
+    mov rax, rbp
+    jmp py_mkint
+.ovf:
+    PERR pe_big
+.zero:
+    PERR pe_zero
+.neg:
+    PERR pe_negp
+
+b_round:
+    cmp ecx, 1
+    jb py_argerr
+    mov rax, [rdx]
+    call py_needint
+    jmp py_mkint
+
+b_isinstance:
+    cmp ecx, 2
+    jne py_argerr
+    mov rax, [rdx]
+    mov r8, [rdx+8]
+    test r8b, 3
+    jnz py_argerr
+    cmp dword [r8], 4
+    jne .one
+    xor r9d, r9d
+.tl:
+    cmp r9d, [r8+4]
+    jae .no
+    mov rdx, [r8+16]
+    mov rdx, [rdx+r9*8]
+    push r8
+    push r9
+    push rax
+    call py_isinst
+    mov edx, eax
+    pop rax
+    pop r9
+    pop r8
+    test edx, edx
+    jnz .yes
+    inc r9d
+    jmp .tl
+.one:
+    mov rdx, r8
+    call py_isinst
+    jmp py_bool
+.yes:
+    mov eax, PY_TRUE
+    ret
+.no:
+    mov eax, PY_FALSE
+    ret
+
+py_isinst:                          ; rax = value, rdx = type object -> eax = 1/0
+    test dl, 3
+    jnz .no
+    cmp dword [rdx], 7
+    jne .no
+    mov rdx, [rdx+8]
+    mov rdx, [rdx]                  ; handler address
+    lea rcx, [b_int]
+    cmp rdx, rcx
+    jne .n1
+    test al, 1
+    jnz .yes
+    jmp .no
+.n1:
+    lea rcx, [b_bool]
+    cmp rdx, rcx
+    jne .n2
+    cmp rax, PY_TRUE
+    je .yes
+    cmp rax, PY_FALSE
+    je .yes
+    jmp .no
+.n2:
+    test al, 3
+    jnz .no
+    mov ecx, [rax]
+    lea r8, [b_str]
+    cmp rdx, r8
+    jne .n3
+    cmp ecx, 1
+    je .yes
+    jmp .no
+.n3:
+    lea r8, [b_list]
+    cmp rdx, r8
+    jne .n4
+    cmp ecx, 2
+    je .yes
+    jmp .no
+.n4:
+    lea r8, [b_tuple]
+    cmp rdx, r8
+    jne .n5
+    cmp ecx, 4
+    je .yes
+    jmp .no
+.n5:
+    lea r8, [b_dict]
+    cmp rdx, r8
+    jne .no
+    cmp ecx, 5
+    je .yes
+.no:
+    xor eax, eax
+    ret
+.yes:
+    mov eax, 1
+    ret
+
+b_hex:
+    mov r8d, 16
+    mov r10d, 'x'
+    jmp py_basefmt
+b_bin:
+    mov r8d, 2
+    mov r10d, 'b'
+    jmp py_basefmt
+b_oct:
+    mov r8d, 8
+    mov r10d, 'o'
+py_basefmt:                         ; r8d = base, r10d = prefix letter
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    call py_needint
+    mov r9, rax
+    xor r11d, r11d
+    test r9, r9
+    jns .p
+    neg r9
+    mov r11d, 1
+.p: lea rdi, [PYV_BUF+0xFF]
+.dv:
+    xor edx, edx
+    mov rax, r9
+    div r8
+    mov r9, rax
+    mov al, dl
+    cmp al, 10
+    jb .dg
+    add al, 'a'-10-'0'
+.dg:
+    add al, '0'
+    mov [rdi], al
+    dec rdi
+    test r9, r9
+    jnz .dv
+    mov [rdi], r10b
+    dec rdi
+    mov byte [rdi], '0'
+    dec rdi
+    test r11d, r11d
+    jz .go
+    mov byte [rdi], '-'
+    dec rdi
+.go:
+    inc rdi
+    lea rcx, [PYV_BUF+0x100]
+    sub rcx, rdi
+    mov rsi, rdi
+    jmp py_newstr
+
+b_exit:
+    lea rdi, [pe_exit]
+    xor esi, esi
+    jmp py_error
+
+b_sorted:
+    cmp ecx, 1
+    jne py_argerr
+    mov rax, [rdx]
+    call py_tolist
+    mov r12, rax
+    call py_sortlist
+    mov rax, r12
+    ret
+
+; sort the list in r12 in place; honours the key= and reverse= keywords
+py_sortlist:
+    push rbx
+    push rbp
+    push r13
+    push r14
+    push r15
+    lea rdi, [s_key]
+    call py_kwget
+    mov rbp, rax
+    cmp rbp, PY_NONE
+    jne .k1
+    xor ebp, ebp
+.k1:
+    lea rdi, [s_reverse]
+    call py_kwget
+    xor r15d, r15d
+    test rax, rax
+    jz .nr
+    call py_truthy
+    mov r15d, eax
+.nr:
+    mov r13d, [r12+4]               ; n
+    cmp r13d, 2
+    jb .out
+    mov ecx, r13d
+    shl ecx, 3
+    call py_alloc
+    mov r14, rax                    ; keys
+    xor ebx, ebx
+.kl:
+    cmp ebx, r13d
+    jae .kd
+    mov rax, [r12+16]
+    mov rax, [rax+rbx*8]
+    call py_keyof
+    mov [r14+rbx*8], rax
+    inc ebx
+    jmp .kl
+.kd:
+    mov ecx, r13d
+    shl ecx, 3
+    call py_alloc
+    mov rbx, rax                    ; index array
+    mov ecx, r13d
+    shl ecx, 3
+    call py_alloc
+    mov [PYV_T1], rax               ; scratch array
+    xor ecx, ecx
+.il:
+    mov [rbx+rcx*8], rcx
+    inc ecx
+    cmp ecx, r13d
+    jb .il
+    mov [PYV_T0], rbx               ; source of the current pass
+    mov dword [PYV_T3], 1           ; run width
+.w: mov eax, [PYV_T3]
+    cmp eax, r13d
+    jae .wd
+    xor esi, esi                    ; start of the left run
+.m: cmp esi, r13d
+    jae .mdone
+    mov eax, [PYV_T3]
+    lea edi, [rsi+rax]              ; mid
+    cmp edi, r13d
+    jbe .m1
+    mov edi, r13d
+.m1:
+    lea ecx, [rdi+rax]              ; end
+    cmp ecx, r13d
+    jbe .m2
+    mov ecx, r13d
+.m2:
+    mov r8d, esi                    ; a
+    mov r9d, edi                    ; b
+    mov r10d, esi                   ; out position
+    mov r11d, ecx                   ; end
+    push rsi
+    push rdi
+.mm:
+    cmp r10d, r11d
+    jae .mend
+    cmp r8d, edi
+    jae .tb
+    cmp r9d, r11d
+    jae .ta
+    mov rax, [PYV_T0]
+    mov rdx, [rax+r8*8]
+    mov rdx, [r14+rdx*8]            ; key of a
+    mov rcx, [rax+r9*8]
+    mov rax, [r14+rcx*8]            ; key of b
+    push r8
+    push r9
+    push r10
+    push r11
+    push rdi
+    call py_cmp3                    ; order(a, b)
+    pop rdi
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    test r15d, r15d
+    jz .asc
+    cmp rax, 0                      ; descending: take b only when a < b
+    jl .tb
+    jmp .ta
+.asc:
+    cmp rax, 0                      ; ascending: take b only when a > b (stable)
+    jg .tb
+.ta:
+    mov rax, [PYV_T0]
+    mov rax, [rax+r8*8]
+    inc r8d
+    jmp .put
+.tb:
+    mov rax, [PYV_T0]
+    mov rax, [rax+r9*8]
+    inc r9d
+.put:
+    mov rdx, [PYV_T1]
+    mov [rdx+r10*8], rax
+    inc r10d
+    jmp .mm
+.mend:
+    pop rdi
+    pop rsi
+    mov eax, [PYV_T3]
+    lea esi, [rsi+rax*2]
+    jmp .m
+.mdone:
+    mov rax, [PYV_T0]
+    mov rdx, [PYV_T1]
+    mov [PYV_T0], rdx
+    mov [PYV_T1], rax
+    shl dword [PYV_T3], 1
+    jmp .w
+.wd:
+    mov ecx, r13d
+    shl ecx, 3
+    call py_alloc
+    mov r8, rax
+    mov rbx, [PYV_T0]
+    xor ecx, ecx
+    mov rdi, [r12+16]
+.rb:
+    mov rax, [rbx+rcx*8]
+    mov rax, [rdi+rax*8]
+    mov [r8+rcx*8], rax
+    inc ecx
+    cmp ecx, r13d
+    jb .rb
+    mov [r12+16], r8
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop rbp
+    pop rbx
+    ret
+
+; ---- the table ---------------------------------------------------------------------------------------------------------------------------
+py_btab:
+    BI "print", b_print
+    BI "len", b_len
+    BI "str", b_str
+    BI "repr", b_repr
+    BI "range", b_range
+    BI "int", b_int
+    BI "abs", b_abs
+    BI "input", b_input
+    BI "bool", b_bool
+    BI "chr", b_chr
+    BI "ord", b_ord
+    BI "sum", b_sum
+    BI "min", b_min
+    BI "max", b_max
+    BI "list", b_list
+    BI "tuple", b_tuple
+    BI "dict", b_dict
+    BI "enumerate", b_enumerate
+    BI "zip", b_zip
+    BI "reversed", b_reversed
+    BI "any", b_any
+    BI "all", b_all
+    BI "map", b_map
+    BI "filter", b_filter
+    BI "divmod", b_divmod
+    BI "pow", b_pow
+    BI "round", b_round
+    BI "isinstance", b_isinstance
+    BI "hex", b_hex
+    BI "bin", b_bin
+    BI "oct", b_oct
+    BI "sorted", b_sorted
+    BI "exit", b_exit
+    BI "quit", b_exit
+    db 0
+
+
+; ---- end py5.inc
+; ---- begin py6.inc
+; =============================================================================
+;  Python subset interpreter - part 6: methods of str, list, tuple and dict
+;  Method handlers: rax = receiver, rdx = argv, ecx = argc -> rax.  They may clobber every register.
+; =============================================================================
+%macro MI 3
+    db %1, %2, 0
+    dq %3
+%endmacro
+MT_STR  equ 1
+MT_LIST equ 2
+MT_TUP  equ 4
+MT_DICT equ 5
+
+py_domethod:                        ; rax = receiver, rdi = name, ecx = length, rsi behind '(' -> rax
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13d, ecx
+    mov rbp, rax
+    push qword [PYV_KWB]
+    mov rax, [PYV_NKW]
+    mov [PYV_KWB], rax
+    mov r14, [PYV_VSP]
+    call py_args
+    mov r15d, eax
+    mov eax, PY_NONE
+    cmp qword [PYV_SKIP], 0
+    jne .done
+    test bpl, 3
+    jnz .nometh
+    mov ebx, [rbp]                  ; type of the receiver
+    lea rdi, [py_mtab]
+.l: movzx eax, byte [rdi]
+    test eax, eax
+    jz .nometh
+    xor ecx, ecx
+.c: cmp byte [rdi+rcx+1], 0
+    je .e
+    inc ecx
+    jmp .c
+.e: cmp eax, ebx
+    jne .nx
+    cmp ecx, r13d
+    jne .nx
+    push rdi
+    push rsi
+    mov rsi, r12
+    inc rdi
+    call py_memeq
+    pop rsi
+    pop rdi
+    je .found
+.nx:
+    lea rdi, [rdi+rcx+10]
+    jmp .l
+.found:
+    lea rax, [rdi+rcx+2]
+    push rsi
+    push r14
+    mov rdx, r14
+    mov ecx, r15d
+    mov rbx, [rax]
+    mov rax, rbp
+    call rbx
+    pop r14
+    pop rsi
+.done:
+    mov [PYV_VSP], r14
+    mov rcx, [PYV_KWB]
+    mov [PYV_NKW], rcx
+    pop qword [PYV_KWB]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.nometh:
+    PERR pe_nometh
+
+; ---- helpers --------------------------------------------------------------------------------------------------------------------------
+py_newstrbuf:                       ; ecx = length -> rax = str object, rdi = its first byte
+    push rcx
+    add ecx, 9
+    call py_alloc
+    pop rcx
+    mov dword [rax], 1
+    mov [rax+4], ecx
+    lea rdi, [rax+8]
+    ret
+
+py_isstr:                           ; rax -> ZF=1 when it is a str
+    test al, 3
+    jnz .n
+    cmp dword [rax], 1
+    ret
+.n: or al, 1
+    cmp al, 0                       ; ZF = 0
+    ret
+
+py_needstr:                         ; rax -> rax (error unless str)
+    call py_isstr
+    jne .bad
+    ret
+.bad:
+    PERR pe_needstr
+
+; substring search: rsi = haystack (str object), ecx = its length, rdi = needle bytes, edx = needle length, r8d = start
+; -> rax = index or -1
+py_find:
+    push rbx
+    push r9
+    add rsi, 8                      ; rsi was a str object
+    mov r9d, r8d
+.l: mov eax, ecx
+    sub eax, edx
+    cmp r9d, eax
+    jg .no
+    xor ebx, ebx
+.m: cmp ebx, edx
+    jae .yes
+    lea eax, [r9+rbx]
+    mov al, [rsi+rax]
+    cmp al, [rdi+rbx]
+    jne .nx
+    inc ebx
+    jmp .m
+.nx:
+    inc r9d
+    jmp .l
+.yes:
+    mov eax, r9d
+    jmp .o
+.no:
+    mov rax, -1
+.o: sub rsi, 8
+    pop r9
+    pop rbx
+    ret
+
+; ---- str: case ------------------------------------------------------------------------------------------------------------------------
+m_upper:
+    mov r8d, 1
+    jmp py_casemap
+m_lower:
+    mov r8d, 2
+    jmp py_casemap
+m_title:
+    mov r8d, 3
+    jmp py_casemap
+m_capitalize:
+    mov r8d, 4
+    jmp py_casemap
+m_swapcase:
+    mov r8d, 5
+py_casemap:                         ; r8d: 1 upper, 2 lower, 3 title, 4 capitalize, 5 swap
+    mov rsi, rax
+    mov ecx, [rax+4]
+    call py_newstrbuf
+    push rax
+    xor ecx, ecx
+    xor r9d, r9d                    ; previous char was a letter
+.l: cmp ecx, [rsi+4]
+    jae .d
+    movzx eax, byte [rsi+8+rcx]
+    mov r10d, eax
+    or r10d, 0x20
+    sub r10d, 'a'
+    cmp r10d, 25
+    ja .nl
+    ; a letter
+    cmp r8d, 1
+    je .up
+    cmp r8d, 2
+    je .lo
+    cmp r8d, 5
+    je .sw
+    cmp r8d, 3
+    je .ti
+    test ecx, ecx                   ; capitalize
+    jz .up
+    jmp .lo
+.ti:
+    test r9d, r9d
+    jz .up
+    jmp .lo
+.sw:
+    xor eax, 0x20
+    jmp .st
+.up:
+    and eax, 0xDF
+    jmp .st
+.lo:
+    or eax, 0x20
+.st:
+    mov r9d, 1
+    jmp .put
+.nl:
+    xor r9d, r9d
+.put:
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .l
+.d: pop rax
+    ret
+
+; ---- str: strip -------------------------------------------------------------------------------------------------------------------------
+m_strip:
+    mov r8d, 3
+    jmp py_strip
+m_lstrip:
+    mov r8d, 1
+    jmp py_strip
+m_rstrip:
+    mov r8d, 2
+py_strip:                           ; r8d: 1 left, 2 right
+    mov rsi, rax
+    xor r9d, r9d                    ; custom character set (str) or 0
+    test ecx, ecx
+    jz .go
+    mov r9, [rdx]
+    cmp r9, PY_NONE
+    jne .c
+    xor r9d, r9d
+    jmp .go
+.c: mov rax, r9
+    call py_needstr
+.go:
+    xor ebx, ebx                    ; start
+    mov r10d, [rsi+4]               ; end
+    test r8d, 1
+    jz .r
+.ls:
+    cmp ebx, r10d
+    jae .r
+    movzx eax, byte [rsi+8+rbx]
+    call py_instrip
+    jnz .r
+    inc ebx
+    jmp .ls
+.r: test r8d, 2
+    jz .mk
+.rs:
+    cmp r10d, ebx
+    jbe .mk
+    movzx eax, byte [rsi+7+r10]
+    call py_instrip
+    jnz .mk
+    dec r10d
+    jmp .rs
+.mk:
+    lea rcx, [r10]
+    sub ecx, ebx
+    lea rsi, [rsi+8+rbx]
+    jmp py_newstr
+
+py_instrip:                         ; al = char, r9 = set or 0 -> ZF=1 when it is to be stripped
+    test r9, r9
+    jnz .set
+    cmp al, ' '
+    je .y
+    cmp al, 9
+    je .y
+    cmp al, 10
+    je .y
+    cmp al, 13
+    je .y
+    cmp al, 11
+    je .y
+    cmp al, 12
+    je .y
+    or al, 1
+    cmp al, 0                       ; ZF = 0
+    ret
+.y: xor eax, eax
+    ret
+.set:
+    push rcx
+    mov ecx, [r9+4]
+    lea rdi, [r9+8]
+    repne scasb
+    pop rcx
+    ret                             ; ZF=1 when found
+
+; ---- str: split / join / replace --------------------------------------------------------------------------------------------------
+m_split:
+    mov r12, rax                    ; the string
+    mov r13, -1                     ; max splits
+    xor r14d, r14d                  ; separator
+    test ecx, ecx
+    jz .go
+    mov r14, [rdx]
+    cmp r14, PY_NONE
+    jne .sep
+    xor r14d, r14d
+    jmp .mx
+.sep:
+    mov rax, r14
+    call py_needstr
+.mx:
+    cmp ecx, 2
+    jb .go
+    mov rax, [rdx+8]
+    call py_needint
+    mov r13, rax
+.go:
+    mov ecx, 8
+    mov edx, 2
+    call py_newlist
+    mov r15, rax                    ; result
+    mov rsi, r12
+    test r14, r14
+    jz .ws
+    ; separator mode
+    cmp dword [r14+4], 0
+    je .empty
+    xor ebx, ebx                    ; start of the current piece
+.sl:
+    test r13, r13
+    jz .last
+    mov rsi, r12
+    mov ecx, [r12+4]
+    lea rdi, [r14+8]
+    mov edx, [r14+4]
+    mov r8d, ebx
+    call py_find
+    cmp rax, 0
+    jl .last
+    ; piece [ebx, eax)
+    push rax
+    lea rsi, [r12+8+rbx]
+    mov ecx, eax
+    sub ecx, ebx
+    call py_newstr
+    mov rdx, rax
+    mov rax, r15
+    call py_lappend
+    pop rax
+    mov ebx, eax
+    add ebx, [r14+4]
+    dec r13
+    jmp .sl
+.last:
+    lea rsi, [r12+8+rbx]
+    mov ecx, [r12+4]
+    sub ecx, ebx
+    call py_newstr
+    mov rdx, rax
+    mov rax, r15
+    call py_lappend
+    ret
+.empty:
+    PERR pe_emptysep
+.ws:
+    xor ebx, ebx
+.wl:
+    mov ecx, [r12+4]
+.sk:
+    cmp ebx, ecx
+    jae .wd
+    movzx eax, byte [r12+8+rbx]
+    cmp al, ' '
+    je .s1
+    cmp al, 9
+    je .s1
+    cmp al, 10
+    je .s1
+    cmp al, 13
+    jne .st
+.s1:
+    inc ebx
+    jmp .sk
+.st:
+    test r13, r13
+    jz .rest
+    mov r8d, ebx                    ; start of the word
+.we:
+    cmp ebx, ecx
+    jae .wend
+    movzx eax, byte [r12+8+rbx]
+    cmp al, ' '
+    je .wend
+    cmp al, 9
+    je .wend
+    cmp al, 10
+    je .wend
+    cmp al, 13
+    je .wend
+    inc ebx
+    jmp .we
+.wend:
+    lea rsi, [r12+8+r8]
+    mov ecx, ebx
+    sub ecx, r8d
+    call py_newstr
+    mov rdx, rax
+    mov rax, r15
+    call py_lappend
+    dec r13
+    jmp .wl
+.rest:
+    lea rsi, [r12+8+rbx]
+    sub ecx, ebx
+    call py_newstr
+    mov rdx, rax
+    mov rax, r15
+    call py_lappend
+.wd:
+    mov rax, r15
+    ret
+
+m_splitlines:
+    mov r12, rax
+    mov ecx, 8
+    mov edx, 2
+    call py_newlist
+    mov r15, rax
+    xor ebx, ebx                    ; start
+    xor r13d, r13d                  ; position
+.l: cmp r13d, [r12+4]
+    jae .end
+    cmp byte [r12+8+r13], 10
+    jne .n
+    lea rsi, [r12+8+rbx]
+    mov ecx, r13d
+    sub ecx, ebx
+    cmp ecx, 0
+    jle .e1
+    cmp byte [rsi+rcx-1], 13
+    jne .e1
+    dec ecx
+.e1:
+    call py_newstr
+    mov rdx, rax
+    mov rax, r15
+    call py_lappend
+    lea ebx, [r13+1]
+.n: inc r13d
+    jmp .l
+.end:
+    cmp ebx, [r12+4]
+    jae .o
+    lea rsi, [r12+8+rbx]
+    mov ecx, [r12+4]
+    sub ecx, ebx
+    call py_newstr
+    mov rdx, rax
+    mov rax, r15
+    call py_lappend
+.o: mov rax, r15
+    ret
+
+m_join:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax                    ; separator
+    mov rax, [rdx]
+    call py_tolist
+    mov r13, rax
+    mov r14d, [r13+4]
+    ; total length
+    xor ebx, ebx
+    xor ecx, ecx
+.t: cmp ecx, r14d
+    jae .td
+    mov rax, [r13+16]
+    mov rax, [rax+rcx*8]
+    call py_isstr
+    jne .bad
+    add ebx, [rax+4]
+    inc ecx
+    jmp .t
+.td:
+    test r14d, r14d
+    jz .z
+    lea eax, [r14-1]
+    imul eax, [r12+4]
+    add ebx, eax
+.z: mov ecx, ebx
+    call py_newstrbuf
+    mov r15, rax
+    xor ebx, ebx
+.c: cmp ebx, r14d
+    jae .o
+    test ebx, ebx
+    jz .it
+    mov ecx, [r12+4]
+    lea rsi, [r12+8]
+    rep movsb
+.it:
+    mov rax, [r13+16]
+    mov rax, [rax+rbx*8]
+    mov ecx, [rax+4]
+    lea rsi, [rax+8]
+    rep movsb
+    inc ebx
+    jmp .c
+.o: mov rax, r15
+    ret
+.bad:
+    PERR pe_joinstr
+
+m_replace:
+    cmp ecx, 2
+    jb py_argerr
+    cmp ecx, 3
+    ja py_argerr
+    mov r12, rax                    ; str
+    mov r13, [rdx]                  ; old
+    mov r14, [rdx+8]                ; new
+    mov r15, -1                     ; count
+    cmp ecx, 3
+    jne .c
+    mov rax, [rdx+16]
+    call py_needint
+    mov r15, rax
+.c: mov rax, r13
+    call py_needstr
+    mov rax, r14
+    call py_needstr
+    cmp dword [r13+4], 0
+    je .emp
+    ; pass 1: number of replacements
+    xor ebx, ebx                    ; position
+    xor ebp, ebp                    ; count found
+.p1:
+    mov rsi, r12
+    mov ecx, [r12+4]
+    lea rdi, [r13+8]
+    mov edx, [r13+4]
+    mov r8d, ebx
+    call py_find
+    cmp rax, 0
+    jl .p1d
+    test r15, r15
+    js .a1
+    cmp rbp, r15
+    jge .p1d
+.a1:
+    inc ebp
+    lea ebx, [rax+rdx]
+    jmp .p1
+.p1d:
+    mov ecx, [r12+4]
+    mov eax, [r14+4]
+    sub eax, [r13+4]
+    imul eax, ebp
+    add ecx, eax
+    call py_newstrbuf
+    push rax
+    ; pass 2
+    xor ebx, ebx
+    mov r9d, ebp                    ; replacements left
+.p2:
+    test r9d, r9d
+    jz .tail
+    mov rsi, r12
+    mov ecx, [r12+4]
+    push rdi
+    lea rdi, [r13+8]
+    mov edx, [r13+4]
+    mov r8d, ebx
+    call py_find
+    pop rdi
+    mov r10, rax
+    ; copy [ebx, r10)
+    lea rsi, [r12+8+rbx]
+    mov ecx, r10d
+    sub ecx, ebx
+    rep movsb
+    mov ecx, [r14+4]
+    lea rsi, [r14+8]
+    rep movsb
+    lea ebx, [r10+rdx]
+    mov edx, [r13+4]
+    mov ebx, r10d
+    add ebx, edx
+    dec r9d
+    jmp .p2
+.tail:
+    lea rsi, [r12+8+rbx]
+    mov ecx, [r12+4]
+    sub ecx, ebx
+    rep movsb
+    pop rax
+    ret
+.emp:
+    PERR pe_emptysep
+
+; ---- str: tests ------------------------------------------------------------------------------------------------------------------------
+m_startswith:
+    mov r8d, 1
+    jmp py_affix
+m_endswith:
+    mov r8d, 2
+py_affix:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax
+    mov rax, [rdx]
+    test al, 3
+    jnz .bad
+    cmp dword [rax], 4
+    je .tup
+    call py_needstr
+    call py_affix1
+    jmp py_bool
+.tup:
+    mov r13, rax
+    xor ebx, ebx
+.tl:
+    cmp ebx, [r13+4]
+    jae .no
+    mov rax, [r13+16]
+    mov rax, [rax+rbx*8]
+    call py_needstr
+    call py_affix1
+    test eax, eax
+    jnz .yes
+    inc ebx
+    jmp .tl
+.yes:
+    mov eax, PY_TRUE
+    ret
+.no:
+    mov eax, PY_FALSE
+    ret
+.bad:
+    PERR pe_needstr
+
+py_affix1:                          ; r12 = str, rax = prefix/suffix, r8d = 1 start / 2 end -> eax = 1/0
+    mov ecx, [rax+4]
+    cmp ecx, [r12+4]
+    ja .no
+    lea rdi, [rax+8]
+    lea rsi, [r12+8]
+    cmp r8d, 1
+    je .cmp
+    mov edx, [r12+4]
+    sub edx, ecx
+    add rsi, rdx
+.cmp:
+    push r8
+    call py_memeq
+    pop r8
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+m_find:
+    xor r10d, r10d
+    jmp py_findm
+m_rfind:
+    mov r10d, 1
+    jmp py_findm
+m_index:
+    mov r10d, 2
+    jmp py_findm
+m_count:
+    mov r10d, 3
+py_findm:                           ; r10d: 0 find, 1 rfind, 2 index, 3 count
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax
+    mov r13, [rdx]
+    mov rax, r13
+    call py_needstr
+    cmp r10d, 3
+    je .count
+    cmp r10d, 1
+    je .rf
+    mov rsi, r12
+    mov ecx, [r12+4]
+    lea rdi, [r13+8]
+    mov edx, [r13+4]
+    xor r8d, r8d
+    call py_find
+    jmp .res
+.rf:
+    mov ebx, [r12+4]
+    sub ebx, [r13+4]
+    mov rax, -1
+.rl:
+    cmp ebx, 0
+    jl .res
+    mov rsi, r12
+    mov ecx, [r12+4]
+    lea rdi, [r13+8]
+    mov edx, [r13+4]
+    mov r8d, ebx
+    push rbx
+    call py_find
+    pop rbx
+    cmp rax, rbx
+    je .res
+    dec ebx
+    jmp .rl
+.count:
+    xor ebx, ebx
+    xor ebp, ebp
+    cmp dword [r13+4], 0
+    je .cz
+.cl:
+    mov rsi, r12
+    mov ecx, [r12+4]
+    lea rdi, [r13+8]
+    mov edx, [r13+4]
+    mov r8d, ebx
+    call py_find
+    cmp rax, 0
+    jl .cz
+    inc ebp
+    lea ebx, [rax+rdx]
+    jmp .cl
+.cz:
+    mov rax, rbp
+    jmp py_mkint
+.res:
+    cmp r10d, 2
+    jne .ok
+    cmp rax, 0
+    jl .nf
+.ok:
+    jmp py_mkint
+.nf:
+    PERR pe_substr
+
+m_isdigit:
+    mov r8d, 1
+    jmp py_ctest
+m_isalpha:
+    mov r8d, 2
+    jmp py_ctest
+m_isalnum:
+    mov r8d, 3
+    jmp py_ctest
+m_isspace:
+    mov r8d, 4
+    jmp py_ctest
+m_islower:
+    mov r8d, 5
+    jmp py_ctest
+m_isupper:
+    mov r8d, 6
+py_ctest:
+    mov rsi, rax
+    mov ecx, [rax+4]
+    test ecx, ecx
+    jz .no
+    xor ebx, ebx                    ; cased letters seen
+    xor r9d, r9d
+.l: movzx eax, byte [rsi+8+r9]
+    mov edx, eax
+    or edx, 0x20
+    sub edx, 'a'
+    cmp edx, 25
+    seta dl                         ; dl = 1 when not a letter
+    movzx edx, dl
+    mov r10d, eax
+    sub r10d, '0'
+    cmp r10d, 9
+    seta r10b                       ; 1 when not a digit
+    movzx r10d, r10b
+    cmp r8d, 1
+    je .dg
+    cmp r8d, 2
+    je .al
+    cmp r8d, 3
+    je .an
+    cmp r8d, 4
+    je .sp
+    cmp r8d, 5
+    je .lo
+    ; isupper
+    cmp al, 'A'
+    jb .nx
+    cmp al, 'Z'
+    ja .u2
+    inc ebx
+    jmp .nx
+.u2:
+    cmp al, 'a'
+    jb .nx
+    cmp al, 'z'
+    jbe .no
+    jmp .nx
+.lo:
+    cmp al, 'a'
+    jb .l2
+    cmp al, 'z'
+    ja .nx
+    inc ebx
+    jmp .nx
+.l2:
+    cmp al, 'A'
+    jb .nx
+    cmp al, 'Z'
+    jbe .no
+    jmp .nx
+.dg:
+    test r10d, r10d
+    jnz .no
+    jmp .nx
+.al:
+    test edx, edx
+    jnz .no
+    jmp .nx
+.an:
+    test edx, edx
+    jz .nx
+    test r10d, r10d
+    jnz .no
+    jmp .nx
+.sp:
+    cmp al, ' '
+    je .nx
+    cmp al, 9
+    je .nx
+    cmp al, 10
+    je .nx
+    cmp al, 13
+    jne .no
+.nx:
+    inc r9d
+    cmp r9d, ecx
+    jb .l
+    cmp r8d, 5
+    jb .yes
+    cmp r8d, 4
+    je .yes
+    test ebx, ebx
+    jz .no
+.yes:
+    mov eax, PY_TRUE
+    ret
+.no:
+    mov eax, PY_FALSE
+    ret
+
+; ---- str: padding -------------------------------------------------------------------------------------------------------------------
+m_zfill:
+    mov r8d, '0'
+    mov r9d, 3
+    jmp py_padm
+m_center:
+    mov r9d, 2
+    jmp py_padm0
+m_ljust:
+    mov r9d, 0
+    jmp py_padm0
+m_rjust:
+    mov r9d, 1
+py_padm0:
+    mov r8d, ' '
+    cmp ecx, 2
+    jb py_padm
+    mov r10, [rdx+8]
+    push rax
+    mov rax, r10
+    call py_needstr
+    movzx r8d, byte [rax+8]
+    pop rax
+py_padm:                            ; r8d = fill char, r9d: 0 left-justify, 1 right, 2 centre, 3 zfill
+    test ecx, ecx
+    jz py_argerr
+    mov r12, rax
+    mov rax, [rdx]
+    call py_needint
+    mov r13, rax                    ; width
+    mov ecx, [r12+4]
+    cmp r13, rcx
+    jbe .same
+    mov rdx, r13
+    sub rdx, rcx                    ; padding
+    mov ecx, r13d
+    push rdx
+    call py_newstrbuf
+    pop rdx
+    push rax
+    ; left and right padding amounts
+    cmp r9d, 0
+    je .l0
+    cmp r9d, 1
+    je .l1
+    cmp r9d, 3
+    je .l3
+    mov r10d, edx
+    shr r10d, 1                     ; centre: left = pad/2 (Python uses (pad+1)/2 for odd widths on the left)
+    test dl, 1
+    jz .go
+    cmp r13b, 1
+    jb .go
+    inc r10d
+    jmp .go
+.l0:
+    xor r10d, r10d
+    jmp .go
+.l1:
+    mov r10d, edx
+    jmp .go
+.l3:
+    ; zero padding goes behind a sign
+    mov r10d, edx
+    mov ecx, [r12+4]
+    test ecx, ecx
+    jz .go
+    mov al, [r12+8]
+    cmp al, '-'
+    je .sg
+    cmp al, '+'
+    jne .go
+.sg:
+    mov [rdi], al
+    inc rdi
+    inc r12                         ; (the sign is copied separately)
+    ; we cannot modify r12 permanently: copy below handles the shifted source
+    mov ecx, r10d
+    mov al, r8b
+    rep stosb
+    mov ecx, [r12+4]
+    dec ecx
+    lea rsi, [r12+7]
+    rep movsb
+    pop rax
+    ret
+.go:
+    mov ecx, r10d
+    mov al, r8b
+    rep stosb
+    mov ecx, [r12+4]
+    lea rsi, [r12+8]
+    rep movsb
+    mov ecx, edx
+    sub ecx, r10d
+    mov al, r8b
+    rep stosb
+    pop rax
+    ret
+.same:
+    mov rax, r12
+    ret
+
+; ---- str.format -----------------------------------------------------------------------------------------------------------------------
+m_format:
+    mov r12, rax                    ; the format string
+    mov r13, rdx                    ; arguments
+    mov r14d, ecx
+    xor r15d, r15d                  ; next automatic index
+    mov rbp, [PYV_SBP]              ; builder start
+    mov qword [PYV_CAP], 1
+    xor ebx, ebx                    ; position
+.l: cmp ebx, [r12+4]
+    jae .end
+    movzx eax, byte [r12+8+rbx]
+    inc ebx
+    cmp al, '{'
+    je .open
+    cmp al, '}'
+    jne .lit
+    cmp ebx, [r12+4]
+    jae .lit
+    cmp byte [r12+8+rbx], '}'
+    jne .lit
+    inc ebx
+.lit:
+    call py_out
+    jmp .l
+.open:
+    cmp ebx, [r12+4]
+    jae .bad
+    cmp byte [r12+8+rbx], '{'
+    jne .field
+    inc ebx
+    mov al, '{'
+    jmp .lit
+.field:
+    ; field name: up to ':' or '}'
+    mov r8d, ebx                    ; start
+.fn:
+    cmp ebx, [r12+4]
+    jae .bad
+    mov al, [r12+8+rbx]
+    cmp al, '}'
+    je .fne
+    cmp al, ':'
+    je .fne
+    inc ebx
+    jmp .fn
+.fne:
+    mov r9d, ebx                    ; end of the name
+    ; value
+    cmp r9d, r8d
+    je .auto
+    movzx eax, byte [r12+8+r8]
+    sub eax, '0'
+    cmp eax, 9
+    ja .named
+    ; index
+    xor eax, eax
+    mov ecx, r8d
+.ix:
+    cmp ecx, r9d
+    jae .ixd
+    movzx edx, byte [r12+8+rcx]
+    sub edx, '0'
+    cmp edx, 9
+    ja .bad
+    imul eax, eax, 10
+    add eax, edx
+    inc ecx
+    jmp .ix
+.auto:
+    mov eax, r15d
+    inc r15d
+.ixd:
+    cmp eax, r14d
+    jae .noarg
+    mov rax, [r13+rax*8]
+    jmp .have
+.named:
+    lea rsi, [r12+8+r8]
+    mov ecx, r9d
+    sub ecx, r8d
+    call py_kwfind
+    test rax, rax
+    jz .noarg
+.have:
+    mov r10, rax                    ; the value
+    ; spec
+    mov r8d, 0                      ; width
+    mov r9d, ' '                    ; fill
+    xor r11d, r11d                  ; align
+    xor ecx, ecx                    ; zero flag (kept in ecx while parsing)
+    cmp byte [r12+8+rbx], ':'
+    jne .nospec
+    inc ebx
+    mov edx, ebx
+    inc edx
+    cmp edx, [r12+4]
+    jae .a1
+    movzx eax, byte [r12+8+rdx]
+    cmp al, '<'
+    je .fa
+    cmp al, '>'
+    je .fa
+    cmp al, '^'
+    jne .a1
+.fa:
+    movzx r9d, byte [r12+8+rbx]
+    mov r11d, eax
+    add ebx, 2
+    jmp .w
+.a1:
+    movzx eax, byte [r12+8+rbx]
+    cmp al, '<'
+    je .a2
+    cmp al, '>'
+    je .a2
+    cmp al, '^'
+    jne .w
+.a2:
+    mov r11d, eax
+    inc ebx
+.w: cmp byte [r12+8+rbx], '0'
+    jne .wd
+    mov ecx, 1
+    inc ebx
+.wd:
+    movzx eax, byte [r12+8+rbx]
+    sub eax, '0'
+    cmp eax, 9
+    ja .wend
+    imul r8d, r8d, 10
+    add r8d, eax
+    inc ebx
+    jmp .wd
+.wend:
+    cmp byte [r12+8+rbx], 'd'
+    je .sk
+    cmp byte [r12+8+rbx], 's'
+    jne .nospec
+.sk:
+    inc ebx
+.nospec:
+    cmp ebx, [r12+4]
+    jae .bad
+    cmp byte [r12+8+rbx], '}'
+    jne .bad
+    inc ebx
+    ; text of the value
+    push r8
+    push r9
+    push r11
+    push rcx
+    mov rax, r10
+    mov r10, [PYV_SBP]              ; start of this field
+    xor edx, edx
+    call py_putval
+    pop rcx
+    pop r11
+    pop r9
+    pop r8
+    ; padding
+    mov rax, [PYV_SBP]
+    sub rax, r10                    ; text length
+    cmp eax, r8d
+    jae .l
+    mov edx, r8d
+    sub edx, eax                    ; pad count
+    test r11d, r11d
+    jnz .al
+    mov r11d, '<'
+    test rax, rax
+    jz .al
+    movzx eax, byte [r10]
+    cmp al, '-'
+    je .num
+    sub eax, '0'
+    cmp eax, 9
+    ja .al
+.num:
+    mov r11d, '>'
+    test ecx, ecx
+    jz .al
+    mov r9d, '0'
+.al:
+    mov rdi, [PYV_SBP]
+    cmp r11d, '<'
+    jne .notl
+    mov ecx, edx
+    mov al, r9b
+    rep stosb
+    mov [PYV_SBP], rdi
+    jmp .l
+.notl:
+    push rdx
+    mov rcx, [PYV_SBP]
+    sub rcx, r10
+    lea rsi, [r10+rcx-1]
+    mov edx, [rsp]
+    cmp r11d, '^'
+    jne .rt
+    shr edx, 1
+.rt:
+    lea rdi, [rsi+rdx]
+    std
+    rep movsb
+    cld
+    mov rdi, r10
+    mov ecx, edx
+    mov al, r9b
+    rep stosb
+    mov rdi, [PYV_SBP]
+    add rdi, rdx
+    mov ecx, [rsp]
+    sub ecx, edx
+    mov al, r9b
+    rep stosb
+    mov [PYV_SBP], rdi
+    add rsp, 8
+    jmp .l
+.end:
+    mov qword [PYV_CAP], 0
+    mov rcx, [PYV_SBP]
+    sub rcx, rbp
+    mov rsi, rbp
+    mov [PYV_SBP], rbp
+    jmp py_newstr
+.noarg:
+    mov qword [PYV_CAP], 0
+    PERR pe_fmtarg
+.bad:
+    mov qword [PYV_CAP], 0
+    PERR pe_fmtbad
+
+py_kwfind:                          ; rsi = name, ecx = length -> rax = keyword argument value or 0
+    push rbx
+    push rdx
+    push rdi
+    mov rbx, [PYV_KWB]
+.l: cmp rbx, [PYV_NKW]
+    jae .no
+    lea rdx, [rbx+rbx*2]
+    lea rdx, [PYV_KWT+rdx*8]
+    mov rax, [rdx+8]
+    cmp eax, ecx
+    jne .nx
+    push rsi
+    mov rdi, [rdx]
+    call py_memeq
+    pop rsi
+    jne .nx
+    mov rax, [rdx+16]
+    jmp .o
+.nx:
+    inc rbx
+    jmp .l
+.no:
+    xor eax, eax
+.o: pop rdi
+    pop rdx
+    pop rbx
+    ret
+
+; ---- list methods ---------------------------------------------------------------------------------------------------------------------
+m_append:
+    cmp ecx, 1
+    jne py_argerr
+    mov rdx, [rdx]
+    call py_lappend
+    mov eax, PY_NONE
+    ret
+
+m_extend:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax
+    mov rax, [rdx]
+    call py_tolist
+    mov r13, rax
+    xor ebx, ebx
+.l: cmp ebx, [r13+4]
+    jae .d
+    mov rdx, [r13+16]
+    mov rdx, [rdx+rbx*8]
+    mov rax, r12
+    call py_lappend
+    inc ebx
+    jmp .l
+.d: mov eax, PY_NONE
+    ret
+
+m_pop:
+    mov r12, rax
+    mov r13, -1
+    test ecx, ecx
+    jz .go
+    mov rax, [rdx]
+    call py_needint
+    mov r13, rax
+.go:
+    mov ecx, [r12+4]
+    test ecx, ecx
+    jz .empty
+    test r13, r13
+    jns .p
+    add r13, rcx
+.p: cmp r13, 0
+    jl .oob
+    cmp r13, rcx
+    jae .oob
+    mov rdx, [r12+16]
+    mov rax, [rdx+r13*8]
+    push rax
+    lea rdi, [rdx+r13*8]
+    lea rsi, [rdi+8]
+    mov rcx, [r12+4]
+    mov ecx, ecx
+    sub rcx, r13
+    dec rcx
+    rep movsq
+    dec dword [r12+4]
+    pop rax
+    ret
+.empty:
+    PERR pe_popempty
+.oob:
+    PERR pe_idx
+
+m_insert:
+    cmp ecx, 2
+    jne py_argerr
+    mov r12, rax
+    mov r14, [rdx+8]
+    mov rax, [rdx]
+    call py_needint
+    mov r13, rax
+    mov ecx, [r12+4]
+    test r13, r13
+    jns .p
+    add r13, rcx
+    jns .p
+    xor r13d, r13d
+.p: cmp r13, rcx
+    jbe .ok
+    mov r13, rcx
+.ok:
+    mov rdx, r14
+    mov rax, r12
+    call py_lappend                 ; grows the list by one
+    mov rdx, [r12+16]
+    mov ecx, [r12+4]
+    dec ecx                         ; old length
+    sub rcx, r13
+    jbe .st
+    lea rdi, [rdx+r13*8+8]
+    lea rsi, [rdx+r13*8]
+    ; move [r13, old) up by one, from the end
+    lea rsi, [rdx+r13*8]
+    lea rax, [rsi+rcx*8-8]
+    lea rdi, [rax+8]
+    mov rsi, rax
+    std
+    rep movsq
+    cld
+.st:
+    mov rdx, [r12+16]
+    mov [rdx+r13*8], r14
+    mov eax, PY_NONE
+    ret
+
+m_remove:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax
+    mov r13, [rdx]
+    xor ebx, ebx
+.l: cmp ebx, [r12+4]
+    jae .no
+    mov rax, [r12+16]
+    mov rdx, [rax+rbx*8]
+    mov rax, r13
+    call py_eq
+    test eax, eax
+    jnz .f
+    inc ebx
+    jmp .l
+.f: mov rax, r12
+    mov rcx, rbx
+    call py_delitem
+    mov eax, PY_NONE
+    ret
+.no:
+    PERR pe_notinlist
+
+m_lindex:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax
+    mov r13, [rdx]
+    xor ebx, ebx
+.l: cmp ebx, [r12+4]
+    jae .no
+    mov rax, [r12+16]
+    mov rdx, [rax+rbx*8]
+    mov rax, r13
+    call py_eq
+    test eax, eax
+    jnz .f
+    inc ebx
+    jmp .l
+.f: mov rax, rbx
+    jmp py_mkint
+.no:
+    PERR pe_notinlist
+
+m_lcount:
+    cmp ecx, 1
+    jne py_argerr
+    mov r12, rax
+    mov r13, [rdx]
+    xor ebx, ebx
+    xor ebp, ebp
+.l: cmp ebx, [r12+4]
+    jae .d
+    mov rax, [r12+16]
+    mov rdx, [rax+rbx*8]
+    mov rax, r13
+    call py_eq
+    add ebp, eax
+    inc ebx
+    jmp .l
+.d: mov rax, rbp
+    jmp py_mkint
+
+m_sort:
+    mov r12, rax
+    call py_sortlist
+    mov eax, PY_NONE
+    ret
+
+m_reverse:
+    mov rdx, [rax+16]
+    mov ecx, [rax+4]
+    xor esi, esi
+    lea edi, [rcx-1]
+.l: cmp esi, edi
+    jge .d
+    mov r8, [rdx+rsi*8]
+    mov r9, [rdx+rdi*8]
+    mov [rdx+rsi*8], r9
+    mov [rdx+rdi*8], r8
+    inc esi
+    dec edi
+    jmp .l
+.d: mov eax, PY_NONE
+    ret
+
+m_lcopy:
+    jmp py_tolist
+m_lclear:
+    mov dword [rax+4], 0
+    mov eax, PY_NONE
+    ret
+
+; ---- dict methods ----------------------------------------------------------------------------------------------------------------------
+m_get:
+    cmp ecx, 1
+    jb py_argerr
+    cmp ecx, 2
+    ja py_argerr
+    mov r12, rdx
+    mov r13d, ecx
+    mov rcx, [r12]
+    call py_dget
+    test rax, rax
+    jnz .r
+    mov eax, PY_NONE
+    cmp r13d, 2
+    jne .r
+    mov rax, [r12+8]
+.r: ret
+
+m_keys:
+    mov r8d, 0
+    jmp py_dview
+m_values:
+    mov r8d, 1
+    jmp py_dview
+m_items:
+    mov r8d, 2
+py_dview:
+    mov r12, rax
+    mov ecx, [rax+4]
+    inc ecx
+    mov edx, 2
+    call py_newlist
+    mov r13, rax
+    xor ebx, ebx
+.l: cmp ebx, [r12+4]
+    jae .d
+    mov rax, rbx
+    shl rax, 4
+    add rax, [r12+16]
+    cmp r8d, 2
+    je .it
+    mov rdx, [rax]
+    cmp r8d, 0
+    je .ap
+    mov rdx, [rax+8]
+.ap:
+    mov rax, r13
+    call py_lappend
+    inc ebx
+    jmp .l
+.it:
+    mov r14, rax
+    mov ecx, 2
+    mov edx, 4
+    call py_newlist
+    mov r15, rax
+    mov rdx, [r14]
+    call py_lappend
+    mov rdx, [r14+8]
+    mov rax, r15
+    call py_lappend
+    mov rdx, r15
+    mov rax, r13
+    call py_lappend
+    inc ebx
+    jmp .l
+.d: mov rax, r13
+    ret
+
+m_dpop:
+    cmp ecx, 1
+    jb py_argerr
+    cmp ecx, 2
+    ja py_argerr
+    mov r12, rax
+    mov r13, rdx
+    mov r14d, ecx
+    mov rcx, [r13]
+    call py_dget
+    test rax, rax
+    jz .no
+    push rax
+    mov rax, r12
+    mov rcx, [r13]
+    call py_ddel
+    pop rax
+    ret
+.no:
+    cmp r14d, 2
+    jne .key
+    mov rax, [r13+8]
+    ret
+.key:
+    PERR pe_key
+
+m_update:
+    mov r12, rax
+    mov r13, rdx
+    mov r14d, ecx
+    test ecx, ecx
+    jz .kw
+    mov rax, [r13]
+    test al, 3
+    jnz py_argerr
+    cmp dword [rax], 5
+    jne py_argerr
+    mov r15, rax
+    xor ebx, ebx
+.l: cmp ebx, [r15+4]
+    jae .kw
+    mov rax, rbx
+    shl rax, 4
+    add rax, [r15+16]
+    mov rcx, [rax]
+    mov rdx, [rax+8]
+    mov rax, r12
+    call py_dset
+    inc ebx
+    jmp .l
+.kw:
+    mov rbx, [PYV_KWB]
+.k: cmp rbx, [PYV_NKW]
+    jae .d
+    lea rdx, [rbx+rbx*2]
+    lea rdx, [PYV_KWT+rdx*8]
+    push rdx
+    mov rsi, [rdx]
+    mov ecx, [rdx+8]
+    call py_newstr
+    pop rdx
+    mov rcx, rax
+    mov rdx, [rdx+16]
+    mov rax, r12
+    call py_dset
+    inc rbx
+    jmp .k
+.d: mov eax, PY_NONE
+    ret
+
+m_setdefault:
+    cmp ecx, 1
+    jb py_argerr
+    cmp ecx, 2
+    ja py_argerr
+    mov r12, rax
+    mov r13, rdx
+    mov r14d, ecx
+    mov rcx, [r13]
+    call py_dget
+    test rax, rax
+    jnz .r
+    mov rdx, PY_NONE
+    cmp r14d, 2
+    jne .set
+    mov rdx, [r13+8]
+.set:
+    mov r15, rdx
+    mov rax, r12
+    mov rcx, [r13]
+    call py_dset
+    mov rax, r15
+.r: ret
+
+m_dcopy:
+    mov r12, rax
+    call py_newdict
+    mov r13, rax
+    xor ebx, ebx
+.l: cmp ebx, [r12+4]
+    jae .d
+    mov rax, rbx
+    shl rax, 4
+    add rax, [r12+16]
+    mov rcx, [rax]
+    mov rdx, [rax+8]
+    mov rax, r13
+    call py_dset
+    inc ebx
+    jmp .l
+.d: mov rax, r13
+    ret
+
+m_dclear:
+    mov dword [rax+4], 0
+    mov eax, PY_NONE
+    ret
+
+m_tindex:
+    jmp m_lindex
+m_tcount:
+    jmp m_lcount
+
+; ---- method table ---------------------------------------------------------------------------------------------------------------------
+py_mtab:
+    MI MT_STR, "upper", m_upper
+    MI MT_STR, "lower", m_lower
+    MI MT_STR, "title", m_title
+    MI MT_STR, "capitalize", m_capitalize
+    MI MT_STR, "swapcase", m_swapcase
+    MI MT_STR, "strip", m_strip
+    MI MT_STR, "lstrip", m_lstrip
+    MI MT_STR, "rstrip", m_rstrip
+    MI MT_STR, "split", m_split
+    MI MT_STR, "splitlines", m_splitlines
+    MI MT_STR, "join", m_join
+    MI MT_STR, "replace", m_replace
+    MI MT_STR, "startswith", m_startswith
+    MI MT_STR, "endswith", m_endswith
+    MI MT_STR, "find", m_find
+    MI MT_STR, "rfind", m_rfind
+    MI MT_STR, "index", m_index
+    MI MT_STR, "count", m_count
+    MI MT_STR, "isdigit", m_isdigit
+    MI MT_STR, "isalpha", m_isalpha
+    MI MT_STR, "isalnum", m_isalnum
+    MI MT_STR, "isspace", m_isspace
+    MI MT_STR, "islower", m_islower
+    MI MT_STR, "isupper", m_isupper
+    MI MT_STR, "zfill", m_zfill
+    MI MT_STR, "center", m_center
+    MI MT_STR, "ljust", m_ljust
+    MI MT_STR, "rjust", m_rjust
+    MI MT_STR, "format", m_format
+    MI MT_LIST, "append", m_append
+    MI MT_LIST, "extend", m_extend
+    MI MT_LIST, "pop", m_pop
+    MI MT_LIST, "insert", m_insert
+    MI MT_LIST, "remove", m_remove
+    MI MT_LIST, "index", m_lindex
+    MI MT_LIST, "count", m_lcount
+    MI MT_LIST, "sort", m_sort
+    MI MT_LIST, "reverse", m_reverse
+    MI MT_LIST, "copy", m_lcopy
+    MI MT_LIST, "clear", m_lclear
+    MI MT_TUP, "index", m_tindex
+    MI MT_TUP, "count", m_tcount
+    MI MT_DICT, "get", m_get
+    MI MT_DICT, "keys", m_keys
+    MI MT_DICT, "values", m_values
+    MI MT_DICT, "items", m_items
+    MI MT_DICT, "pop", m_dpop
+    MI MT_DICT, "update", m_update
+    MI MT_DICT, "setdefault", m_setdefault
+    MI MT_DICT, "copy", m_dcopy
+    MI MT_DICT, "clear", m_dclear
+    db 0
+
+
+; ---- end py6.inc
+; ---- begin pyglue.inc
+; =============================================================================
+;  Python <-> terminal glue: output, input(), Esc to stop, the 'python' command
+; =============================================================================
+PYLINE      equ PY+0x20000          ; one typed line (256 bytes)
+
+py_ext_putc:                        ; al = character -> terminal
+    jmp tput_c
+
+py_ext_break:                       ; CF=1 when the user pressed Esc
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    inc dword [py_polls]
+    test dword [py_polls], 7
+    jnz .p
+    call term_all                   ; show what the program printed so far
+    call term_caret
+.p: call pollkey
+    cmp al, 27
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    je .brk
+    clc
+    ret
+.brk:
+    stc
+    ret
+
+; read one line from the keyboard into [rdi] (NUL terminated, at most 200 chars) -> eax = length, CF=1 on Esc
+term_getline:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    mov rbx, rdi
+    xor r12d, r12d
+    call term_all
+    call term_caret
+.k: call getkey
+    cmp al, 27
+    je .esc
+    cmp al, 13
+    je .enter
+    cmp al, 8
+    je .bs
+    cmp al, 32
+    jb .k
+    cmp al, 0xDF
+    ja .k
+    cmp r12d, 200
+    jae .k
+    mov [rbx+r12], al
+    inc r12d
+    call tput_c
+    jmp .upd
+.bs:
+    test r12d, r12d
+    jz .k
+    dec r12d
+    mov eax, [t_col]
+    test eax, eax
+    jz .k
+    dec eax
+    mov [t_col], eax
+    mov edx, [t_row]
+    imul edx, COLS
+    add edx, eax
+    mov byte [TBUF+rdx], ' '
+.upd:
+    cmp byte [t_scr], 0
+    jne .full
+    mov eax, [t_row]
+    call term_row
+    call term_caret
+    jmp .k
+.full:
+    mov byte [t_scr], 0
+    call term_all
+    call term_caret
+    jmp .k
+.enter:
+    mov byte [rbx+r12], 0
+    call tnl
+    mov eax, r12d
+    clc
+    jmp .o
+.esc:
+    mov byte [rbx], 0
+    xor eax, eax
+    stc
+.o: pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+py_ext_input:                       ; -> rax = str object (without the newline), 0 on Esc
+    push rsi
+    push rcx
+    push rdx
+    push rdi
+    lea rdi, [PYV_BUF]
+    call term_getline
+    jc .esc
+    mov ecx, eax
+    lea rsi, [PYV_BUF]
+    call py_newstr
+    jmp .o
+.esc:
+    xor eax, eax
+.o: pop rdi
+    pop rdx
+    pop rcx
+    pop rsi
+    ret
+
+; print the outcome of py_exec: eax = result, esi = 1 to add the line number
+py_report:
+    cmp eax, 1
+    jne .ok
+    push rsi
+    lea rsi, [s_py_err]
+    call tput_s
+    mov rsi, [PYV_ERRMSG]
+    test rsi, rsi
+    jz .nm
+    call tput_s
+.nm:
+    pop rsi
+    test esi, esi
+    jz .nl
+    lea rsi, [s_py_line]
+    call tput_s
+    call py_errline
+    call tput_dec
+    mov al, ')'
+    call tput_c
+.nl:
+    call tnl
+.ok:
+    ret
+
+tput_dec:                           ; eax = unsigned number
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    mov ebx, 10
+    xor ecx, ecx
+.d: xor edx, edx
+    div ebx
+    push rdx
+    inc ecx
+    test eax, eax
+    jnz .d
+.p: pop rax
+    add al, '0'
+    call tput_c
+    dec ecx
+    jnz .p
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; the 'python' command: r15 = argument text
+term_python:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    cmp byte [r15], 0
+    jne .file
+    ; ---- interactive prompt ----
+    lea rsi, [s_py_banner]
+    call tput_s
+    call py_init
+.rl:
+    lea rsi, [s_py_ps1]
+    call tput_s
+    lea rdi, [PYLINE]
+    call term_getline
+    jc .done
+    lea rsi, [PYLINE]
+    cmp byte [rsi], 0
+    je .rl
+    ; exit() / quit()
+    lea rdi, [s_py_exit]
+    call strcmp
+    je .done
+    lea rsi, [PYLINE]
+    lea rdi, [s_py_quit]
+    call strcmp
+    je .done
+    ; collect the line (and a block when it ends with ':' or starts with a blank)
+    lea rdi, [PY_SB]
+    lea rsi, [PYLINE]
+    call py_copyline
+    cmp byte [PYLINE], ' '
+    je .more
+    cmp byte [PYLINE], 9
+    je .more
+    call py_endcolon
+    jnz .run
+.more:
+    lea rsi, [s_py_ps2]
+    call tput_s
+    push rdi
+    lea rdi, [PYLINE]
+    call term_getline
+    pop rdi
+    jc .run
+    cmp byte [PYLINE], 0
+    je .run
+    lea rsi, [PYLINE]
+    call py_copyline
+    jmp .more
+.run:
+    mov byte [rdi], 0
+    lea rdi, [PY_SB]
+    mov esi, 1
+    call py_exec
+    cmp eax, 2
+    je .done
+    xor esi, esi
+    call py_report
+    jmp .rl
+.done:
+    jmp .out
+.file:
+    mov rsi, r15
+    call resolve
+    call find_any
+    test rax, rax
+    jz .nofile
+    mov rsi, rax
+    mov ecx, [rsi+48]
+    cmp ecx, 0xF000
+    jbe .sz
+    mov ecx, 0xF000
+.sz:
+    lea rsi, [rax+64]
+    lea rdi, [PY_SB]
+.cp:
+    test ecx, ecx
+    jz .cd
+    lodsb
+    dec ecx
+    cmp al, 13
+    je .cp
+    stosb
+    jmp .cp
+.cd:
+    mov byte [rdi], 0
+    call py_init
+    lea rdi, [PY_SB]
+    xor esi, esi
+    call py_exec
+    cmp eax, 2
+    je .out
+    mov esi, 1
+    call py_report
+    cmp dword [t_col], 0
+    je .out
+    call tnl
+    jmp .out
+.nofile:
+    lea rsi, [s_py_nofile]
+    call tput_s
+    call tnl
+.out:
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+py_copyline:                        ; rsi = text -> appended at rdi with a newline (rdi advances)
+.l: lodsb
+    test al, al
+    jz .d
+    stosb
+    jmp .l
+.d: mov al, 10
+    stosb
+    ret
+
+py_endcolon:                        ; PYLINE ends with ':' (ignoring blanks)? -> ZF=1 when it does
+    push rsi
+    lea rsi, [PYLINE]
+    xor ecx, ecx
+.l: cmp byte [rsi+rcx], 0
+    je .e
+    inc ecx
+    jmp .l
+.e: test ecx, ecx
+    jz .no
+.t: cmp byte [rsi+rcx-1], ' '
+    jne .c
+    dec ecx
+    jnz .t
+    jmp .no
+.c: cmp byte [rsi+rcx-1], ':'
+    pop rsi
+    ret
+.no:
+    or al, 1
+    cmp al, 0
+    pop rsi
+    ret
+
+
+; ---- end pyglue.inc
+; ---- begin gvmac.inc
+%macro DISC 3
+    mov eax, %1
+    mov ebx, %2
+    mov ecx, %3
+    call gv_disc
+%endmacro
+%macro RING 5
+    mov eax, %1
+    mov ebx, %2
+    mov ecx, %3
+    mov esi, %4
+    mov edi, %5
+    call gv_ring
+%endmacro
+%macro SEG 5
+    mov eax, %1
+    mov ebx, %2
+    mov ecx, %3
+    mov esi, %4
+    mov edi, %5
+    call gv_seg
+%endmacro
+%macro RR 5
+    mov eax, %1
+    mov ebx, %2
+    mov ecx, %3
+    mov esi, %4
+    mov edi, %5
+    call gv_rr
+%endmacro
+%macro TRI 6
+    mov dword [gv_ti], %1
+    mov dword [gv_ti+4], %2
+    mov dword [gv_ti+8], %3
+    mov dword [gv_ti+12], %4
+    mov dword [gv_ti+16], %5
+    mov dword [gv_ti+20], %6
+    call gv_tri
+%endmacro
+%macro ALPHA 1
+    mov dword [gv_a], %1
+%endmacro
+%macro HOLE 1
+    mov byte [gv_hole], %1
+%endmacro
+
+
+; ---- end gvmac.inc
+; ---- begin extras.inc
+; =============================================================================
+;  EXTRAS : more themes, top-bar items, volume / Wi-Fi / Bluetooth / battery
+;           switches, Super key (Super+X launcher, Super+C quick panel,
+;           Super+Up/Down volume)
+;  Honest limits: no Wi-Fi / Bluetooth / audio / battery drivers exist, the
+;  switches are stored settings; "volume" only drives a PC-speaker beep.
+; =============================================================================
+NPAL    equ 10
+A_PAL   equ 18
+A_BARI  equ 19
+A_VOL   equ 20
+A_MUTE  equ 21
+A_WIFI  equ 22
+A_BT    equ 23
+A_BIOS  equ 24
+
+
+; ---- palettes : win hdr brd txt stat dim card accent dark -----------------------------
+pal_tab:
+    dd 0xFFFFFF,0xEBEBEB,0xCCCCCC,0x2E3436,0xF6F5F4,0x77767B,0xFFFFFF,0,0
+    dd 0x242424,0x303030,0x1A1A1A,0xEEEEEC,0x2B2B2B,0x9A9996,0x383838,0,1
+    dd 0x151A2B,0x1E2540,0x0F1320,0xE6EAF5,0x1A2038,0x8A93B0,0x262E50,0x6C8CFF,1
+    dd 0x2E3440,0x3B4252,0x242933,0xECEFF4,0x343B49,0x9AA5B8,0x434C5E,0x88C0D0,1
+    dd 0x282A36,0x343746,0x1E1F29,0xF8F8F2,0x2F3140,0x9AA0C0,0x44475A,0xBD93F9,1
+    dd 0x1B2620,0x24332B,0x131B16,0xE3EFE6,0x202D26,0x8DA596,0x2E4036,0x5FBF7F,1
+    dd 0xFDF6E3,0xEEE8D5,0xD6CFB8,0x586E75,0xF3ECD8,0x93A1A1,0xFDF6E3,0x268BD2,0
+    dd 0xF6EEDC,0xE9DEC6,0xCFC1A3,0x4A3B2A,0xEFE5CF,0x8C7B65,0xFBF5E6,0xB5651D,0
+    dd 0xFFF7F9,0xFBE6EC,0xEBC5D1,0x4A2C37,0xFCEEF2,0x9A7683,0xFFFFFF,0xE0457B,0
+    dd 0x000000,0x1A1A1A,0xFFFFFF,0xFFFFFF,0x0D0D0D,0xCCCCCC,0x111111,0xFFD60A,1
+
+pal_apply:                           ; eax = palette (>= 2)
+    PUSHA
+    imul eax, eax, 36
+    lea rsi, [pal_tab+rax]
+    mov eax, [rsi]
+    mov [th_win], eax
+    mov eax, [rsi+4]
+    mov [th_hdr], eax
+    mov eax, [rsi+8]
+    mov [th_brd], eax
+    mov eax, [rsi+12]
+    mov [th_txt], eax
+    mov eax, [rsi+16]
+    mov [th_stat], eax
+    mov eax, [rsi+20]
+    mov [th_dim], eax
+    mov eax, [rsi+24]
+    mov [th_card], eax
+    cmp byte [SB_ACC], 0
+    jne .o
+    mov eax, [rsi+28]
+    mov [th_acc], eax
+.o: POPA
+    ret
+
+; keep the new fields sane; first start: defaults
+ex_clamp:
+    PUSHA
+    cmp byte [SB_XINIT], 0xA5
+    je .go
+    mov byte [SB_XINIT], 0xA5
+    mov byte [SB_VOL], 7
+    mov byte [SB_MUTE], 0
+    mov byte [SB_WIFI], 1
+    mov byte [SB_BT], 0
+    mov byte [SB_BAR], 0x1F
+    mov byte [SB_PAL], 0
+    cmp byte [SB_THEME], 1
+    jne .go
+    mov byte [SB_PAL], 1             ; an older dark configuration
+.go:
+    cmp byte [SB_PAL], NPAL-1
+    jbe .a
+    mov byte [SB_PAL], 0
+.a: cmp byte [SB_VOL], 10
+    jbe .b
+    mov byte [SB_VOL], 7
+.b: and byte [SB_MUTE], 1
+    and byte [SB_WIFI], 1
+    and byte [SB_BT], 1
+    and byte [SB_BAR], 0x1F
+    and byte [SB_BIOS], 1
+    movzx eax, byte [SB_PAL]
+    lea rsi, [pal_dark]
+    mov al, [rsi+rax]
+    mov [SB_THEME], al
+    POPA
+    ret
+
+; ---- small string helpers -----------------------------------------------------------
+ex_cat:                              ; rsi = zstr -> append at rdi (rdi stays on the terminator)
+    push rax
+.l: mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .d
+    inc rsi
+    inc rdi
+    jmp .l
+.d: pop rax
+    ret
+ex_dec:                              ; eax -> decimal text appended at rdi
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    mov ebx, 10
+    xor ecx, ecx
+.l: xor edx, edx
+    div ebx
+    push rdx
+    inc ecx
+    test eax, eax
+    jnz .l
+.p: pop rdx
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .p
+    mov byte [rdi], 0
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+ex_str:                              ; rsi = list, ecx = index -> rsi
+.l: test ecx, ecx
+    jz .d
+.s: cmp byte [rsi], 0
+    je .e
+    inc rsi
+    jmp .s
+.e: inc rsi
+    dec ecx
+    jmp .l
+.d: ret
+
+; ---- volume ----------------------------------------------------------------------------
+ex_beep:                             ; short tone: AC'97 when present, else the PC speaker
+    PUSHA
+    cmp byte [snd_tried], 0
+    jne .t
+    call snd_init
+.t: cmp byte [SB_MUTE], 0
+    jne .o
+    cmp byte [snd_ok], 0
+    je .pc
+    call snd_vol
+    mov ecx, 880
+    mov edx, 90
+    call snd_tone
+    jmp .o
+.pc:
+    movzx eax, byte [SB_VOL]
+    imul eax, eax, 90
+    add eax, 500                     ; Hz
+    mov ecx, eax
+    mov eax, 1193182
+    xor edx, edx
+    div ecx
+    mov ecx, eax
+    mov al, 0xB6
+    out 0x43, al
+    mov al, cl
+    out 0x42, al
+    mov al, ch
+    out 0x42, al
+    in al, 0x61
+    or al, 3
+    out 0x61, al
+    mov ecx, 2500000
+.d: pause
+    dec ecx
+    jnz .d
+    in al, 0x61
+    and al, 0xFC
+    out 0x61, al
+.o: POPA
+    ret
+
+vol_step:                            ; edx = +1 / -1
+    PUSHA
+    movzx eax, byte [SB_VOL]
+    add eax, edx
+    jns .p
+    xor eax, eax
+.p: cmp eax, 10
+    jbe .q
+    mov eax, 10
+.q: mov [SB_VOL], al
+    mov byte [SB_MUTE], 0
+    call ex_beep
+    call sb_save
+    call top_draw
+    POPA
+    ret
+
+ex_minute:                           ; once a minute (clock changed)
+    cmp byte [SB_BIOS], 0
+    je .o
+    call bat_poll
+.o: ret
+
+; ---- Super key requests, called from the shell loop ------------------------------------
+ex_super:
+    PUSHA
+    movzx eax, byte [su_req]
+    test eax, eax
+    jz .o
+    mov byte [su_req], 0
+    cmp eax, 1
+    je .x
+    cmp eax, 2
+    je .c
+    mov edx, 1
+    cmp eax, 3
+    je .v
+    mov edx, -1
+.v: call vol_step
+    call open_qpanel
+    jmp .o
+.x: call ex_tog5
+    jmp .o
+.c: call ex_tog6
+.o: POPA
+    ret
+ex_tog5:
+    cmp byte [pm_open], 0
+    je .op
+    cmp byte [pm_kind], 5
+    jne .op
+    call pm_close
+    ret
+.op:
+    mov dword [ov_ql], 0
+    mov byte [ov_q], 0
+    call open_launcher
+    ret
+ex_tog6:
+    cmp byte [pm_open], 0
+    je .op
+    cmp byte [pm_kind], 6
+    jne .op
+    call pm_close
+    ret
+.op:
+    call open_qpanel
+    ret
+
+; ---- keys while the launcher / panel is open ---------------------------------------------
+ex_keys:
+    PUSHA
+.again:
+    movzx ecx, byte [ov_h]
+    cmp cl, [ov_t]
+    je .o
+    movzx eax, byte [ov_ring+rcx]
+    inc cl
+    and cl, 15
+    mov [ov_h], cl
+    cmp byte [pm_open], 0
+    je .o
+    movzx r12d, byte [pm_kind]
+    cmp r12d, 5
+    jb .o
+    cmp r12d, 7
+    jae .o
+    cmp al, 27
+    je .esc
+    cmp al, K_UP
+    je .up
+    cmp al, K_DN
+    je .dn
+    cmp al, 13
+    je .ent
+    cmp r12d, 6
+    je .pk
+    cmp al, 8
+    je .bs
+    cmp al, 32
+    jb .o
+    cmp al, 126
+    ja .o
+    mov ecx, [ov_ql]
+    cmp ecx, 20
+    jae .o
+    cmp al, 'A'
+    jb .ap
+    cmp al, 'Z'
+    ja .ap
+    or al, 0x20
+.ap:
+    mov [ov_q+rcx], al
+    inc ecx
+    mov byte [ov_q+rcx], 0
+    mov [ov_ql], ecx
+    call open_launcher
+    jmp .o
+.bs:
+    mov ecx, [ov_ql]
+    test ecx, ecx
+    jz .o
+    dec ecx
+    mov byte [ov_q+rcx], 0
+    mov [ov_ql], ecx
+    call open_launcher
+    jmp .o
+.pk:                                 ; quick panel : left / right = volume
+    mov edx, -1
+    cmp al, K_LF
+    je .pv
+    mov edx, 1
+    cmp al, K_RT
+    jne .o
+.pv:
+    call vol_step
+    call open_qpanel
+    jmp .o
+.esc:
+    call pm_close
+    jmp .o
+.up:
+    mov edx, -1
+    jmp .mv
+.dn:
+    mov edx, 1
+.mv:
+    cmp dword [pm_n], 0
+    je .o
+    mov ebx, [pm_hov]
+    mov ecx, [pm_n]
+    inc ecx
+.ml:
+    add ebx, edx
+    cmp ebx, 0
+    jge .m1
+    mov ebx, [pm_n]
+    dec ebx
+.m1:
+    cmp ebx, [pm_n]
+    jl .m2
+    xor ebx, ebx
+.m2:
+    mov eax, ebx
+    shl eax, 4
+    test dword [pm_ent+rax+12], 3
+    jz .mok
+    dec ecx
+    jnz .ml
+    jmp .o
+.mok:
+    mov [pm_hov], ebx
+    call pm_draw
+    jmp .o
+.ent:
+    mov eax, [pm_hov]
+    test eax, eax
+    js .o
+    call pm_pick
+.o:
+    movzx ecx, byte [ov_h]
+    cmp cl, [ov_t]
+    jne .again
+    POPA
+    ret
+
+; ---- launcher (Super+X) ---------------------------------------------------------------------
+la_tab:
+    dq s_la_files
+    dd 50, 0
+    dq s_la_term
+    dd 51, 1
+    dq s_la_py
+    dd 51, 1
+    dq s_la_ed
+    dd 52, 2
+    dq s_la_br
+    dd 53, 3
+    dq s_la_im
+    dd 54, 4
+    dq s_la_pa
+    dd 55, 5
+    dq s_la_set
+    dd 56, 6
+    dq s_la_th
+    dd 66, 526
+    dq s_la_snd
+    dd 65, 518
+    dq s_la_mon
+    dd 3, 265
+    dq s_la_lock
+    dd 4, 269
+    dq s_la_out
+    dd 5, 267
+    dq s_la_rest
+    dd 6, 268
+    dq s_la_down
+    dd 7, 268
+    dq 0
+
+la_match:                            ; rsi = name -> ZF set if ov_q is inside it (case-insensitive)
+    PUSHA
+    cmp dword [ov_ql], 0
+    je .yes
+.pos:
+    cmp byte [rsi], 0
+    je .no
+    xor ecx, ecx
+.cm:
+    movzx eax, byte [ov_q+rcx]
+    test eax, eax
+    jz .yes
+    movzx edx, byte [rsi+rcx]
+    test edx, edx
+    jz .no
+    cmp dl, 'A'
+    jb .lw
+    cmp dl, 'Z'
+    ja .lw
+    or dl, 0x20
+.lw:
+    cmp al, dl
+    jne .nx
+    inc ecx
+    jmp .cm
+.nx:
+    inc rsi
+    jmp .pos
+.yes:
+    POPA
+    xor eax, eax                     ; ZF = 1
+    ret
+.no:
+    POPA
+    or eax, 1                        ; ZF = 0 (eax is not used by callers)
+    ret
+
+
+; ---- quick panel (Super+C) ------------------------------------------------------------------
+
+qp_put:                              ; eax = action, edx = flags ; text is r13..rdi
+    mov byte [rdi], 0
+    mov [r12], r13
+    mov [r12+8], eax
+    mov [r12+12], edx
+    add r12, 16
+    inc r14d
+    lea r13, [rdi+1]
+    mov rdi, r13
+    ret
+
+
+qp_action:                           ; eax = 60..64 (panel stays open)
+    PUSHA
+    cmp eax, 60
+    je .wf
+    cmp eax, 61
+    je .bt
+    cmp eax, 62
+    je .vu
+    cmp eax, 63
+    je .vd
+    xor byte [SB_MUTE], 1
+    jmp .sv
+.wf:
+    xor byte [SB_WIFI], 1
+    jmp .sv
+.bt:
+    xor byte [SB_BT], 1
+    jmp .sv
+.vu:
+    mov edx, 1
+    call vol_step
+    jmp .sv
+.vd:
+    mov edx, -1
+    call vol_step
+.sv:
+    call sb_save
+    call top_draw
+    call open_qpanel
+    POPA
+    ret
+
+; ---- top bar indicators (drawn left of the layout badge) ---------------------------------
+
+bar_inds:
+    PUSHA
+    call chrome_fg
+    mov [gv_c], eax
+    mov byte [gv_pass], 1
+    mov byte [gv_hole], 0
+    mov dword [gv_s], 0x3F400000          ; 0.75
+    mov dword [gv_oy], 0x40C00000         ; 6.0
+    mov r13d, [tb_kx0]
+    sub r13d, 12
+    mov [tb_ix0], r13d
+    ; battery (bit 16)
+    test byte [SB_BAR], 16
+    jz .nb
+    cmp byte [bat_ok], 0
+    je .bnp
+    lea rdi, [bi_buf]
+    movzx eax, byte [bat_pct]
+    call ex_dec
+    mov byte [rdi], '%'
+    mov byte [rdi+1], 0
+    lea rsi, [bi_buf]
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    mov eax, [gv_c]
+    mov [g_fg], eax
+    call ui_width
+    sub r13d, eax
+    mov ebx, r13d
+    mov ecx, 6
+    lea rsi, [bi_buf]
+    call ui_text
+    sub r13d, 6
+.bnp:
+    sub r13d, 25
+    call .setx
+    ALPHA 110
+    RR 11,12,10,6,2
+    ALPHA 255
+    movzx eax, byte [bat_pct]
+    cmp byte [bat_ok], 0
+    jne .bp
+    mov eax, 100
+.bp:
+    imul eax, 18
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    cmp eax, 3
+    jae .bq
+    mov eax, 3
+.bq:
+    mov ecx, eax
+    shr ecx, 1
+    lea eax, [rcx+2]
+    mov ebx, 12
+    mov esi, 3
+    mov edi, 1
+    call gv_rr
+    RR 22,12,1,2,1
+    sub r13d, 10
+.nb:
+    test byte [SB_BAR], 8
+    jz .nbt
+    sub r13d, 18
+    call .setx
+    cmp byte [SB_BT], 0
+    jne .bt1
+    ALPHA 110
+.bt1:
+    SEG 12,3,12,21,2
+    SEG 12,3,18,8,2
+    SEG 18,8,6,16,2
+    SEG 6,8,18,16,2
+    SEG 18,16,12,21,2
+    ALPHA 255
+    sub r13d, 10
+.nbt:
+    test byte [SB_BAR], 4
+    jz .nw
+    sub r13d, 18
+    call .setx
+    cmp byte [SB_WIFI], 0
+    jne .w1
+    ALPHA 110
+.w1:
+    DISC 12,19,2
+    RING 12,19,17,14,1
+    RING 12,19,12,9,1
+    RING 12,19,7,4,1
+    ALPHA 255
+    sub r13d, 10
+.nw:
+    test byte [SB_BAR], 2
+    jz .nv
+    sub r13d, 18
+    call .setx
+    RR 5,12,2,3,1
+    TRI 6,12,14,4,14,20
+    cmp byte [SB_MUTE], 0
+    jne .mu
+    SEG 17,9,17,15,2
+    SEG 21,6,21,18,2
+    jmp .vd
+.mu:
+    SEG 17,8,23,16,2
+    SEG 23,8,17,16,2
+.vd:
+    sub r13d, 10
+.nv:
+    cmp r13d, [tb_ix0]
+    jge .o
+    lea eax, [r13+6]
+    mov [tb_ix0], eax
+.o: POPA
+    ret
+.setx:
+    cvtsi2ss xmm0, r13d
+    movss [gv_ox], xmm0
+    ret
+
+; ---- settings panes ----------------------------------------------------------------------------
+
+st_pane_themes:
+    PUSHA
+    lea rsi, [s_pt_note]
+    mov ebx, SPX
+    mov ecx, PY0-12
+    call st_d
+    xor r12d, r12d
+.l: mov eax, r12d
+    xor edx, edx
+    mov ecx, 5
+    div ecx
+    imul r13d, edx, 108
+    add r13d, SPX
+    imul r14d, eax, 150
+    add r14d, PY0+22
+    xor edi, edi
+    movzx eax, byte [SB_PAL]
+    cmp eax, r12d
+    jne .ns
+    mov edi, 1
+.ns:
+    mov eax, r13d
+    mov ebx, r14d
+    mov ecx, 100
+    mov edx, 124
+    call st_card
+    imul r15d, r12d, 36
+    lea rbp, [pal_tab+r15]
+    mov eax, [rbp]
+    lea ebx, [r13+8]
+    lea ecx, [r14+8]
+    mov esi, 84
+    mov edx, 66
+    mov r9d, 6
+    call rrect
+    mov eax, [rbp+4]
+    lea ebx, [r13+8]
+    lea ecx, [r14+8]
+    mov esi, 84
+    mov edx, 16
+    mov r9d, 5
+    call rrect
+    mov eax, [rbp+28]
+    test eax, eax
+    jnz .ac
+    mov eax, 0x3584E4
+.ac:
+    lea ebx, [r13+16]
+    lea ecx, [r14+34]
+    mov esi, 38
+    mov edx, 12
+    mov r9d, 5
+    call rrect
+    mov eax, [rbp+12]
+    lea ebx, [r13+16]
+    lea ecx, [r14+54]
+    mov esi, 66
+    mov edx, 5
+    mov r9d, 2
+    call rrect
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    mov eax, [th_txt]
+    mov [g_fg], eax
+    lea rsi, [pal_names]
+    mov ecx, r12d
+    call ex_str
+    lea ebx, [r13+50]
+    lea ecx, [r14+88]
+    call ui_text_c
+    mov eax, r13d
+    mov ebx, r14d
+    mov ecx, 100
+    mov edx, 124
+    mov esi, A_PAL
+    mov edi, r12d
+    call hs_add
+    inc r12d
+    cmp r12d, NPAL
+    jb .l
+    POPA
+    ret
+
+
+st_pane_topbar:
+    PUSHA
+    lea rsi, [s_tb_note]
+    mov ebx, SPX
+    mov ecx, PY0-12
+    call st_d
+    xor r12d, r12d
+.l: imul eax, r12d, 48
+    add eax, PY0+16
+    mov r13d, eax
+    mov ecx, r12d
+    lea rsi, [s_tb_lay]
+    call .name
+    mov eax, 1
+    mov ecx, r12d
+    shl eax, cl
+    xor edi, edi
+    test [SB_BAR], al
+    jz .of
+    mov edi, 1
+.of:
+    mov r9d, eax
+    mov eax, SPX
+    mov ebx, r13d
+    mov ecx, 360
+    mov edx, 38
+    mov r8d, A_BARI
+    call st_opt
+    inc r12d
+    cmp r12d, 5
+    jb .l
+    lea rsi, [s_tb_note2]
+    mov ebx, SPX
+    mov ecx, PY0+16+5*48+8
+    call st_d
+    POPA
+    ret
+.name:                               ; ecx = index of the bar item -> rsi label
+    lea rsi, [s_tb_lay]
+    cmp ecx, 0
+    je .r
+    lea rsi, [s_tb_vol]
+    cmp ecx, 1
+    je .r
+    lea rsi, [s_tb_wifi]
+    cmp ecx, 2
+    je .r
+    lea rsi, [s_tb_bt]
+    cmp ecx, 3
+    je .r
+    lea rsi, [s_tb_bat]
+.r: ret
+
+
+st_pane_sound:
+    PUSHA
+    lea rsi, [s_sn_vol]
+    mov ebx, SPX
+    mov ecx, PY0-6
+    call st_h
+    xor r12d, r12d
+.v: imul eax, r12d, 49
+    add eax, SPX
+    lea rsi, [vol_lbl]
+    mov ecx, r12d
+    call ex_str
+    xor edi, edi
+    movzx ecx, byte [SB_VOL]
+    cmp ecx, r12d
+    jne .vn
+    mov edi, 1
+.vn:
+    mov ebx, PY0+20
+    mov ecx, 44
+    mov edx, 36
+    mov r8d, A_VOL
+    mov r9d, r12d
+    call st_opt
+    inc r12d
+    cmp r12d, 11
+    jb .v
+    lea rsi, [s_sn_mute]
+    movzx edi, byte [SB_MUTE]
+    mov eax, SPX
+    mov ebx, PY0+68
+    mov ecx, 140
+    mov edx, 36
+    mov r8d, A_MUTE
+    xor r9d, r9d
+    call st_opt
+    lea rsi, [s_sn_net]
+    mov ebx, SPX
+    mov ecx, PY0+120
+    call st_h
+    lea rsi, [s_sn_wifi]
+    movzx edi, byte [SB_WIFI]
+    mov eax, SPX
+    mov ebx, PY0+146
+    mov ecx, 200
+    mov edx, 36
+    mov r8d, A_WIFI
+    xor r9d, r9d
+    call st_opt
+    lea rsi, [s_sn_bt]
+    movzx edi, byte [SB_BT]
+    mov eax, SPX+216
+    mov ebx, PY0+146
+    mov ecx, 200
+    mov edx, 36
+    mov r8d, A_BT
+    xor r9d, r9d
+    call st_opt
+    lea rsi, [s_sn_bios]
+    movzx edi, byte [SB_BIOS]
+    mov eax, SPX
+    mov ebx, PY0+196
+    mov ecx, 416
+    mov edx, 36
+    mov r8d, A_BIOS
+    xor r9d, r9d
+    call st_opt
+    lea rsi, [s_sn_n4]
+    cmp byte [bat_ok], 0
+    jne .nb
+    lea rsi, [s_sn_n4b]
+.nb:
+    mov ebx, SPX
+    mov ecx, PY0+244
+    call st_p
+    lea rsi, [s_sn_n1]
+    mov ebx, SPX
+    mov ecx, PY0+284
+    call st_d
+    lea rsi, [s_sn_n2]
+    mov ebx, SPX
+    mov ecx, PY0+308
+    call st_d
+    lea rsi, [s_sn_n3]
+    mov ebx, SPX
+    mov ecx, PY0+332
+    call st_d
+    lea rsi, [s_sn_n5]
+    mov ebx, SPX
+    mov ecx, PY0+356
+    call st_d
+    lea rsi, [s_sn_n6]
+    mov ebx, SPX
+    mov ecx, PY0+380
+    call st_d
+    POPA
+    ret
+
+; esi = action, edi = value (settings click)
+ex_act:
+    PUSHA
+    cmp esi, A_PAL
+    je .pal
+    cmp esi, A_BARI
+    je .bar
+    cmp esi, A_VOL
+    je .vol
+    cmp esi, A_MUTE
+    je .mute
+    cmp esi, A_WIFI
+    je .wifi
+    cmp esi, A_BT
+    je .bt
+    cmp esi, A_BIOS
+    je .bios
+    jmp .o
+.pal:
+    cmp edi, NPAL
+    jae .o
+    mov [SB_PAL], dil
+    call st_changed_look
+    jmp .o
+.bar:
+    xor [SB_BAR], dil
+    jmp .sv
+.vol:
+    cmp edi, 10
+    ja .o
+    mov [SB_VOL], dil
+    mov byte [SB_MUTE], 0
+    call ex_beep
+    jmp .sv
+.mute:
+    xor byte [SB_MUTE], 1
+    jmp .sv
+.wifi:
+    xor byte [SB_WIFI], 1
+    jmp .sv
+.bt:
+    xor byte [SB_BT], 1
+    jmp .sv
+.bios:
+    xor byte [SB_BIOS], 1
+    mov byte [bat_ok], 0
+    cmp byte [SB_BIOS], 0
+    je .sv
+    call bat_poll
+.sv:
+    call cfg_apply_save
+    call top_draw
+    call st_retarget
+.o: POPA
+    ret
+
+; ---- end extras.inc
+; ---- begin bios.inc
+; =============================================================================
+;  BIOS services from long mode: disk read/write on any BIOS drive (IDE, SATA in
+;  legacy mode, USB sticks), drive size query, APM battery.
+; =============================================================================
+BOUNCE  equ 0x70000                  ; 32 KB bounce buffer for int 13h (free low memory)
+
+
+%ifndef TESTBUILD
+bios_call:                           ; run  int [bc_int]  with the registers in bc_ax..bc_di
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+    mov [bc_rsp], rsp
+    mov rax, cr0
+    mov [bc_cr0], eax
+    mov rax, cr3
+    mov [bc_cr3], eax
+    mov rax, cr4
+    mov [bc_cr4], eax
+    in al, 0x21
+    mov [bc_pic1], al
+    in al, 0xA1
+    mov [bc_pic2], al
+    mov al, [bc_int]
+    mov [bc_int_op], al
+    mov al, [bc_pic1]
+    or al, 0x02                      ; keyboard and mouse stay with the kernel
+    out 0x21, al
+    mov al, [bc_pic2]
+    or al, 0x10
+    out 0xA1, al
+    cli
+    push qword 0x08
+    push qword bc_c32
+    db 0x48, 0xCB                    ; retfq -> 32-bit compatibility mode
+bc_back64:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov rsp, [bc_rsp]
+    mov al, [bc_pic1]
+    out 0x21, al
+    mov al, [bc_pic2]
+    out 0xA1, al
+    popfq
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+%macro DAPBUF 0
+    mov word [bc_dap+4], 0
+    mov word [bc_dap+6], BOUNCE >> 4
+    mov word [bc_si], bc_dap
+%endmacro
+%macro INFSI 0
+    mov word [bc_si], bc_inf
+%endmacro
+BNC_P equ BOUNCE
+%endif
+
+; bd_xfer: ebx = 0x42 read / 0x43 write, edx = drive, eax = LBA, ecx = sectors (1..32) -> CF
+bd_xfer:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov byte [bc_dap], 0x10
+    mov byte [bc_dap+1], 0
+    mov [bc_dap+2], cx
+    DAPBUF
+    mov [bc_dap+8], eax
+    mov dword [bc_dap+12], 0
+    mov eax, ebx
+    shl eax, 8
+    mov [bc_ax], ax
+    mov [bc_dx], dx
+    mov word [bc_bx], 0
+    mov word [bc_cx], 0
+    mov byte [bc_int], 0x13
+    call bios_call
+    cmp byte [bc_cf], 0
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    jne .err
+    clc
+    ret
+.err:
+    stc
+    ret
+
+
+; bios_rd: edx = drive, eax = LBA, ecx = sectors, rdi = destination (advances) -> CF
+bios_rd:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+.l: test ecx, ecx
+    jz .ok
+    mov ebx, ecx
+    cmp ebx, 32
+    jbe .n
+    mov ebx, 32
+.n: push rcx
+    mov ecx, ebx
+    push rbx
+    mov ebx, 0x42
+    call bd_xfer
+    pop rbx
+    pop rcx
+    jc .e
+    push rcx
+    mov rsi, BNC_P
+    mov ecx, ebx
+    shl ecx, 9
+    rep movsb
+    pop rcx
+    add eax, ebx
+    sub ecx, ebx
+    jmp .l
+.ok:
+    clc
+    jmp .o
+.e: stc
+.o: pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; bios_wr: edx = drive, eax = LBA, ecx = sectors, rsi = source (advances) -> CF
+bios_wr:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+.l: test ecx, ecx
+    jz .ok
+    mov ebx, ecx
+    cmp ebx, 32
+    jbe .n
+    mov ebx, 32
+.n: push rcx
+    push rbx
+    mov ecx, ebx
+    shl ecx, 9
+    mov rdi, BNC_P
+    rep movsb
+    pop rbx
+    mov ecx, ebx
+    push rbx
+    mov ebx, 0x43
+    call bd_xfer
+    pop rbx
+    pop rcx
+    jc .e
+    add eax, ebx
+    sub ecx, ebx
+    jmp .l
+.ok:
+    clc
+    jmp .o
+.e: stc
+.o: pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; bios_info: edx = drive -> rax = total sectors (0 = no such drive)
+bios_info:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov [bc_dx], dx
+    mov word [bc_ax], 0x4100
+    mov word [bc_bx], 0x55AA
+    mov byte [bc_int], 0x13
+    call bios_call
+    cmp byte [bc_cf], 0
+    jne .no
+    cmp word [bc_bx], 0xAA55
+    jne .no
+    mov word [bc_ax], 0x4800
+    INFSI
+    mov byte [bc_int], 0x13
+    mov word [bc_inf], 0x1E
+    call bios_call
+    cmp byte [bc_cf], 0
+    jne .no
+    mov rax, [bc_inf+0x10]
+    jmp .o
+.no:
+    xor eax, eax
+.o: pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- APM battery (older BIOSes; modern UEFI/ACPI-only machines answer "no APM") ----
+
+apm_call:                            ; ax, bx, cx already stored -> CF
+    mov byte [bc_int], 0x15
+    call bios_call
+    cmp byte [bc_cf], 0
+    ret
+
+bat_poll:
+    PUSHA
+    mov byte [bat_ok], 0
+    mov word [bc_ax], 0x5300         ; installation check
+    mov word [bc_bx], 0
+    call apm_call
+    jne .o
+    mov word [bc_ax], 0x5301         ; connect (real mode interface)
+    mov word [bc_bx], 0
+    call apm_call
+    mov word [bc_ax], 0x530E         ; driver version 1.2
+    mov word [bc_bx], 0
+    mov word [bc_cx], 0x0102
+    call apm_call
+    mov word [bc_ax], 0x530A         ; power status, all devices
+    mov word [bc_bx], 1
+    call apm_call
+    jne .dis
+    mov ax, [bc_bx]
+    mov [bat_ac], ah
+    mov [bat_chg], al
+    mov cx, [bc_cx]
+    mov [bat_pct], cl
+    test ch, 0x80
+    jnz .dis                         ; no system battery
+    cmp cl, 100
+    ja .dis
+    mov byte [bat_ok], 1
+.dis:
+    mov word [bc_ax], 0x5304         ; disconnect
+    mov word [bc_bx], 0
+    call apm_call
+.o: POPA
+    ret
+
+; write one sector to the boot medium through the BIOS (used when the ATA ports do not reach it)
+bw1:                                 ; eax = LBA, rsi = source (advances)
+    push rax
+    push rcx
+    push rdx
+    movzx edx, byte [bootdrv]
+    mov ecx, 1
+    call bios_wr
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ---- end bios.inc
+; ---- begin install.inc
+; =============================================================================
+;  Terminal commands:  install   (copy Centtrix to another BIOS disk)
+;                      battery   (APM battery query, experimental)
+;                      biossave  (write the whole file system to the boot medium via the BIOS)
+;  Everything goes through the BIOS (bios.inc), so IDE, SATA (legacy mode) and USB disks work.
+; =============================================================================
+IMG_FS   equ FS_LBA + 1 + MAXF*32            ; sectors that make up a complete image
+IBUF     equ PY + 0x200000                   ; scratch (the Python heap, idle outside `python`)
+IBUF2    equ IBUF + 0x10000
+
+
+tput_hex2:                           ; al -> two hex digits
+    push rax
+    push rcx
+    mov cl, al
+    shr al, 4
+    call .d
+    mov al, cl
+    and al, 15
+    call .d
+    pop rcx
+    pop rax
+    ret
+.d: add al, '0'
+    cmp al, '9'
+    jbe .p
+    add al, 7
+.p: call tput_c
+    ret
+
+; copy sectors [0, FS_LBA) of the boot medium to the target, then the RAM copy of the file system
+term_install:
+    PUSHA
+    lea rsi, [s_in_head]
+    call tput_s
+    xor r12d, r12d                   ; candidate count
+    mov r13d, 0x80
+    lea rdi, [in_drv]
+    xor eax, eax
+    mov ecx, 8
+    rep stosb
+    lea rdi, [in_sec]
+    mov ecx, 64
+    rep stosb
+.e: mov edx, r13d
+    call bios_info
+    test rax, rax
+    jz .nx
+    push rax
+    lea rsi, [s_in_drive]
+    call tput_s
+    mov al, r13b
+    call tput_hex2
+    pop rax
+    mov rbx, rax
+    shr rax, 11                      ; MB
+    cmp r13b, [bootdrv]
+    je .isboot
+    inc r12d
+    mov [in_drv+r12-1], r13b
+    mov [in_sec+r12*8-8], rbx
+    push rax
+    mov al, ' '
+    call tput_c
+    mov al, '#'
+    call tput_c
+    mov eax, r12d
+    call tput_dec
+    mov al, ' '
+    call tput_c
+    pop rax
+    call tput_dec
+    lea rsi, [s_in_mb]
+    call tput_s
+    call tnl
+    jmp .nx
+.isboot:
+    push rax
+    mov al, ' '
+    call tput_c
+    pop rax
+    call tput_dec
+    lea rsi, [s_in_mb]
+    call tput_s
+    lea rsi, [s_in_boot]
+    call tput_s
+    call tnl
+.nx:
+    inc r13d
+    cmp r13d, 0x88
+    jb .e
+    test r12d, r12d
+    jnz .ask
+    lea rsi, [s_in_none]
+    call tput_s
+    jmp .out
+.ask:
+    mov [in_n], r12d
+    lea rsi, [s_in_ask]
+    call tput_s
+    lea rdi, [TMPB]
+    call term_getline
+    jc .cancel
+    movzx eax, byte [TMPB]
+    sub eax, '0'
+    jbe .cancel
+    cmp eax, [in_n]
+    ja .cancel
+    dec eax
+    movzx r14d, byte [in_drv+rax]    ; target drive
+    mov r15, [in_sec+rax*8]          ; its size in sectors
+    cmp r15, IMG_FS
+    jb .small
+    lea rsi, [s_in_warn1]
+    call tput_s
+    lea rsi, [s_in_drive]
+    call tput_s
+    mov eax, r14d
+    call tput_hex2
+    mov al, ' '
+    call tput_c
+    mov rax, r15
+    shr rax, 11
+    call tput_dec
+    lea rsi, [s_in_mb]
+    call tput_s
+    call tnl
+    lea rsi, [s_in_warn2]
+    call tput_s
+    lea rdi, [TMPB]
+    call term_getline
+    jc .cancel
+    lea rsi, [TMPB]
+    lea rdi, [s_in_erase]
+    call strcmp
+    jne .cancel
+    lea rsi, [s_in_cur]
+    call tput_s
+    ; ---- boot code + kernel, straight from the boot medium ----
+    xor r12d, r12d                   ; LBA
+.cp:
+    cmp r12d, FS_LBA
+    jae .fs
+    mov ecx, FS_LBA
+    sub ecx, r12d
+    cmp ecx, 32
+    jbe .c1
+    mov ecx, 32
+.c1:
+    mov ebx, ecx                     ; sectors in this chunk
+    movzx edx, byte [bootdrv]
+    mov eax, r12d
+    mov rdi, IBUF
+    call bios_rd
+    jc .rerr
+    mov rsi, IBUF
+    mov edx, r14d
+    mov eax, r12d
+    mov ecx, ebx
+    call bios_wr
+    jc .werr
+    call .verify
+    jc .verr
+    mov al, '.'
+    call tput_c
+    add r12d, ebx
+    jmp .cp
+.fs:
+    ; the live file system: build a fresh CNT3 on the target drive
+    mov [fs_tgt], r14d
+    call fs3_format
+    call fs3_seed
+    mov dword [fs_tgt], 0
+    movzx eax, byte [bootdrv]
+    mov [fs_tgt], eax
+    lea rsi, [s_in_ok]
+    call tput_s
+    jmp .out
+.verify:                             ; read r12d.. (ebx sectors) back from r14d and compare with IBUF
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov edx, r14d
+    mov eax, r12d
+    mov ecx, ebx
+    mov rdi, IBUF2
+    call bios_rd
+    jc .ve
+    mov rsi, IBUF
+    mov rdi, IBUF2
+    mov ecx, ebx
+    shl ecx, 7
+    repe cmpsd
+    jne .ve
+    clc
+    jmp .vo
+.ve:
+    stc
+.vo:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+.rerr:
+    lea rsi, [s_in_rerr]
+    jmp .msg
+.werr:
+    lea rsi, [s_in_werr]
+    jmp .msg
+.verr:
+    lea rsi, [s_in_verr]
+    jmp .msg
+.small:
+    lea rsi, [s_in_small]
+    jmp .msg
+.cancel:
+    lea rsi, [s_in_bad]
+.msg:
+    call tput_s
+.out:
+    POPA
+    ret
+
+term_df:
+    PUSHA
+    lea rsi, [s_df_head]
+    call tput_s
+    movzx edx, byte [bootdrv]
+    call bios_info
+    test rax, rax
+    jz .noata
+    lea rsi, [s_df_disk]
+    call tput_s
+    shr rax, 11
+    call tput_dec
+    lea rsi, [s_df_mb]
+    call tput_s
+    call tnl
+    jmp .cl
+.noata:
+    lea rsi, [s_df_noata]
+    call tput_s
+.cl:
+    lea rsi, [s_df_cl]
+    call tput_s
+    mov eax, [SB3_NCL]
+    sub eax, [SB3_FREE]
+    call tput_dec
+    lea rsi, [s_df_of]
+    call tput_s
+    mov eax, [SB3_NCL]
+    call tput_dec
+    lea rsi, [s_df_free]
+    call tput_s
+    mov eax, [SB3_FREE]
+    call tput_dec
+    call tnl
+    call fs3_count
+    lea rsi, [s_df_files]
+    call tput_s
+    mov eax, [fs_nfiles]
+    call tput_dec
+    lea rsi, [s_df_dcom]
+    call tput_s
+    mov eax, [fs_ndirs]
+    call tput_dec
+    lea rsi, [s_df_fcom]
+    call tput_s
+    mov eax, [fs_nbytes]
+    call tput_dec
+    lea rsi, [s_df_bend]
+    call tput_s
+    POPA
+    ret
+
+term_battery:
+    PUSHA
+    call bat_poll
+    cmp byte [bat_ok], 0
+    jne .y
+    lea rsi, [s_bt_none]
+    call tput_s
+    jmp .o
+.y: lea rsi, [s_bt_val]
+    call tput_s
+    movzx eax, byte [bat_pct]
+    call tput_dec
+    lea rsi, [s_bt_pc]
+    call tput_s
+    lea rsi, [s_bt_unk]
+    cmp byte [bat_ac], 1
+    jne .n1
+    lea rsi, [s_bt_ac]
+.n1:
+    cmp byte [bat_ac], 0
+    jne .n2
+    lea rsi, [s_bt_bat]
+.n2:
+    call tput_s
+    call tnl
+.o: POPA
+    ret
+
+term_biossave:
+    PUSHA
+    cmp byte [SB_BIOS], 0
+    jne .go
+    lea rsi, [s_bs_off]
+    call tput_s
+    jmp .o
+.go:
+    call fs3_flushterm
+    lea rsi, [s_bs_ok]
+    call tput_s
+.o: POPA
+    ret
+
+; ---- end install.inc
+; ---- begin audio.inc
+; =============================================================================
+;  Sound: Intel AC'97 (ICH, also what QEMU's  -device AC97  provides).
+;  Falls back to the PC speaker when no AC'97 controller is found.
+;  Not covered: Intel HD Audio (most PCs from ~2006 on) - that needs a much larger driver.
+;  Written from the AC'97 / ICH register documentation; not run against a real device here.
+; =============================================================================
+AUBUF   equ PY + 0x300000            ; tone samples (python heap area, idle outside `python`)
+AUBDL   equ AUBUF - 64               ; buffer descriptor list
+
+snd_find:                            ; -> CF clear and snd_busdev set when an AC'97 controller exists
+    PUSHA
+    xor r12d, r12d                   ; bus
+.b: xor r13d, r13d                   ; device
+.d: xor r14d, r14d                   ; function
+.f: mov eax, r12d
+    shl eax, 16
+    mov ecx, r13d
+    shl ecx, 11
+    or eax, ecx
+    mov ecx, r14d
+    shl ecx, 8
+    or eax, ecx
+    mov ebx, eax
+    xor ecx, ecx
+    call pci_rd
+    cmp ax, 0xFFFF
+    je .nf
+    test ax, ax
+    jz .nf
+    cmp ax, 0x8086
+    jne .nx
+    mov eax, ebx
+    mov ecx, 8
+    call pci_rd
+    shr eax, 16
+    cmp ax, 0x0401
+    jne .nx
+    mov [snd_busdev], ebx
+    POPA
+    clc
+    ret
+.nf:
+    test r14d, r14d
+    jz .nd                           ; no function 0 -> no device
+.nx:
+    inc r14d
+    cmp r14d, 8
+    jb .f
+.nd:
+    inc r13d
+    cmp r13d, 32
+    jb .d
+    inc r12d
+    cmp r12d, 4
+    jb .b
+    POPA
+    stc
+    ret
+
+snd_init:
+    PUSHA
+    mov byte [snd_tried], 1
+    mov byte [snd_ok], 0
+    call snd_find
+    jc .o
+    mov eax, [snd_busdev]
+    mov ecx, 0x10
+    call pci_rd
+    test al, 1
+    jz .o                            ; BAR0 must be an I/O BAR
+    and eax, 0xFFFC
+    mov [snd_nam], ax
+    mov eax, [snd_busdev]
+    mov ecx, 0x14
+    call pci_rd
+    test al, 1
+    jz .o
+    and eax, 0xFFFC
+    mov [snd_nabm], ax
+    mov eax, [snd_busdev]
+    mov ecx, 4
+    call pci_rd
+    or eax, 5                        ; I/O space + bus master
+    and eax, 0xFFFF
+    mov esi, eax
+    mov eax, [snd_busdev]
+    mov ecx, 4
+    call pci_wr
+    movzx edx, word [snd_nabm]
+    add dx, 0x2C
+    mov eax, 2                       ; release the cold reset
+    out dx, eax
+    mov ecx, 3000000
+.w: movzx edx, word [snd_nabm]
+    add dx, 0x30
+    in eax, dx
+    test eax, 0x100                  ; primary codec ready
+    jnz .r
+    pause
+    dec ecx
+    jnz .w
+    jmp .o
+.r: movzx edx, word [snd_nam]
+    xor eax, eax
+    out dx, ax                       ; codec reset
+    mov ecx, 3000000
+.w2:
+    movzx edx, word [snd_nam]
+    add dx, 0x26
+    in ax, dx
+    and eax, 0x0F
+    cmp eax, 0x0F
+    je .ok
+    pause
+    dec ecx
+    jnz .w2
+.ok:
+    mov byte [snd_ok], 1
+    call snd_vol
+.o: POPA
+    ret
+
+snd_vol:                             ; mixer follows SB_VOL / SB_MUTE
+    PUSHA
+    cmp byte [snd_ok], 0
+    je .o
+    movzx eax, byte [SB_VOL]
+    mov ecx, 10
+    sub ecx, eax
+    imul ecx, ecx, 3                 ; attenuation 0..30 (1.5 dB steps)
+    mov eax, ecx
+    shl eax, 8
+    or eax, ecx
+    cmp byte [SB_MUTE], 0
+    jne .m
+    cmp byte [SB_VOL], 0
+    jne .w
+.m: or eax, 0x8000
+.w: mov ebx, eax
+    movzx edx, word [snd_nam]
+    add dx, 0x02                     ; master volume
+    mov ax, bx
+    out dx, ax
+    movzx edx, word [snd_nam]
+    add dx, 0x18                     ; PCM out volume
+    mov ax, bx
+    out dx, ax
+.o: POPA
+    ret
+
+; snd_tone: ecx = frequency in Hz, edx = milliseconds (<= 300) through the AC'97 DMA engine
+snd_tone:
+    PUSHA
+    cmp byte [snd_ok], 0
+    je .o
+    mov r12d, ecx
+    mov r13d, edx
+    ; 48000 Hz, 16-bit stereo square wave
+    imul r14d, r13d, 48              ; frames
+    mov eax, 48000
+    xor edx, edx
+    div r12d
+    shr eax, 1
+    jnz .p
+    mov eax, 1
+.p: mov r15d, eax                    ; half period in frames
+    mov rdi, AUBUF
+    xor ecx, ecx
+    xor ebx, ebx                     ; frames written
+.g: cmp ebx, r14d
+    jae .gd
+    mov eax, ebx
+    xor edx, edx
+    div r15d
+    test eax, 1
+    mov eax, 0x3000
+    jz .s
+    mov eax, -0x3000
+.s: mov [rdi], ax
+    mov [rdi+2], ax
+    add rdi, 4
+    inc ebx
+    jmp .g
+.gd:
+    ; one buffer descriptor: address, number of 16-bit samples
+    mov dword [AUBDL], AUBUF
+    lea eax, [r14*2]
+    mov [AUBDL+4], ax
+    mov word [AUBDL+6], 0
+    movzx edx, word [snd_nabm]
+    add dx, 0x1B
+    mov al, 2                        ; reset the PCM-out channel
+    out dx, al
+    mov ecx, 1000000
+.rs:
+    in al, dx
+    test al, 2
+    jz .rd
+    pause
+    dec ecx
+    jnz .rs
+.rd:
+    movzx edx, word [snd_nabm]
+    add dx, 0x10
+    mov eax, AUBDL
+    out dx, eax
+    movzx edx, word [snd_nabm]
+    add dx, 0x15
+    xor eax, eax
+    out dx, al                       ; last valid index 0
+    movzx edx, word [snd_nabm]
+    add dx, 0x16
+    mov ax, 0x1C
+    out dx, ax                       ; clear status
+    movzx edx, word [snd_nabm]
+    add dx, 0x1B
+    mov al, 1                        ; run
+    out dx, al
+    mov ecx, 30000000
+.pl:
+    movzx edx, word [snd_nabm]
+    add dx, 0x16
+    in ax, dx
+    test ax, 0x0C                    ; LVBCI / BCIS : the buffer was played
+    jnz .dn
+    pause
+    dec ecx
+    jnz .pl
+.dn:
+    movzx edx, word [snd_nabm]
+    add dx, 0x1B
+    xor eax, eax
+    out dx, al                       ; stop
+.o: POPA
+    ret
+
+; ---- end audio.inc
+; ---- begin glass.inc
+; =============================================================================
+;  GLASS : frosted-glass panels (real blur of the screen behind them), anti-aliased
+;  discs / rings / lines, small vector icons, big thin clock text.
+;  All drawing goes to the current target (gfx_target), in screen coordinates.
+; =============================================================================
+GLB     equ 0x6600000                ; blurred backdrop, later the finished panel (< 1 MB)
+GLLB    equ 0x66F8000                ; line buffer for the blur
+GLM     equ 18                       ; shadow margin around a glass panel (= PMSH)
+GL_R    equ 8                        ; blur radius
+
+
+; ---- packed colour mix: eax = c, edx = t, ecx = a (0..256 weight of t) -> eax ------------
+gl_mix:
+    push rbx
+    push rsi
+    push rdi
+    mov ebx, 256
+    sub ebx, ecx
+    mov esi, eax
+    and esi, 0x00FF00FF
+    imul esi, ebx
+    mov edi, edx
+    and edi, 0x00FF00FF
+    imul edi, ecx
+    add esi, edi
+    shr esi, 8
+    and esi, 0x00FF00FF
+    and eax, 0x0000FF00
+    imul eax, ebx
+    and edx, 0x0000FF00
+    imul edx, ecx
+    add eax, edx
+    shr eax, 8
+    and eax, 0x0000FF00
+    or eax, esi
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; ---- box blur of one line ---------------------------------------------------------------
+; rsi = source, rdi = destination, ecx = n, [gl_ss]/[gl_ds] strides in bytes
+glb_px:                               ; r13d = index (clamped) -> eax = 0x00RRGGBB
+    mov eax, r13d
+    test eax, eax
+    jns .a
+    xor eax, eax
+.a: mov r14d, [gl_n]
+    dec r14d
+    cmp eax, r14d
+    jbe .b
+    mov eax, r14d
+.b: imul rax, [gl_ss]
+    mov eax, [rsi+rax]
+    and eax, 0xFFFFFF
+    ret
+gl_addpx:                            ; eax = pixel, sign in r8d (+1 / -1) -> sums r9 r10 r11
+    movzx r15d, al
+    imul r15d, r8d
+    add r11d, r15d
+    mov r15d, eax
+    shr r15d, 8
+    movzx r15d, r15b
+    imul r15d, r8d
+    add r10d, r15d
+    shr eax, 16
+    movzx r15d, al
+    imul r15d, r8d
+    add r9d, r15d
+    ret
+gl_blur_line:
+    PUSHA
+    mov [gl_n], ecx
+    mov eax, 65536
+    xor edx, edx
+    mov ecx, 2*GL_R+1
+    div ecx
+    mov [gl_rc], eax
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    mov r13d, -GL_R
+.ini:
+    call glb_px
+    mov r8d, 1
+    call gl_addpx
+    inc r13d
+    cmp r13d, GL_R
+    jle .ini
+    xor r12d, r12d
+.lp:
+    cmp r12d, [gl_n]
+    jae .done
+    mov eax, r9d
+    imul eax, [gl_rc]
+    add eax, 0x8000
+    shr eax, 16
+    cmp eax, 255
+    jbe .r1
+    mov eax, 255
+.r1:
+    shl eax, 16
+    mov ebx, eax
+    mov eax, r10d
+    imul eax, [gl_rc]
+    add eax, 0x8000
+    shr eax, 16
+    cmp eax, 255
+    jbe .g1
+    mov eax, 255
+.g1:
+    shl eax, 8
+    or ebx, eax
+    mov eax, r11d
+    imul eax, [gl_rc]
+    add eax, 0x8000
+    shr eax, 16
+    cmp eax, 255
+    jbe .b1
+    mov eax, 255
+.b1:
+    or ebx, eax
+    mov [rdi], ebx
+    add rdi, [gl_ds]
+    lea r13d, [r12+GL_R+1]
+    call glb_px
+    mov r8d, 1
+    call gl_addpx
+    lea r13d, [r12-GL_R]
+    call glb_px
+    mov r8d, -1
+    call gl_addpx
+    inc r12d
+    jmp .lp
+.done:
+    POPA
+    ret
+
+; copy a strided line into the line buffer: rsi = source, rbx = stride, ecx = n
+gl_copy_line:
+    push rax
+    push rcx
+    push rdi
+    mov rdi, GLLB
+.l: mov eax, [rsi]
+    mov [rdi], eax
+    add rsi, rbx
+    add rdi, 4
+    dec ecx
+    jnz .l
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; one in-place pass over the GLB image : r12d = 0 horizontal / 1 vertical
+gl_pass:
+    PUSHA
+    mov r13d, [gl_w]
+    mov r14d, [gl_h]
+    test r12d, r12d
+    jnz .v
+    ; rows
+    xor r15d, r15d
+.hr:
+    mov eax, r15d
+    imul eax, r13d
+    shl rax, 2
+    mov r8, GLB
+    add r8, rax
+    mov rsi, r8
+    mov ebx, 4
+    mov ecx, r13d
+    call gl_copy_line
+    mov rsi, GLLB
+    mov rdi, r8
+    mov qword [gl_ss], 4
+    mov qword [gl_ds], 4
+    mov ecx, r13d
+    call gl_blur_line
+    inc r15d
+    cmp r15d, r14d
+    jb .hr
+    jmp .o
+.v:
+    xor r15d, r15d
+.vc:
+    mov r8, r15
+    shl r8, 2
+    add r8, GLB
+    mov rsi, r8
+    mov eax, r13d
+    shl eax, 2
+    mov ebx, eax
+    mov ecx, r14d
+    call gl_copy_line
+    mov rsi, GLLB
+    mov rdi, r8
+    mov qword [gl_ss], 4
+    mov eax, r13d
+    shl eax, 2
+    mov [gl_ds], rax
+    mov ecx, r14d
+    call gl_blur_line
+    inc r15d
+    cmp r15d, r13d
+    jb .vc
+.o: POPA
+    ret
+
+; ---- gl_make: build a glass panel.  eax=x ebx=y ecx=w edx=h esi=radius  (screen coords of the glass itself)
+;      sets up SI_CARD (sized for panel + shadow), draws shadow + blurred backdrop + tint + rim,
+;      keeps the finished image in GLB so gl_redraw can restore it cheaply.
+gl_make:
+    PUSHA
+    mov [gl_x], eax
+    mov [gl_y], ebx
+    mov [gl_w], ecx
+    mov [gl_h], edx
+    mov [gl_rad], esi
+    lea eax, [rcx+2*GLM]
+    mov [gl_sw], eax
+    lea eax, [rdx+2*GLM]
+    mov [gl_sh], eax
+    ; make BACK hold the clean screen (no old panel, no mouse pointer) under the new glass
+    mov esi, SI_CARD
+    call surf_hide
+    mov eax, [gl_x]
+    sub eax, GLM
+    mov ebx, [gl_y]
+    sub ebx, GLM
+    mov ecx, eax
+    add ecx, [gl_sw]
+    mov edx, ebx
+    add edx, [gl_sh]
+    call damage
+    mov byte [cur_skip], 1
+    call wm_flush
+    mov byte [cur_skip], 0
+    ; tint by theme
+    cmp byte [SB_THEME], 0
+    jne .dk
+    mov dword [gl_tc], 0xFFFFFF
+    mov dword [gl_hi], 150
+    mov dword [gl_lo], 120
+    mov dword [gl_rimc], 0xFFFFFF
+    mov dword [gl_rima], 170
+    jmp .t1
+.dk:
+    mov dword [gl_tc], 0x15151D
+    mov dword [gl_hi], 120
+    mov dword [gl_lo], 150
+    mov dword [gl_rimc], 0xFFFFFF
+    mov dword [gl_rima], 64
+.t1:
+    ; 1. backdrop -> GLB (w x h), blurred
+    xor r15d, r15d
+.cp:
+    mov eax, [gl_y]
+    add eax, r15d
+    imul eax, [back_pitch]
+    mov rsi, BACK
+    add rsi, rax
+    mov eax, [gl_x]
+    lea rsi, [rsi+rax*4]
+    mov eax, r15d
+    imul eax, [gl_w]
+    shl rax, 2
+    mov rdi, GLB
+    add rdi, rax
+    mov ecx, [gl_w]
+.cr:
+    mov eax, [rsi]
+    and eax, 0xFFFFFF
+    mov [rdi], eax
+    add rsi, 4
+    add rdi, 4
+    dec ecx
+    jnz .cr
+    inc r15d
+    cmp r15d, [gl_h]
+    jb .cp
+    mov r12d, 0
+    call gl_pass
+    mov r12d, 1
+    call gl_pass
+    mov r12d, 0
+    call gl_pass
+    mov r12d, 1
+    call gl_pass
+    ; 2. surface: transparent, then the soft shadow
+    mov esi, SI_CARD
+    mov ebx, [gl_x]
+    sub ebx, GLM
+    mov ecx, [gl_y]
+    sub ecx, GLM
+    mov eax, [gl_sw]
+    mov edx, [gl_sh]
+    mov rdi, M_CARD
+    call surf_setup
+    mov esi, SI_CARD
+    call gfx_target
+    mov eax, [gl_x]
+    mov [pm_x], eax
+    mov eax, [gl_y]
+    mov [pm_y], eax
+    mov eax, [gl_w]
+    mov [pm_w], eax
+    mov eax, [gl_h]
+    mov [pm_h], eax
+    mov eax, [gl_rad]
+    mov [pm_rad], eax
+    call gl_shadow
+    ; 3. tint + rounded mask + rim, composed over the shadow
+    call gl_finish
+    ; 4. keep a copy of the whole surface
+    mov eax, [gl_sw]
+    imul eax, [gl_sh]
+    mov ecx, eax
+    mov rsi, M_CARD
+    mov rdi, GLB
+    rep movsd
+    mov byte [gl_ok], 1
+    POPA
+    ret
+
+; the soft shadow (rings, like panel_bg but without the body)
+gl_shadow:
+    PUSHA
+    mov r15d, GLM
+.sh:
+    mov eax, GLM
+    sub eax, r15d
+    imul eax, eax, 3
+    add eax, 4
+    xor eax, 255
+    shl eax, 24
+    mov ebx, [gl_x]
+    sub ebx, r15d
+    mov ecx, [gl_y]
+    sub ecx, r15d
+    add ecx, 5
+    mov esi, [gl_w]
+    lea esi, [rsi+r15*2]
+    mov edx, [gl_h]
+    lea edx, [rdx+r15*2]
+    mov r9d, [gl_rad]
+    add r9d, r15d
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+    dec r15d
+    jnz .sh
+    POPA
+    ret
+
+; corner coverage : ebx = i, ecx = j (pixel inside the panel) -> eax = coverage 0..255, edx = rim 0..256
+; (255,0 for ordinary pixels)
+gl_corner:
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov r8d, [gl_rad]
+    mov eax, [gl_w]
+    mov esi, [gl_h]
+    ; horizontal / vertical distance to the corner centre
+    mov edx, r8d                      ; cx
+    cmp ebx, r8d
+    jb .hx
+    sub eax, r8d
+    cmp ebx, eax
+    jb .no
+    mov edx, eax                      ; right corner centre = w - r
+.hx:
+    mov edi, r8d                      ; cy
+    cmp ecx, r8d
+    jb .hy
+    sub esi, r8d
+    cmp ecx, esi
+    jb .no
+    mov edi, esi
+.hy:
+    ; d = distance from the pixel centre to (edx, edi)
+    lea eax, [rbx*2+1]
+    sub eax, edx
+    sub eax, edx                      ; 2*(x+.5) - 2*cx
+    imul eax, eax
+    lea esi, [rcx*2+1]
+    sub esi, edi
+    sub esi, edi
+    imul esi, esi
+    add eax, esi
+    cvtsi2ss xmm0, eax
+    sqrtss xmm0, xmm0
+    mov eax, 0x3F000000               ; 0.5
+    movd xmm3, eax
+    mulss xmm0, xmm3                  ; d
+    cvtsi2ss xmm1, r8d
+    subss xmm1, xmm0                  ; r - d
+    movaps xmm2, xmm1
+    addss xmm2, xmm3                  ; coverage = r - d + .5
+    xorps xmm4, xmm4
+    maxss xmm2, xmm4
+    mov eax, 0x3F800000
+    movd xmm5, eax
+    minss xmm2, xmm5
+    mov eax, 0x437F0000               ; 255.0
+    movd xmm6, eax
+    mulss xmm2, xmm6
+    cvtss2si eax, xmm2
+    ; rim : 1px band inside the edge -> strength = clamp(1.5 - (r - d))
+    mov edx, 0x3FC00000               ; 1.5
+    movd xmm7, edx
+    subss xmm7, xmm1
+    maxss xmm7, xmm4
+    minss xmm7, xmm5
+    mov edx, 0x43800000               ; 256.0
+    movd xmm6, edx
+    mulss xmm7, xmm6
+    cvtss2si edx, xmm7
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    ret
+.no:
+    mov eax, 255
+    xor edx, edx
+    ; straight edges get the rim
+    test ebx, ebx
+    jz .rim
+    test ecx, ecx
+    jz .rim
+    push rax
+    mov eax, [gl_w]
+    dec eax
+    cmp ebx, eax
+    pop rax
+    je .rim
+    push rax
+    mov eax, [gl_h]
+    dec eax
+    cmp ecx, eax
+    pop rax
+    je .rim
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    ret
+.rim:
+    mov edx, 256
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    ret
+
+gl_finish:
+    PUSHA
+    xor r14d, r14d                    ; j
+.row:
+    ; tint alpha for this row: lo + (hi - lo) * (h-1-j) / (h-1)
+    mov eax, [gl_h]
+    dec eax
+    sub eax, r14d
+    mov ecx, [gl_hi]
+    sub ecx, [gl_lo]
+    imul eax, ecx
+    cdq
+    mov ecx, [gl_h]
+    dec ecx
+    idiv ecx
+    add eax, [gl_lo]
+    mov r13d, eax                     ; tint weight
+    xor r12d, r12d                    ; i
+.px:
+    ; source pixel
+    mov eax, r14d
+    imul eax, [gl_w]
+    add eax, r12d
+    mov rsi, GLB
+    mov eax, [rsi+rax*4]
+    mov edx, [gl_tc]
+    mov ecx, r13d
+    call gl_mix
+    mov r15d, eax                     ; glass colour
+    mov ebx, r12d
+    mov ecx, r14d
+    call gl_corner
+    test eax, eax
+    jz .next
+    mov r8d, eax                      ; coverage
+    test edx, edx
+    jz .nr
+    mov eax, r15d
+    mov ecx, edx
+    imul ecx, [gl_rima]
+    shr ecx, 8                        ; rim weight 0..256
+    mov edx, [gl_rimc]
+    call gl_mix
+    mov r15d, eax
+.nr:
+    ; destination address inside the surface
+    mov eax, r14d
+    add eax, GLM
+    imul eax, [gl_sw]
+    add eax, r12d
+    add eax, GLM
+    mov rdi, M_CARD
+    lea rdi, [rdi+rax*4]
+    cmp r8d, 255
+    jb .part
+    mov [rdi], r15d                   ; opaque
+    jmp .next
+.part:
+    mov eax, [rdi]
+    mov ebx, r15d
+    mov edx, r8d
+    call lerp_px
+    mov [rdi], eax
+.next:
+    inc r12d
+    cmp r12d, [gl_w]
+    jb .px
+    inc r14d
+    cmp r14d, [gl_h]
+    jb .row
+    POPA
+    ret
+
+; restore the finished panel into the surface and mark it all dirty (contents are redrawn on top)
+gl_redraw:
+    PUSHA
+    mov esi, SI_CARD
+    call gfx_target
+    mov eax, [gl_sw]
+    imul eax, [gl_sh]
+    mov ecx, eax
+    mov rsi, GLB
+    mov rdi, M_CARD
+    rep movsd
+    mov ebx, [gl_x]
+    sub ebx, GLM
+    mov ecx, [gl_y]
+    sub ecx, GLM
+    mov esi, [gl_sw]
+    mov edx, [gl_sh]
+    call mark_dirty
+    POPA
+    ret
+
+; =============================================================================
+;  anti-aliased shapes.  Centres / end points are on the pixel grid (integers),
+;  colour in r10d (0xRRGGBB), alpha in edx (0..255).
+; =============================================================================
+
+; coverage of a disc at the current pixel centre: xmm0 = px, xmm1 = py, centre (xmm2,xmm3), r xmm4 -> xmm0 (0..1)
+gs_discc:
+    subss xmm0, xmm2
+    subss xmm1, xmm3
+    mulss xmm0, xmm0
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    sqrtss xmm0, xmm0
+    subss xmm4, xmm0
+    addss xmm4, [gs_half]
+    xorps xmm0, xmm0
+    maxss xmm4, xmm0
+    minss xmm4, [gs_one]
+    movaps xmm0, xmm4
+    ret
+
+; ebx = x, ecx = y -> eax = coverage 0..255 for the current shape
+gs_cov:
+    cvtsi2ss xmm0, ebx
+    addss xmm0, [gs_half]
+    cvtsi2ss xmm1, ecx
+    addss xmm1, [gs_half]
+    movaps xmm6, xmm0                 ; px
+    movaps xmm7, xmm1                 ; py
+    mov eax, [gs_mode]
+    cmp eax, 2
+    je .cap
+    cmp eax, 4
+    je .rr
+    cmp eax, 5
+    je .tri
+    ; angular masks (ring / disc)
+    mov eax, [gs_mask]
+    test eax, eax
+    jz .nomask
+    movss xmm2, xmm6
+    subss xmm2, [gs_cx]               ; dx
+    movss xmm3, [gs_cy]
+    subss xmm3, xmm7                  ; up = cy - y
+    cmp eax, 1
+    je .m1
+    cmp eax, 2
+    je .m2
+    cmp eax, 4
+    je .m4
+    cmp eax, 5
+    je .m5
+    cmp eax, 6
+    je .m6
+    ; 3: cone to the right  (dx > |dy|)
+    movss xmm4, xmm7
+    subss xmm4, [gs_cy]
+    mov eax, 0x7FFFFFFF
+    movd xmm5, eax
+    andps xmm4, xmm5
+    comiss xmm2, xmm4
+    jbe .zero
+    jmp .nomask
+.m1:                                  ; cone up : up > |dx|
+    mov eax, 0x7FFFFFFF
+    movd xmm5, eax
+    andps xmm2, xmm5
+    comiss xmm3, xmm2
+    jbe .zero
+    jmp .nomask
+.m4:                                  ; everything except the cone up (power symbol)
+    mov eax, 0x7FFFFFFF
+    movd xmm5, eax
+    andps xmm2, xmm5
+    comiss xmm3, xmm2
+    ja .zero
+    jmp .nomask
+.m5:                                  ; left half
+    xorps xmm4, xmm4
+    comiss xmm2, xmm4
+    jae .zero
+    jmp .nomask
+.m6:                                  ; right half
+    xorps xmm4, xmm4
+    comiss xmm2, xmm4
+    jbe .zero
+    jmp .nomask
+.m2:                                  ; half plane above the centre line
+    xorps xmm4, xmm4
+    comiss xmm3, xmm4
+    jbe .zero
+.nomask:
+    movaps xmm0, xmm6
+    movaps xmm1, xmm7
+    movss xmm2, [gs_cx]
+    movss xmm3, [gs_cy]
+    movss xmm4, [gs_r]
+    call gs_discc
+    movaps xmm5, xmm0                 ; outer coverage
+    mov eax, [gs_mode]
+    cmp eax, 1
+    jne .m3
+    ; ring : times coverage outside the inner radius
+    movaps xmm0, xmm6
+    movaps xmm1, xmm7
+    movss xmm2, [gs_cx]
+    movss xmm3, [gs_cy]
+    movss xmm4, [gs_r0]
+    call gs_discc
+    movss xmm1, [gs_one]
+    subss xmm1, xmm0
+    mulss xmm5, xmm1
+    jmp .out
+.m3:
+    cmp eax, 3
+    jne .out
+    ; crescent : minus the second disc
+    movaps xmm0, xmm6
+    movaps xmm1, xmm7
+    movss xmm2, [gs_x1]
+    movss xmm3, [gs_y1]
+    movss xmm4, [gs_r1]
+    call gs_discc
+    movss xmm1, [gs_one]
+    subss xmm1, xmm0
+    mulss xmm5, xmm1
+.out:
+    mulss xmm5, [gs_255]
+    cvtss2si eax, xmm5
+    ret
+.zero:
+    xor eax, eax
+    ret
+.rr:                                  ; rounded rectangle: centre (cx,cy), half sizes (x1,y1), radius r
+    movaps xmm0, xmm6
+    subss xmm0, [gs_cx]
+    mov eax, 0x7FFFFFFF
+    movd xmm5, eax
+    andps xmm0, xmm5
+    movss xmm2, [gs_x1]
+    subss xmm2, [gs_r]
+    subss xmm0, xmm2                  ; qx
+    movaps xmm1, xmm7
+    subss xmm1, [gs_cy]
+    andps xmm1, xmm5
+    movss xmm3, [gs_y1]
+    subss xmm3, [gs_r]
+    subss xmm1, xmm3                  ; qy
+    movaps xmm2, xmm0
+    maxss xmm2, xmm1
+    xorps xmm4, xmm4
+    minss xmm2, xmm4                  ; min(max(qx,qy),0)
+    maxss xmm0, xmm4
+    maxss xmm1, xmm4
+    mulss xmm0, xmm0
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    sqrtss xmm0, xmm0
+    addss xmm0, xmm2
+    subss xmm0, [gs_r]                ; signed distance
+    movss xmm1, [gs_half]
+    subss xmm1, xmm0
+    maxss xmm1, xmm4
+    minss xmm1, [gs_one]
+    mulss xmm1, [gs_255]
+    cvtss2si eax, xmm1
+    ret
+.tri:                                 ; triangle from gs_t (v0 v1 v2 v0), orientation in gs_ts
+    movss xmm5, [gs_big]
+    lea rsi, [gs_t]
+    mov ecx, 3
+.te:
+    movss xmm0, [rsi+8]
+    subss xmm0, [rsi]                 ; ex
+    movss xmm1, [rsi+12]
+    subss xmm1, [rsi+4]               ; ey
+    movaps xmm2, xmm7
+    subss xmm2, [rsi+4]
+    mulss xmm2, xmm0
+    movaps xmm3, xmm6
+    subss xmm3, [rsi]
+    mulss xmm3, xmm1
+    subss xmm2, xmm3
+    mulss xmm2, [gs_ts]
+    mulss xmm0, xmm0
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    sqrtss xmm0, xmm0
+    divss xmm2, xmm0
+    minss xmm5, xmm2
+    add rsi, 8
+    dec ecx
+    jnz .te
+    addss xmm5, [gs_half]
+    xorps xmm0, xmm0
+    maxss xmm5, xmm0
+    minss xmm5, [gs_one]
+    mulss xmm5, [gs_255]
+    cvtss2si eax, xmm5
+    ret
+.cap:                                 ; capsule from (cx,cy) to (x1,y1), half thickness r
+    movss xmm2, [gs_x1]
+    subss xmm2, [gs_cx]               ; bx
+    movss xmm3, [gs_y1]
+    subss xmm3, [gs_cy]               ; by
+    movaps xmm4, xmm6
+    subss xmm4, [gs_cx]               ; ax
+    movaps xmm5, xmm7
+    subss xmm5, [gs_cy]               ; ay
+    movaps xmm0, xmm4
+    mulss xmm0, xmm2
+    movaps xmm1, xmm5
+    mulss xmm1, xmm3
+    addss xmm0, xmm1                  ; a . b
+    divss xmm0, [gs_len2]
+    xorps xmm1, xmm1
+    maxss xmm0, xmm1
+    minss xmm0, [gs_one]              ; t
+    mulss xmm2, xmm0
+    mulss xmm3, xmm0
+    subss xmm4, xmm2
+    subss xmm5, xmm3
+    mulss xmm4, xmm4
+    mulss xmm5, xmm5
+    addss xmm4, xmm5
+    sqrtss xmm4, xmm4                 ; distance
+    movss xmm0, [gs_r]
+    subss xmm0, xmm4
+    addss xmm0, [gs_half]
+    xorps xmm1, xmm1
+    maxss xmm0, xmm1
+    minss xmm0, [gs_one]
+    mulss xmm0, [gs_255]
+    cvtss2si eax, xmm0
+    ret
+
+; draw the current shape inside [gs_bx0,gs_bx1) x [gs_by0,gs_by1) ; colour r10d, alpha [gs_A]
+gs_fill:
+    PUSHA
+    mov r12d, [gs_by0]
+.y: mov r13d, [gs_bx0]
+.x: mov ebx, r13d
+    mov ecx, r12d
+    call gs_cov
+    test eax, eax
+    jz .n
+    imul eax, [gs_A]
+    add eax, 127
+    mov ecx, 255
+    xor edx, edx
+    div ecx
+    test eax, eax
+    jz .n
+    mov edx, eax
+    mov ebx, r13d
+    mov ecx, r12d
+    call gl_plot
+.n: inc r13d
+    cmp r13d, [gs_bx1]
+    jl .x
+    inc r12d
+    cmp r12d, [gs_by1]
+    jl .y
+    POPA
+    ret
+
+; ebx = x, ecx = y, edx = alpha, r10d = colour : blend one pixel into the current target
+gl_plot:
+    push rax
+    push rcx
+    push rsi
+    push r13
+    push r15
+    mov eax, ecx
+    imul rax, [cur_pitch]
+    mov ecx, ebx
+    lea r15, [rax+rcx*4]
+    add r15, [cur_fb]
+    cmp edx, 255
+    jbe .a
+    mov edx, 255
+.a: call plot_a
+    pop r15
+    pop r13
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; helpers that load the globals (ints -> floats) and fill the bounding box
+; eax = cx, ebx = cy, ecx = radius : filled disc
+gl_disc:
+    PUSHA
+    mov [gs_A], edx
+    mov dword [gs_mode], 0
+    mov dword [gs_mask], 0
+    cvtsi2ss xmm0, eax
+    movss [gs_cx], xmm0
+    cvtsi2ss xmm0, ebx
+    movss [gs_cy], xmm0
+    cvtsi2ss xmm0, ecx
+    movss [gs_r], xmm0
+    mov esi, eax
+    sub esi, ecx
+    dec esi
+    mov [gs_bx0], esi
+    lea esi, [rax+rcx+2]
+    mov [gs_bx1], esi
+    mov esi, ebx
+    sub esi, ecx
+    dec esi
+    mov [gs_by0], esi
+    lea esi, [rbx+rcx+2]
+    mov [gs_by1], esi
+    call gs_fill
+    POPA
+    ret
+
+; eax = cx, ebx = cy, ecx = outer radius, esi = inner radius, edi = mask (0..3)
+gl_ring:
+    PUSHA
+    mov [gs_A], edx
+    mov dword [gs_mode], 1
+    mov [gs_mask], edi
+    cvtsi2ss xmm0, eax
+    movss [gs_cx], xmm0
+    cvtsi2ss xmm0, ebx
+    movss [gs_cy], xmm0
+    cvtsi2ss xmm0, ecx
+    movss [gs_r], xmm0
+    cvtsi2ss xmm0, esi
+    movss [gs_r0], xmm0
+    mov esi, eax
+    sub esi, ecx
+    dec esi
+    mov [gs_bx0], esi
+    lea esi, [rax+rcx+2]
+    mov [gs_bx1], esi
+    mov esi, ebx
+    sub esi, ecx
+    dec esi
+    mov [gs_by0], esi
+    lea esi, [rbx+rcx+2]
+    mov [gs_by1], esi
+    call gs_fill
+    POPA
+    ret
+
+; capsule : eax = x0, ebx = y0, ecx = x1, esi = y1, edi = thickness in half pixels (e.g. 5 = 2.5 px)
+gl_seg:
+    PUSHA
+    mov [gs_A], edx
+    mov dword [gs_mode], 2
+    mov dword [gs_mask], 0
+    cvtsi2ss xmm0, eax
+    movss [gs_cx], xmm0
+    cvtsi2ss xmm0, ebx
+    movss [gs_cy], xmm0
+    cvtsi2ss xmm0, ecx
+    movss [gs_x1], xmm0
+    cvtsi2ss xmm0, esi
+    movss [gs_y1], xmm0
+    cvtsi2ss xmm0, edi
+    mov edx, 0x3F000000
+    movd xmm1, edx
+    mulss xmm0, xmm1
+    mulss xmm0, xmm1                  ; thickness / 4 = half thickness in px
+    movss [gs_r], xmm0
+    ; |b - a|^2
+    mov edx, ecx
+    sub edx, eax
+    imul edx, edx
+    mov edi, esi
+    sub edi, ebx
+    imul edi, edi
+    add edx, edi
+    jnz .l
+    mov edx, 1
+.l: cvtsi2ss xmm0, edx
+    movss [gs_len2], xmm0
+    ; bounding box
+    mov edx, eax
+    cmp ecx, edx
+    jge .a
+    mov edx, ecx
+.a: sub edx, 4
+    mov [gs_bx0], edx
+    mov edx, eax
+    cmp ecx, edx
+    jle .b
+    mov edx, ecx
+.b: add edx, 5
+    mov [gs_bx1], edx
+    mov edx, ebx
+    cmp esi, edx
+    jge .c
+    mov edx, esi
+.c: sub edx, 4
+    mov [gs_by0], edx
+    mov edx, ebx
+    cmp esi, edx
+    jle .d
+    mov edx, esi
+.d: add edx, 5
+    mov [gs_by1], edx
+    call gs_fill
+    POPA
+    ret
+
+; crescent : outer disc (eax, ebx, ecx) minus a second disc at (esi, edi) radius [gs_r1 set from edx]
+gl_moon:                              ; eax=cx ebx=cy ecx=R esi=cx2 edi=cy2 r8d=R2 ; edx = alpha
+    PUSHA
+    mov [gs_A], edx
+    mov dword [gs_mode], 3
+    mov dword [gs_mask], 0
+    cvtsi2ss xmm0, eax
+    movss [gs_cx], xmm0
+    cvtsi2ss xmm0, ebx
+    movss [gs_cy], xmm0
+    cvtsi2ss xmm0, ecx
+    movss [gs_r], xmm0
+    cvtsi2ss xmm0, esi
+    movss [gs_x1], xmm0
+    cvtsi2ss xmm0, edi
+    movss [gs_y1], xmm0
+    cvtsi2ss xmm0, r8d
+    movss [gs_r1], xmm0
+    mov esi, eax
+    sub esi, ecx
+    dec esi
+    mov [gs_bx0], esi
+    lea esi, [rax+rcx+2]
+    mov [gs_bx1], esi
+    mov esi, ebx
+    sub esi, ecx
+    dec esi
+    mov [gs_by0], esi
+    lea esi, [rbx+rcx+2]
+    mov [gs_by1], esi
+    call gs_fill
+    POPA
+    ret
+
+; =============================================================================
+;  icons.  eax = cx, ebx = cy (centre), r10d = colour.  About 28 px wide.
+; =============================================================================
+gi_wifi:
+    PUSHA
+    mov r12d, eax
+    lea r13d, [rbx+9]
+    mov eax, r12d
+    mov ebx, r13d
+    mov ecx, 3
+    mov edx, 255
+    call gl_disc
+    mov r14d, 0
+.l: lea eax, [r14+r14*4]              ; 5 * i
+    lea ecx, [rax+9]                  ; outer 9, 14, 19
+    lea esi, [rax+6]                  ; inner 6, 11, 16
+    mov eax, r12d
+    mov ebx, r13d
+    mov edi, 1
+    mov edx, 255
+    call gl_ring
+    inc r14d
+    cmp r14d, 3
+    jb .l
+    POPA
+    ret
+
+gi_seg5:                              ; helper: x0 y0 x1 y1 in r8d r9d r11d r15d ; thickness 5
+    PUSHA
+    mov eax, r8d
+    mov ebx, r9d
+    mov ecx, r11d
+    mov esi, r15d
+    mov edi, 5
+    mov edx, 255
+    call gl_seg
+    POPA
+    ret
+
+gi_bt:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    ; stem T-B
+    lea r8d, [r12]
+    lea r9d, [r13-11]
+    mov r11d, r12d
+    lea r15d, [r13+11]
+    call gi_seg5
+    ; T - R1
+    lea r8d, [r12]
+    lea r9d, [r13-11]
+    lea r11d, [r12+6]
+    lea r15d, [r13-5]
+    call gi_seg5
+    ; R1 - L2
+    lea r8d, [r12+6]
+    lea r9d, [r13-5]
+    lea r11d, [r12-6]
+    lea r15d, [r13+5]
+    call gi_seg5
+    ; B - R2
+    lea r8d, [r12]
+    lea r9d, [r13+11]
+    lea r11d, [r12+6]
+    lea r15d, [r13+5]
+    call gi_seg5
+    ; R2 - L1
+    lea r8d, [r12+6]
+    lea r9d, [r13+5]
+    lea r11d, [r12-6]
+    lea r15d, [r13-5]
+    call gi_seg5
+    POPA
+    ret
+
+gi_moon:
+    PUSHA
+    lea eax, [rax-1]
+    lea esi, [rax+7]
+    lea edi, [rbx-3]
+    mov ecx, 11
+    mov r8d, 9
+    mov edx, 255
+    call gl_moon
+    POPA
+    ret
+
+gi_sun:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    mov ecx, 5
+    mov edx, 255
+    call gl_disc
+    lea r14, [sun_rays]
+    mov r15d, 8
+.l: movsx eax, byte [r14]
+    movsx ebx, byte [r14+1]
+    movsx ecx, byte [r14+2]
+    movsx esi, byte [r14+3]
+    add eax, r12d
+    add ebx, r13d
+    add ecx, r12d
+    add esi, r13d
+    mov edi, 5
+    mov edx, 255
+    call gl_seg
+    add r14, 4
+    dec r15d
+    jnz .l
+    POPA
+    ret
+
+gi_gear:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    mov ecx, 7
+    mov esi, 4
+    xor edi, edi
+    mov edx, 255
+    call gl_ring
+    lea r14, [gear_teeth]
+    mov r15d, 8
+.l: movsx eax, byte [r14]
+    movsx ebx, byte [r14+1]
+    movsx ecx, byte [r14+2]
+    movsx esi, byte [r14+3]
+    add eax, r12d
+    add ebx, r13d
+    add ecx, r12d
+    add esi, r13d
+    mov edi, 8
+    mov edx, 255
+    call gl_seg
+    add r14, 4
+    dec r15d
+    jnz .l
+    POPA
+    ret
+
+gi_mon:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    lea r8d, [r12-11]
+    lea r9d, [r13-9]
+    lea r11d, [r12+11]
+    lea r15d, [r13-9]
+    call gi_seg5
+    lea r8d, [r12+11]
+    lea r9d, [r13-9]
+    lea r11d, [r12+11]
+    lea r15d, [r13+5]
+    call gi_seg5
+    lea r8d, [r12+11]
+    lea r9d, [r13+5]
+    lea r11d, [r12-11]
+    lea r15d, [r13+5]
+    call gi_seg5
+    lea r8d, [r12-11]
+    lea r9d, [r13+5]
+    lea r11d, [r12-11]
+    lea r15d, [r13-9]
+    call gi_seg5
+    lea r8d, [r12]
+    lea r9d, [r13+5]
+    lea r11d, [r12]
+    lea r15d, [r13+10]
+    call gi_seg5
+    lea r8d, [r12-5]
+    lea r9d, [r13+10]
+    lea r11d, [r12+5]
+    lea r15d, [r13+10]
+    call gi_seg5
+    POPA
+    ret
+
+gi_lock:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    lea ebx, [r13-3]
+    mov eax, r12d
+    mov ecx, 6
+    mov esi, 3
+    mov edi, 2
+    mov edx, 255
+    call gl_ring
+    ; shackle legs
+    lea r8d, [r12-5]
+    lea r9d, [r13-3]
+    lea r11d, [r12-5]
+    lea r15d, [r13-1]
+    call gi_seg5
+    lea r8d, [r12+5]
+    lea r9d, [r13-3]
+    lea r11d, [r12+5]
+    lea r15d, [r13-1]
+    call gi_seg5
+    mov eax, r10d
+    and eax, 0xFFFFFF
+    lea ebx, [r12-8]
+    lea ecx, [r13-2]
+    mov esi, 16
+    mov edx, 13
+    mov r9d, 3
+    call rrect
+    POPA
+    ret
+
+gi_spk:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    lea r8d, [r12-9]
+    lea r9d, [r13-3]
+    lea r11d, [r12-9]
+    lea r15d, [r13+3]
+    call gi_seg5
+    lea r8d, [r12-9]
+    lea r9d, [r13-3]
+    lea r11d, [r12-4]
+    lea r15d, [r13-3]
+    call gi_seg5
+    lea r8d, [r12-9]
+    lea r9d, [r13+3]
+    lea r11d, [r12-4]
+    lea r15d, [r13+3]
+    call gi_seg5
+    lea r8d, [r12-4]
+    lea r9d, [r13-3]
+    lea r11d, [r12+2]
+    lea r15d, [r13-8]
+    call gi_seg5
+    lea r8d, [r12-4]
+    lea r9d, [r13+3]
+    lea r11d, [r12+2]
+    lea r15d, [r13+8]
+    call gi_seg5
+    lea r8d, [r12+2]
+    lea r9d, [r13-8]
+    lea r11d, [r12+2]
+    lea r15d, [r13+8]
+    call gi_seg5
+    lea eax, [r12+2]
+    mov ebx, r13d
+    mov ecx, 9
+    mov esi, 7
+    mov edi, 3
+    mov edx, 255
+    call gl_ring
+    lea eax, [r12+2]
+    mov ebx, r13d
+    mov ecx, 14
+    mov esi, 12
+    mov edi, 3
+    mov edx, 255
+    call gl_ring
+    POPA
+    ret
+
+gi_search:
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    lea eax, [r12-2]
+    lea ebx, [r13-2]
+    mov ecx, 8
+    mov esi, 6
+    xor edi, edi
+    mov edx, 255
+    call gl_ring
+    lea eax, [r12+4]
+    lea ebx, [r13+4]
+    lea ecx, [r12+10]
+    lea esi, [r13+10]
+    mov edi, 7
+    mov edx, 255
+    call gl_seg
+    POPA
+    ret
+
+gi_batt:                              ; battery outline: eax = x (left), ebx = y (top) of a 30 x 15 icon
+    PUSHA
+    mov r12d, eax
+    mov r13d, ebx
+    lea r8d, [r12+1]
+    lea r9d, [r13+1]
+    lea r11d, [r12+25]
+    lea r15d, [r13+1]
+    call gi_seg5
+    lea r8d, [r12+25]
+    lea r9d, [r13+1]
+    lea r11d, [r12+25]
+    lea r15d, [r13+14]
+    call gi_seg5
+    lea r8d, [r12+25]
+    lea r9d, [r13+14]
+    lea r11d, [r12+1]
+    lea r15d, [r13+14]
+    call gi_seg5
+    lea r8d, [r12+1]
+    lea r9d, [r13+14]
+    lea r11d, [r12+1]
+    lea r15d, [r13+1]
+    call gi_seg5
+    lea r8d, [r12+28]
+    lea r9d, [r13+5]
+    lea r11d, [r12+28]
+    lea r15d, [r13+10]
+    call gi_seg5
+    POPA
+    ret
+
+; =============================================================================
+;  bilinear icon scaling: rsi = ARGB source (0xTTRRGGBB, square, stride = size), eax = source size,
+;  ebx = x, ecx = y, edx = destination size.  Used for the app icons of the launcher.
+; =============================================================================
+gl_lerp4:                             ; eax = a, ebx = b, ecx = f (0..256) -> eax
+    push rsi
+    push rdi
+    push rdx
+    mov esi, eax
+    and esi, 0x00FF00FF
+    mov edi, ebx
+    and edi, 0x00FF00FF
+    mov edx, 256
+    sub edx, ecx
+    imul esi, edx
+    imul edi, ecx
+    add esi, edi
+    shr esi, 8
+    and esi, 0x00FF00FF
+    shr eax, 8
+    and eax, 0x00FF00FF
+    shr ebx, 8
+    and ebx, 0x00FF00FF
+    imul eax, edx
+    imul ebx, ecx
+    add eax, ebx
+    and eax, 0xFF00FF00
+    or eax, esi
+    pop rdx
+    pop rdi
+    pop rsi
+    ret
+
+
+gl_pxget:                             ; eax = x, edx = y (clamped to the source) -> eax = pixel
+    mov ecx, [gl_ibt_sz]
+    dec ecx
+    test eax, eax
+    jns .a
+    xor eax, eax
+.a: cmp eax, ecx
+    jbe .b
+    mov eax, ecx
+.b: test edx, edx
+    jns .c
+    xor edx, edx
+.c: cmp edx, ecx
+    jbe .d
+    mov edx, ecx
+.d: inc ecx
+    imul edx, ecx
+    add eax, edx
+    mov rdx, [gl_ibt_src]
+    mov eax, [rdx+rax*4]
+    ret
+
+gl_iblit:
+    PUSHA
+    mov [gl_ibt_src], rsi
+    mov [gl_ibt_sz], eax
+    mov [gl_ibt_x], ebx
+    mov [gl_ibt_y], ecx
+    mov [gl_ibt_d], edx
+    shl eax, 16
+    xor edx, edx
+    div dword [gl_ibt_d]
+    mov [gl_ibt_step], eax            ; source pixels per destination pixel, 16.16
+    xor r15d, r15d                    ; destination row
+.r: mov eax, r15d
+    imul eax, [gl_ibt_step]
+    mov ecx, [gl_ibt_step]
+    shr ecx, 1
+    add eax, ecx
+    sub eax, 0x8000
+    mov edx, eax
+    sar edx, 16
+    mov [gl_ibt_row], edx
+    sar eax, 8
+    and eax, 255
+    mov [gl_ibt_fy], eax
+    xor r14d, r14d                    ; destination column
+.c: mov eax, r14d
+    imul eax, [gl_ibt_step]
+    mov ecx, [gl_ibt_step]
+    shr ecx, 1
+    add eax, ecx
+    sub eax, 0x8000
+    mov edx, eax
+    sar edx, 16
+    mov [gl_ibt_ix], edx
+    sar eax, 8
+    and eax, 255
+    mov [gl_ibt_fx], eax
+    ; four samples
+    mov eax, [gl_ibt_ix]
+    mov edx, [gl_ibt_row]
+    call gl_pxget
+    mov r8d, eax                      ; p00
+    mov eax, [gl_ibt_ix]
+    inc eax
+    mov edx, [gl_ibt_row]
+    call gl_pxget
+    mov r9d, eax                      ; p10
+    mov eax, [gl_ibt_ix]
+    mov edx, [gl_ibt_row]
+    inc edx
+    call gl_pxget
+    mov r11d, eax                     ; p01
+    mov eax, [gl_ibt_ix]
+    inc eax
+    mov edx, [gl_ibt_row]
+    inc edx
+    call gl_pxget
+    mov ebx, eax                      ; p11
+    mov [gl_ibt_p11], eax
+    mov eax, r8d
+    mov ebx, r9d
+    mov ecx, [gl_ibt_fx]
+    call gl_lerp4
+    mov r12d, eax                     ; top
+    mov eax, r11d
+    mov ebx, [gl_ibt_p11]
+    mov ecx, [gl_ibt_fx]
+    call gl_lerp4
+    mov ebx, eax                      ; bottom
+    mov eax, r12d
+    mov ecx, [gl_ibt_fy]
+    call gl_lerp4
+    mov r10d, eax
+    shr eax, 24
+    mov edx, 255
+    sub edx, eax                      ; alpha
+    jz .sk
+    and r10d, 0xFFFFFF
+    mov ebx, r14d
+    add ebx, [gl_ibt_x]
+    mov ecx, r15d
+    add ecx, [gl_ibt_y]
+    call gl_plot
+.sk:
+    inc r14d
+    cmp r14d, [gl_ibt_d]
+    jb .c
+    inc r15d
+    cmp r15d, [gl_ibt_d]
+    jb .r
+    POPA
+    ret
+
+; =============================================================================
+;  gl_pill : gradient rounded rectangle.  ebx=x ecx=y esi=w edx=h r9d=radius eax=top colour r8d=bottom colour
+; =============================================================================
+gl_pill:
+    PUSHA
+    mov [gp_x], ebx
+    mov [gp_y], ecx
+    mov [gp_top], eax
+    mov [gp_bot], r8d
+    mov eax, [gl_w]
+    mov [gp_sw], eax
+    mov eax, [gl_h]
+    mov [gp_sh], eax
+    mov eax, [gl_rad]
+    mov [gp_sr], eax
+    mov [gl_w], esi
+    mov [gl_h], edx
+    mov [gl_rad], r9d
+    xor r14d, r14d
+.row:
+    mov eax, r14d
+    shl eax, 8
+    xor edx, edx
+    mov ecx, [gl_h]
+    dec ecx
+    jnz .dv
+    mov ecx, 1
+.dv:
+    div ecx
+    mov ecx, eax
+    mov eax, [gp_top]
+    mov edx, [gp_bot]
+    call gl_mix
+    mov r15d, eax
+    mov eax, [gl_h]
+    shr eax, 1
+    cmp r14d, eax
+    jae .ng
+    mov ecx, eax
+    sub eax, r14d
+    imul eax, [gp_gloss]
+    xor edx, edx
+    div ecx
+    mov ecx, eax
+    mov eax, r15d
+    mov edx, 0xFFFFFF
+    call gl_mix
+    mov r15d, eax
+.ng:
+    xor r12d, r12d
+.px:
+    mov ebx, r12d
+    mov ecx, r14d
+    call gl_corner
+    test eax, eax
+    jz .nx
+    mov r8d, eax
+    mov r10d, r15d
+    test edx, edx
+    jz .nrim
+    imul edx, [gp_rim]
+    shr edx, 8
+    mov ecx, edx
+    mov eax, r10d
+    mov edx, 0xFFFFFF
+    call gl_mix
+    mov r10d, eax
+.nrim:
+    mov eax, r8d
+    imul eax, [gp_alpha]
+    add eax, 127
+    xor edx, edx
+    mov ecx, 255
+    div ecx
+    mov edx, eax
+    test edx, edx
+    jz .nx
+    mov ebx, r12d
+    add ebx, [gp_x]
+    mov ecx, r14d
+    add ecx, [gp_y]
+    call gl_plot
+.nx:
+    inc r12d
+    cmp r12d, [gl_w]
+    jb .px
+    inc r14d
+    cmp r14d, [gl_h]
+    jb .row
+    mov eax, [gp_sw]
+    mov [gl_w], eax
+    mov eax, [gp_sh]
+    mov [gl_h], eax
+    mov eax, [gp_sr]
+    mov [gl_rad], eax
+    POPA
+    ret
+
+; =============================================================================
+;  gl_bigtext : scaled anti-aliased text from the 4-bit font (bilinear + edge sharpening)
+;  rsi = zstr, ebx = x, ecx = y (top), eax = rendered height in px ; font [g_uf], colour [g_fg]
+;  returns eax = width in px
+; =============================================================================
+
+gb_cov:                               ; ecx = col, edx = row (glyph space) -> xmm0 = coverage 0..15 ; rdi = bitmap, r14d = w, r9d = H
+    xorps xmm0, xmm0
+    test ecx, ecx
+    js .z
+    test edx, edx
+    js .z
+    cmp ecx, r14d
+    jae .z
+    cmp edx, r9d
+    jae .z
+    push rax
+    push rbx
+    mov eax, r14d
+    inc eax
+    shr eax, 1                        ; bytes per row
+    imul eax, edx
+    mov ebx, ecx
+    shr ebx, 1
+    add eax, ebx
+    movzx eax, byte [rdi+rax]
+    test ecx, 1
+    jnz .lo
+    shr eax, 4
+    jmp .g
+.lo:
+    and eax, 15
+.g: cvtsi2ss xmm0, eax
+    pop rbx
+    pop rax
+.z: ret
+
+gl_bigtext:
+    PUSHA
+    mov [gb_x], ebx
+    mov [gb_y], ecx
+    mov [gb_dh], eax
+    mov r8, [g_uf]
+    mov r9d, [r8]                     ; H
+    cvtsi2ss xmm0, eax
+    cvtsi2ss xmm1, r9d
+    divss xmm0, xmm1                  ; scale
+    movss [gb_sc], xmm0
+    movss xmm2, [gb_one]
+    divss xmm2, xmm0
+    movss [gb_inv], xmm2              ; 1 / scale
+    ; gain = 1 + (s - 1) * 0.5 (>= 1)
+    subss xmm0, [gb_one]
+    mulss xmm0, [gb_h]
+    addss xmm0, [gb_one]
+    maxss xmm0, [gb_one]
+    movss [gb_k], xmm0
+    xorps xmm0, xmm0
+    movss [gb_pen], xmm0
+    mov dword [gb_wsum], 0
+.ch:
+    lodsb
+    test al, al
+    jz .done
+    movzx eax, al
+    mov edx, [r8+8+rax*4]
+    mov r14d, edx
+    shr r14d, 24
+    and edx, 0xFFFFFF
+    test r14d, r14d
+    jz .ch
+    lea rdi, [r8+rdx]
+    ; glyph destination width and start
+    cvtsi2ss xmm0, r14d
+    mulss xmm0, [gb_sc]               ; w * s
+    movss xmm1, [gb_pen]
+    addss xmm0, xmm1
+    movss [gb_pen], xmm0              ; pen after this glyph
+    movss xmm2, xmm1
+    addss xmm2, [gb_h]
+    cvttss2si r10d, xmm2              ; start offset (rounded)
+    addss xmm0, [gb_h]
+    cvttss2si r11d, xmm0              ; end offset
+    sub r11d, r10d
+    inc r11d                          ; a pixel of slack at the right edge
+    add r10d, [gb_x]
+    mov [gb_dw], r11d
+    mov [gb_c], r10d
+    push rsi
+    mov ebx, r10d
+    mov ecx, [gb_y]
+    mov esi, r11d
+    mov edx, [gb_dh]
+    call mark_dirty
+    pop rsi
+    xor r12d, r12d                    ; destination row
+.row:
+    xor r13d, r13d                    ; destination column
+.col:
+    ; u = (i + 0.5) / s - 0.5 ; v likewise
+    cvtsi2ss xmm0, r13d
+    addss xmm0, [gb_h]
+    mulss xmm0, [gb_inv]
+    subss xmm0, [gb_h]
+    cvtsi2ss xmm1, r12d
+    addss xmm1, [gb_h]
+    mulss xmm1, [gb_inv]
+    subss xmm1, [gb_h]
+    movss [gb_u], xmm0
+    movss [gb_v], xmm1
+    addss xmm0, [gb_two]
+    cvttss2si ecx, xmm0
+    sub ecx, 2                        ; floor(u)
+    addss xmm1, [gb_two]
+    cvttss2si edx, xmm1
+    sub edx, 2                        ; floor(v)
+    mov r15d, ecx
+    mov [gb_tmp], edx
+    cvtsi2ss xmm2, ecx
+    movss xmm3, [gb_u]
+    subss xmm3, xmm2                  ; fx
+    cvtsi2ss xmm2, edx
+    movss xmm4, [gb_v]
+    subss xmm4, xmm2                  ; fy
+    movss [gb_u], xmm3
+    movss [gb_v], xmm4
+    call gb_cov                       ; c00
+    movaps xmm5, xmm0
+    lea ecx, [r15+1]
+    mov edx, [gb_tmp]
+    call gb_cov                       ; c10
+    movaps xmm6, xmm0
+    mov ecx, r15d
+    mov edx, [gb_tmp]
+    inc edx
+    call gb_cov                       ; c01
+    movaps xmm7, xmm0
+    lea ecx, [r15+1]
+    mov edx, [gb_tmp]
+    inc edx
+    call gb_cov                       ; c11
+    movss xmm3, [gb_u]
+    movss xmm4, [gb_v]
+    subss xmm6, xmm5
+    mulss xmm6, xmm3
+    addss xmm5, xmm6                  ; top
+    subss xmm0, xmm7
+    mulss xmm0, xmm3
+    addss xmm7, xmm0                  ; bottom
+    subss xmm7, xmm5
+    mulss xmm7, xmm4
+    addss xmm5, xmm7
+    divss xmm5, [gb_f15]              ; 0..1
+    ; sharpen: (c - 0.5 - bias) * k + 0.5
+    subss xmm5, [gb_h]
+    subss xmm5, [gb_bias]
+    mulss xmm5, [gb_k]
+    addss xmm5, [gb_h]
+    xorps xmm0, xmm0
+    maxss xmm5, xmm0
+    minss xmm5, [gb_one]
+    mulss xmm5, [gb_k255]
+    cvtss2si edx, xmm5
+    test edx, edx
+    jz .nx
+    mov r10d, [g_fg]
+    and r10d, 0xFFFFFF
+    mov ebx, [gb_c]
+    add ebx, r13d
+    mov ecx, [gb_y]
+    add ecx, r12d
+    call gl_plot
+.nx:
+    inc r13d
+    cmp r13d, [gb_dw]
+    jb .col
+    inc r12d
+    cmp r12d, [gb_dh]
+    jb .row
+    jmp .ch
+.done:
+    cvttss2si eax, [gb_pen]
+    mov [gb_wsum], eax
+    POPA
+    mov eax, [gb_wsum]
+    ret
+
+; ---- end glass.inc
+; ---- begin glassui.inc
+; =============================================================================
+;  GLASS UI : launcher (Super+X), quick panel (Super+C)  - frosted glass, pm_kind 5 / 6
+; =============================================================================
+LA_W    equ 540
+LA_ROW  equ 54
+LA_TOP  equ 72
+QP_W    equ 408
+QP_H    equ 382
+
+
+ov_main:                              ; -> eax main text colour
+    mov eax, 0x1C1C1E
+    cmp byte [SB_THEME], 0
+    je .r
+    mov eax, 0xF5F5F7
+.r: ret
+ov_sub:                               ; -> eax secondary text colour
+    mov eax, 0x66666C
+    cmp byte [SB_THEME], 0
+    je .r
+    mov eax, 0xA6A6B0
+.r: ret
+
+; text helper: rsi = zstr, ebx = x, ecx = y, edx = 0 left / 1 centre / 2 right (g_uf, g_fg set)
+ov_txt:
+    cmp edx, 1
+    je .c
+    cmp edx, 2
+    je .r
+    jmp ui_text
+.c: jmp ui_text_c
+.r: jmp ui_text_r
+
+; ---- launcher list -----------------------------------------------------------------------
+la_build:
+    PUSHA
+    lea r13, [la_tab]
+    xor r14d, r14d
+.l: mov rsi, [r13]
+    test rsi, rsi
+    jz .d
+    call la_match
+    jnz .n
+    mov rax, r13
+    lea rdx, [la_tab]
+    sub rax, rdx
+    shr eax, 4
+    mov [la_vis+r14], al
+    inc r14d
+.n: add r13, 16
+    jmp .l
+.d: call cc_try
+    jnc .nc
+    mov ecx, r14d
+    test ecx, ecx
+    jz .sd
+.sh:
+    movzx eax, byte [la_vis+rcx-1]
+    mov [la_vis+rcx], al
+    dec ecx
+    jnz .sh
+.sd:
+    mov byte [la_vis], 0xFF
+    inc r14d
+.nc:
+    mov [la_nvis], r14d
+    mov [pm_n], r14d
+    lea rdi, [pm_ent]
+    xor eax, eax
+    mov ecx, 64
+    rep stosd
+    POPA
+    ret
+
+open_launcher:
+    PUSHA
+    call la_build
+    mov dword [pm_hov], -1
+    cmp dword [la_nvis], 0
+    je .h
+    mov dword [pm_hov], 0
+.h: mov dword [la_scr], 0
+    cmp byte [pm_open], 0
+    je .first
+    cmp byte [pm_kind], 5
+    je .draw
+.first:
+    cmp byte [pm_open], 0
+    je .nc
+    call pm_close
+.nc:
+    mov eax, [scr_w]
+    sub eax, LA_W
+    shr eax, 1
+    mov [pm_x], eax
+    mov eax, [scr_h]
+    xor edx, edx
+    mov ecx, 6
+    div ecx
+    cmp eax, TOPH+24
+    jae .y
+    mov eax, TOPH+24
+.y: mov [pm_y], eax
+    mov dword [pm_w], LA_W
+    mov dword [pm_h], 0
+    mov dword [pm_rad], 22
+    mov byte [pm_kind], 5
+    mov byte [ov_force], 1
+    mov byte [pm_open], 1
+.draw:
+    call pm_draw
+    POPA
+    ret
+
+la_draw:
+    PUSHA
+    ; keep the selected row inside the 6 visible ones
+    mov eax, [la_nvis]
+    cmp eax, 6
+    ja .big
+    mov dword [la_scr], 0
+    jmp .rows
+.big:
+    mov eax, [pm_hov]
+    test eax, eax
+    js .rows
+    cmp eax, 1000
+    jge .rows
+    cmp eax, [la_scr]
+    jge .s2
+    mov [la_scr], eax
+.s2:
+    lea ecx, [rax-5]
+    cmp ecx, [la_scr]
+    jle .rows
+    mov [la_scr], ecx
+.rows:
+    mov eax, [la_nvis]
+    cmp eax, 6
+    jbe .r1
+    mov eax, 6
+.r1:
+    test eax, eax
+    jnz .r2
+    mov eax, 1
+.r2:
+    mov [la_rows], eax
+    imul eax, LA_ROW
+    add eax, LA_TOP+10
+    cmp eax, [pm_h]
+    jne .remake
+    cmp byte [ov_force], 0
+    jne .remake
+    cmp byte [gl_ok], 0
+    je .remake
+    call gl_redraw
+    jmp .draw
+.remake:
+    mov [pm_h], eax
+    mov esi, SI_CARD
+    call surf_damage
+    mov eax, [pm_x]
+    mov ebx, [pm_y]
+    mov ecx, [pm_w]
+    mov edx, [pm_h]
+    mov esi, 22
+    call gl_make
+    mov byte [ov_force], 0
+.draw:
+    mov esi, SI_CARD
+    call gfx_target
+    ; ---- search field
+    call ov_sub
+    mov r10d, eax
+    mov eax, [pm_x]
+    add eax, 42
+    mov ebx, [pm_y]
+    add ebx, 34
+    call gi_search
+    lea rax, [font_uil]
+    mov [g_uf], rax
+    mov ebx, [pm_x]
+    add ebx, 74
+    mov [la_i], ebx
+    cmp dword [ov_ql], 0
+    je .ph
+    call ov_main
+    mov [g_fg], eax
+    lea rsi, [ov_q]
+    mov ecx, [pm_y]
+    add ecx, 16
+    mov eax, 34
+    call gl_bigtext
+    add [la_i], eax
+    add dword [la_i], 3
+    jmp .caret
+.ph:
+    call ov_sub
+    mov [g_fg], eax
+    lea rsi, [s_la_ph]
+    mov ebx, [pm_x]
+    add ebx, 78
+    mov ecx, [pm_y]
+    add ecx, 16
+    mov eax, 34
+    call gl_bigtext
+.caret:
+    mov eax, [th_acc]
+    and eax, 0xFFFFFF
+    mov ebx, [la_i]
+    mov ecx, [pm_y]
+    add ecx, 17
+    mov esi, 2
+    mov edx, 34
+    call rect
+    ; separator
+    mov eax, 0xC0707078
+    cmp byte [SB_THEME], 0
+    je .sep
+    mov eax, 0xE0FFFFFF
+.sep:
+    mov ebx, [pm_x]
+    add ebx, 18
+    mov ecx, [pm_y]
+    add ecx, LA_TOP-4
+    mov esi, [pm_w]
+    sub esi, 36
+    mov edx, 1
+    call rect_a
+    ; ---- rows
+    cmp dword [la_nvis], 0
+    jne .rl
+    call ov_sub
+    mov [g_fg], eax
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    lea rsi, [s_la_none]
+    mov ebx, [pm_x]
+    mov eax, [pm_w]
+    shr eax, 1
+    add ebx, eax
+    mov ecx, [pm_y]
+    add ecx, LA_TOP+17
+    mov edx, 1
+    call ov_txt
+    jmp .done
+.rl:
+    mov dword [la_i], 0
+.row:
+    mov eax, [la_i]
+    cmp eax, [la_rows]
+    jae .done
+    mov r13d, eax
+    add r13d, [la_scr]               ; absolute index
+    mov r12d, eax
+    imul r12d, LA_ROW
+    add r12d, [pm_y]
+    add r12d, LA_TOP                 ; row top
+    mov eax, r13d
+    call la_entp
+    cmp r13d, [pm_hov]
+    jne .nsel
+    ; selected pill
+    mov eax, [th_acc]
+    and eax, 0xFFFFFF
+    mov edx, 0xFFFFFF
+    mov ecx, 46
+    call gl_mix
+    push rax
+    mov eax, [th_acc]
+    and eax, 0xFFFFFF
+    mov edx, 0x000030
+    mov ecx, 64
+    call gl_mix
+    mov r8d, eax
+    pop rax
+    mov ebx, [pm_x]
+    add ebx, 10
+    lea ecx, [r12+3]
+    mov esi, [pm_w]
+    sub esi, 20
+    mov edx, 48
+    mov r9d, 14
+    call gl_pill
+    mov dword [g_fg], 0xFFFFFF
+    mov r15d, 0xE4E8FF
+    jmp .nm
+.nsel:
+    call ov_main
+    mov [g_fg], eax
+    call ov_sub
+    mov r15d, eax
+.nm:
+    ; icon
+    movzx eax, byte [r14+12]
+    shl eax, 15
+    lea rsi, [ICA+rax]
+    mov eax, [dk_isz]
+    mov ebx, [pm_x]
+    add ebx, 24
+    lea ecx, [r12+10]
+    mov edx, 34
+    call gl_iblit
+    ; name
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    mov rsi, [r14]
+    mov ebx, [pm_x]
+    add ebx, 72
+    lea ecx, [r12+17]
+    xor edx, edx
+    call ui_text
+    ; tag
+    mov eax, [g_fg]
+    push rax
+    mov [g_fg], r15d
+    lea rsi, [s_tag_app]
+    cmp byte [r14+13], 3
+    jne .t0
+    lea rsi, [s_tag_calc]
+.t0:
+    cmp byte [r14+13], 1
+    jne .t1
+    lea rsi, [s_tag_sys]
+.t1:
+    cmp byte [r14+13], 2
+    jne .t2
+    lea rsi, [s_tag_set]
+.t2:
+    mov ebx, [pm_x]
+    add ebx, [pm_w]
+    sub ebx, 26
+    lea ecx, [r12+17]
+    mov edx, 2
+    call ov_txt
+    pop rax
+    mov [g_fg], eax
+    inc dword [la_i]
+    jmp .row
+.done:
+    POPA
+    ret
+
+; item under the pointer
+la_hit:                               ; ebx = my, eax = mx -> eax (-1 outside, 1000 inside but inert, else row)
+    PUSHA
+    mov r15d, 1000
+    mov ecx, [pm_x]
+    cmp eax, ecx
+    jl .out
+    add ecx, [pm_w]
+    cmp eax, ecx
+    jge .out
+    mov ecx, [pm_y]
+    cmp ebx, ecx
+    jl .out
+    add ecx, [pm_h]
+    cmp ebx, ecx
+    jge .out
+    cmp dword [la_nvis], 0
+    je .o
+    mov ecx, [pm_y]
+    add ecx, LA_TOP
+    sub ebx, ecx
+    js .o
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, LA_ROW
+    div ecx
+    cmp eax, [la_rows]
+    jae .o
+    add eax, [la_scr]
+    cmp eax, [la_nvis]
+    jae .o
+    mov r15d, eax
+    jmp .o
+.out:
+    mov r15d, -1
+.o: mov [la_res], r15d
+    POPA
+    mov eax, [la_res]
+    ret
+
+la_pick:                              ; eax = visible index
+    PUSHA
+    cmp eax, [la_nvis]
+    jae .o
+    call la_entp
+    mov eax, [r14+8]
+    call menu_do
+.o: POPA
+    ret
+
+; =============================================================================
+;  dispatch for pm_kind >= 5
+; =============================================================================
+ov_draw:
+    cmp byte [pm_kind], 7
+    je sw_draw
+    cmp byte [pm_kind], 5
+    jne .q
+    jmp la_draw
+.q: jmp qp_draw
+ov_hit:
+    push rbx
+    mov eax, [mx]
+    mov ebx, [my]
+    cmp byte [pm_kind], 7
+    je .s
+    cmp byte [pm_kind], 5
+    jne .q
+    call la_hit
+    pop rbx
+    ret
+.q: call qp_hit
+    pop rbx
+    ret
+.s: call sw_hit
+    pop rbx
+    ret
+ov_pick:
+    cmp byte [pm_kind], 7
+    je sw_pick
+    cmp byte [pm_kind], 5
+    jne .q
+    jmp la_pick
+.q: jmp qp_pick
+
+; =============================================================================
+;  quick panel
+;  controls : 0 Wi-Fi  1 Bluetooth  2 dark mode  3 volume slider  4 settings  5 themes  6 display  7 lock
+; =============================================================================
+QP_TX0  equ 18+14                     ; slider track, relative to the panel
+QP_TX1  equ 14+380-18
+qp_rect:                              ; x, y, w, h relative to the panel
+    dw 14, 14, 114, 118
+    dw 128, 14, 114, 118
+    dw 252, 14, 142, 118
+    dw 14, 142, 380, 84
+    dw 14, 236, 95, 72
+    dw 109, 236, 95, 72
+    dw 204, 236, 95, 72
+    dw 299, 236, 95, 72
+
+open_qpanel:
+    PUSHA
+    cmp byte [pm_open], 0
+    je .first
+    cmp byte [pm_kind], 6
+    je .draw
+    call pm_close
+.first:
+    mov eax, [scr_w]
+    sub eax, QP_W+14
+    mov [pm_x], eax
+    mov dword [pm_y], TOPH+8
+    mov dword [pm_w], QP_W
+    mov dword [pm_h], QP_H
+    mov dword [pm_rad], 26
+    mov dword [pm_n], 8
+    lea rdi, [pm_ent]
+    xor eax, eax
+    mov ecx, 64
+    rep stosd
+    mov dword [pm_hov], -1
+    mov byte [qp_drag], 0
+    mov byte [pm_kind], 6
+    mov byte [ov_force], 1
+    mov byte [pm_open], 1
+.draw:
+    call pm_draw
+    POPA
+    ret
+
+; card overlay: eax = x rel, ebx = y rel, ecx = w, edx = h
+qp_card:
+    PUSHA
+    add eax, [pm_x]
+    add ebx, [pm_y]
+    mov esi, ecx
+    mov ecx, ebx
+    mov ebx, eax
+    mov eax, 0x73FFFFFF
+    cmp byte [SB_THEME], 0
+    je .l
+    mov eax, 0xE5FFFFFF
+.l: mov r9d, 20
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+    POPA
+    ret
+
+; round button: eax = centre x rel, ebx = centre y rel, ecx = radius, edx = 1 active (accent) / 0 plain
+qp_btn:
+    PUSHA
+    add eax, [pm_x]
+    add ebx, [pm_y]
+    mov r10d, 0xFFFFFF
+    test edx, edx
+    jz .p
+    mov r10d, [th_acc]
+    and r10d, 0xFFFFFF
+    jmp .d
+.p: cmp byte [SB_THEME], 0
+    jne .dk
+    mov r10d, 0xFFFFFF
+    mov edx, 215
+    jmp .d2
+.dk:
+    mov r10d, 0x5A5A62
+.d: mov edx, 255
+.d2:
+    call gl_disc
+    POPA
+    ret
+
+qp_draw:
+    PUSHA
+    cmp byte [ov_force], 0
+    jne .remake
+    cmp byte [gl_ok], 0
+    je .remake
+    call gl_redraw
+    jmp .draw
+.remake:
+    mov esi, SI_CARD
+    call surf_damage
+    mov eax, [pm_x]
+    mov ebx, [pm_y]
+    mov ecx, [pm_w]
+    mov edx, [pm_h]
+    mov esi, 26
+    call gl_make
+    mov byte [ov_force], 0
+.draw:
+    mov esi, SI_CARD
+    call gfx_target
+    ; cards
+    mov eax, 14
+    mov ebx, 14
+    mov ecx, 228
+    mov edx, 118
+    call qp_card
+    mov eax, 252
+    mov ebx, 14
+    mov ecx, 142
+    mov edx, 118
+    call qp_card
+    mov eax, 14
+    mov ebx, 142
+    mov ecx, 380
+    mov edx, 84
+    call qp_card
+    mov eax, 14
+    mov ebx, 316
+    mov ecx, 380
+    mov edx, 52
+    call qp_card
+    ; hover / focus ring
+    mov eax, [pm_hov]
+    cmp eax, 8
+    jae .nr
+    cmp eax, 3
+    je .nr
+    cmp eax, 4
+    jae .ringb
+    call qp_ringcard
+    jmp .nr
+.ringb:
+    call qp_ringbtn
+.nr:
+    ; round buttons: Wi-Fi, Bluetooth, dark mode
+    movzx edx, byte [SB_WIFI]
+    mov eax, 71
+    mov ebx, 54
+    mov ecx, 27
+    call qp_btn
+    movzx edx, byte [SB_BT]
+    mov eax, 185
+    mov ebx, 54
+    mov ecx, 27
+    call qp_btn
+    movzx edx, byte [SB_THEME]
+    mov eax, 323
+    mov ebx, 54
+    mov ecx, 27
+    call qp_btn
+    ; icons: white on an active (accent) button, otherwise dark / white by theme
+    call qp_off_col
+    cmp byte [SB_WIFI], 0
+    je .iw
+    mov r10d, 0xFFFFFF
+.iw:
+    mov eax, [pm_x]
+    add eax, 71
+    mov ebx, [pm_y]
+    add ebx, 54
+    call gi_wifi
+    call qp_off_col
+    cmp byte [SB_BT], 0
+    je .ib
+    mov r10d, 0xFFFFFF
+.ib:
+    mov eax, [pm_x]
+    add eax, 185
+    mov ebx, [pm_y]
+    add ebx, 54
+    call gi_bt
+    mov eax, [pm_x]
+    add eax, 323
+    mov ebx, [pm_y]
+    add ebx, 54
+    mov r10d, 0xFFFFFF
+    cmp byte [SB_THEME], 0
+    jne .moonw
+    mov r10d, 0x5A5A62
+.moonw:
+    call gi_moon
+    ; labels
+    lea rax, [font_uib]
+    mov [g_uf], rax
+    call ov_main
+    mov [g_fg], eax
+    lea rsi, [s_qp_wifi]
+    mov ebx, [pm_x]
+    add ebx, 71
+    mov ecx, [pm_y]
+    add ecx, 14+80
+    mov edx, 1
+    call ov_txt
+    lea rsi, [s_qp_bt]
+    mov ebx, [pm_x]
+    add ebx, 185
+    mov ecx, [pm_y]
+    add ecx, 14+80
+    mov edx, 1
+    call ov_txt
+    lea rsi, [s_qp_dark]
+    mov ebx, [pm_x]
+    add ebx, 323
+    mov ecx, [pm_y]
+    add ecx, 14+80
+    mov edx, 1
+    call ov_txt
+    ; sub titles
+    lea rax, [font_uis]
+    mov [g_uf], rax
+    call ov_sub
+    mov [g_fg], eax
+    lea rsi, [s_qp_off]
+    cmp byte [SB_WIFI], 0
+    je .w1
+    lea rsi, [s_qp_ond]
+.w1:
+    mov ebx, [pm_x]
+    add ebx, 71
+    mov ecx, [pm_y]
+    add ecx, 14+98
+    mov edx, 1
+    call ov_txt
+    lea rsi, [s_qp_off]
+    cmp byte [SB_BT], 0
+    je .b1
+    lea rsi, [s_qp_ond]
+.b1:
+    mov ebx, [pm_x]
+    add ebx, 185
+    mov ecx, [pm_y]
+    add ecx, 14+98
+    mov edx, 1
+    call ov_txt
+    lea rsi, [s_qp_off]
+    cmp byte [SB_THEME], 0
+    je .d1
+    lea rsi, [s_qp_on]
+.d1:
+    mov ebx, [pm_x]
+    add ebx, 323
+    mov ecx, [pm_y]
+    add ecx, 14+98
+    mov edx, 1
+    call ov_txt
+    ; ---- volume card
+    lea rax, [font_uib]
+    mov [g_uf], rax
+    call ov_main
+    mov [g_fg], eax
+    lea rsi, [s_qp_vol]
+    mov ebx, [pm_x]
+    add ebx, 14+20
+    mov ecx, [pm_y]
+    add ecx, 142+12
+    xor edx, edx
+    call ov_txt
+    ; percentage
+    lea rdi, [s_qp_pct]
+    cmp byte [SB_MUTE], 0
+    je .pc
+    lea rsi, [s_qp_muted]
+    jmp .pt
+.pc:
+    movzx eax, byte [SB_VOL]
+    imul eax, eax, 10
+    mov byte [rdi], 0
+    call ex_dec
+    mov byte [rdi], '%'
+    mov byte [rdi+1], 0
+    lea rsi, [s_qp_pct]
+.pt:
+    call ov_sub
+    mov [g_fg], eax
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    mov ebx, [pm_x]
+    add ebx, 14+380-20
+    mov ecx, [pm_y]
+    add ecx, 142+12
+    mov edx, 2
+    call ov_txt
+    ; track
+    mov eax, 0x66808088
+    cmp byte [SB_THEME], 0
+    je .tk
+    mov eax, 0xC8FFFFFF
+.tk:
+    mov ebx, [pm_x]
+    add ebx, QP_TX0-14
+    mov ecx, [pm_y]
+    add ecx, 142+40
+    mov esi, QP_TX1-QP_TX0+28
+    mov edx, 32
+    mov r9d, 16
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+    ; fill : 32 px minimum so the round end is visible
+    movzx eax, byte [SB_VOL]
+    cmp byte [SB_MUTE], 0
+    je .fv
+    xor eax, eax
+.fv:
+    test eax, eax
+    jz .nofill
+    mov ecx, QP_TX1-QP_TX0+28-32
+    imul eax, ecx
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add eax, 32
+    mov esi, eax
+    mov eax, 0xFFFFFF
+    cmp byte [SB_THEME], 0
+    je .f2
+    mov eax, 0xEDEDF2
+.f2:
+    mov ebx, [pm_x]
+    add ebx, QP_TX0-14
+    mov ecx, [pm_y]
+    add ecx, 142+40
+    mov edx, 32
+    mov r9d, 16
+    call rrect
+.nofill:
+    ; speaker icon inside the track
+    mov r10d, 0x55555C
+    cmp byte [SB_VOL], 0
+    jne .sp
+    mov r10d, 0x8A8A92
+.sp:
+    cmp byte [SB_THEME], 0
+    jne .sp2
+    cmp byte [SB_VOL], 0
+    jne .sp2
+.sp2:
+    mov eax, [pm_x]
+    add eax, QP_TX0-14+19
+    mov ebx, [pm_y]
+    add ebx, 142+56
+    call gi_spk
+    ; ---- bottom round buttons
+    mov r15d, 0
+.bb:
+    mov eax, r15d
+    imul eax, 95
+    add eax, 14+47
+    mov ebx, 236+36
+    mov ecx, 30
+    xor edx, edx
+    call qp_btn
+    inc r15d
+    cmp r15d, 4
+    jb .bb
+    call ov_main
+    mov r10d, eax
+    mov eax, [pm_x]
+    add eax, 14+47
+    mov ebx, [pm_y]
+    add ebx, 236+36
+    call gi_gear
+    mov eax, [pm_x]
+    add eax, 14+47+95
+    mov ebx, [pm_y]
+    add ebx, 236+36
+    call gi_sun
+    mov eax, [pm_x]
+    add eax, 14+47+190
+    mov ebx, [pm_y]
+    add ebx, 236+36
+    call gi_mon
+    mov eax, [pm_x]
+    add eax, 14+47+285
+    mov ebx, [pm_y]
+    add ebx, 236+36
+    call gi_lock
+    ; ---- battery
+    call ov_main
+    mov r10d, eax
+    mov eax, [pm_x]
+    add eax, 14+18
+    mov ebx, [pm_y]
+    add ebx, 316+19
+    call gi_batt
+    cmp byte [bat_ok], 0
+    jne .bat
+    call ov_sub
+    mov [g_fg], eax
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    lea rsi, [s_qp_nobat]
+    mov ebx, [pm_x]
+    add ebx, 14+64
+    mov ecx, [pm_y]
+    add ecx, 316+16
+    xor edx, edx
+    call ov_txt
+    jmp .done
+.bat:
+    ; track
+    mov eax, 0x66808088
+    cmp byte [SB_THEME], 0
+    je .bt1
+    mov eax, 0xC8FFFFFF
+.bt1:
+    mov ebx, [pm_x]
+    add ebx, 14+64
+    mov ecx, [pm_y]
+    add ecx, 316+19
+    mov esi, 380-64-80
+    mov edx, 14
+    mov r9d, 7
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+    movzx eax, byte [bat_pct]
+    cmp eax, 100
+    jbe .bp
+    mov eax, 100
+.bp:
+    imul eax, 380-64-80-14
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    add eax, 14
+    mov esi, eax
+    mov eax, 0x34C759
+    cmp byte [bat_pct], 20
+    ja .bc
+    cmp byte [bat_ac], 1
+    je .bc
+    mov eax, 0xFF453A
+.bc:
+    mov ebx, [pm_x]
+    add ebx, 14+64
+    mov ecx, [pm_y]
+    add ecx, 316+19
+    mov edx, 14
+    mov r9d, 7
+    call rrect
+    lea rdi, [s_qp_pct]
+    movzx eax, byte [bat_pct]
+    mov byte [rdi], 0
+    call ex_dec
+    mov byte [rdi], '%'
+    mov byte [rdi+1], 0
+    call ov_main
+    mov [g_fg], eax
+    lea rax, [font_uib]
+    mov [g_uf], rax
+    lea rsi, [s_qp_pct]
+    mov ebx, [pm_x]
+    add ebx, 14+380-18
+    mov ecx, [pm_y]
+    add ecx, 316+16
+    mov edx, 2
+    call ov_txt
+.done:
+    POPA
+    ret
+
+; thin ring around the focused card / button
+qp_ringcard:                          ; eax = control 0..2
+    PUSHA
+    movzx esi, ax
+    shl esi, 3
+    lea rdi, [qp_rect+rsi]
+    movzx ebx, word [rdi]
+    movzx ecx, word [rdi+2]
+    movzx esi, word [rdi+4]
+    movzx edx, word [rdi+6]
+    add ebx, [pm_x]
+    add ecx, [pm_y]
+    mov eax, 0x50FFFFFF
+    mov r9d, 20
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+    POPA
+    ret
+qp_ringbtn:                           ; eax = control 4..7
+    PUSHA
+    sub eax, 4
+    imul eax, 95
+    add eax, 14+47
+    add eax, [pm_x]
+    mov ebx, [pm_y]
+    add ebx, 236+36
+    mov ecx, 34
+    mov esi, 31
+    xor edi, edi
+    mov edx, 150
+    mov r10d, [th_acc]
+    and r10d, 0xFFFFFF
+    call gl_ring
+    POPA
+    ret
+
+qp_hit:                               ; eax = mx, ebx = my -> eax (-1 outside, 1000 inert, else control)
+    PUSHA
+    mov r15d, -1
+    mov ecx, [pm_x]
+    cmp eax, ecx
+    jl .o
+    add ecx, [pm_w]
+    cmp eax, ecx
+    jge .o
+    mov ecx, [pm_y]
+    cmp ebx, ecx
+    jl .o
+    add ecx, [pm_h]
+    cmp ebx, ecx
+    jge .o
+    mov r15d, 1000
+    sub eax, [pm_x]
+    sub ebx, [pm_y]
+    xor r12d, r12d
+.l: movzx esi, r12w
+    shl esi, 3
+    lea rdi, [qp_rect+rsi]
+    movzx ecx, word [rdi]
+    cmp eax, ecx
+    jl .n
+    movzx edx, word [rdi+4]
+    add ecx, edx
+    cmp eax, ecx
+    jge .n
+    movzx ecx, word [rdi+2]
+    cmp ebx, ecx
+    jl .n
+    movzx edx, word [rdi+6]
+    add ecx, edx
+    cmp ebx, ecx
+    jge .n
+    mov r15d, r12d
+    jmp .o
+.n: inc r12d
+    cmp r12d, 8
+    jb .l
+.o: mov [qp_res], r15d
+    POPA
+    mov eax, [qp_res]
+    ret
+
+; volume from the pointer x : eax = screen x
+qp_setvol:
+    PUSHA
+    sub eax, [pm_x]
+    sub eax, QP_TX0
+    jns .a
+    xor eax, eax
+.a: imul eax, 10
+    add eax, (QP_TX1-QP_TX0)/2
+    xor edx, edx
+    mov ecx, QP_TX1-QP_TX0
+    div ecx
+    cmp eax, 10
+    jbe .b
+    mov eax, 10
+.b: cmp al, [SB_VOL]
+    je .o
+    mov [SB_VOL], al
+    mov byte [SB_MUTE], 0
+    call top_draw
+    call pm_draw
+.o: POPA
+    ret
+
+qp_pick:                              ; eax = control
+    PUSHA
+    cmp eax, 8
+    jae .o
+    cmp eax, 3
+    jb .tg
+    je .vol
+    cmp eax, 5
+    jb .set
+    je .thm
+    cmp eax, 6
+    je .dsp
+    mov eax, 4
+    jmp .go
+.set:
+    mov eax, 56
+    jmp .go
+.thm:
+    mov eax, 66
+    jmp .go
+.dsp:
+    mov eax, 67
+.go:
+    call menu_do
+    jmp .o
+.vol:
+    mov byte [qp_drag], 1
+    mov eax, [pm_cx]
+    call qp_setvol
+    jmp .o
+.tg:
+    test eax, eax
+    jz .wf
+    cmp eax, 1
+    je .bt
+    ; dark mode
+    xor byte [SB_THEME], 1
+    mov al, [SB_THEME]
+    mov [SB_PAL], al
+    call st_changed_look
+    mov byte [ov_force], 1
+    call pm_draw
+    jmp .o
+.wf:
+    xor byte [SB_WIFI], 1
+    jmp .sv
+.bt:
+    xor byte [SB_BT], 1
+.sv:
+    call sb_save
+    call top_draw
+    call pm_draw
+.o: POPA
+    ret
+
+; every shell pass: dragging the volume slider
+ov_tick:
+    cmp byte [qp_drag], 0
+    je .r
+    cmp byte [pm_open], 0
+    je .stop
+    cmp byte [pm_kind], 6
+    jne .stop
+    test byte [m_btn], 1
+    jz .rel
+    push rax
+    mov eax, [mx]
+    call qp_setvol
+    pop rax
+.r: ret
+.rel:
+    mov byte [qp_drag], 0
+    push rax
+    call ex_beep
+    call sb_save
+    pop rax
+    ret
+.stop:
+    mov byte [qp_drag], 0
+    ret
+
+; =============================================================================
+;  LOCK / WELCOME SCREEN  (clock, date, padlock, hint on the wallpaper)
+; =============================================================================
+
+; two digits at rdi
+lk_put2:                              ; eax = 0..99
+    push rdx
+    push rcx
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi], al
+    add dl, '0'
+    mov [rdi+1], dl
+    add rdi, 2
+    mov byte [rdi], 0
+    pop rcx
+    pop rdx
+    ret
+
+lk_texts:                             ; builds lk_buf (date) and lk_tbuf (time)
+    PUSHA
+    mov al, 9
+    call rtc_get
+    movzx r12d, al
+    add r12d, 2000
+    mov al, 8
+    call rtc_get
+    movzx r13d, al
+    mov al, 7
+    call rtc_get
+    movzx r14d, al
+    cmp r13d, 1
+    jae .m1
+    mov r13d, 1
+.m1:
+    cmp r13d, 12
+    jbe .m2
+    mov r13d, 12
+.m2:
+    mov esi, r12d
+    cmp r13d, 3
+    jae .y3
+    dec esi
+.y3:
+    mov ebx, esi
+    shr ebx, 2
+    add ebx, esi
+    mov eax, esi
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    sub ebx, eax
+    mov eax, esi
+    xor edx, edx
+    mov ecx, 400
+    div ecx
+    add ebx, eax
+    lea rdx, [dow_t]
+    movzx eax, byte [rdx+r13-1]
+    add ebx, eax
+    add ebx, r14d
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, 7
+    div ecx
+    mov ecx, edx
+    lea rdi, [lk_buf]
+    mov byte [rdi], 0
+    lea rsi, [s_dn_0]
+    call ex_str
+    call ex_cat
+    mov byte [rdi], ','
+    mov byte [rdi+1], ' '
+    add rdi, 2
+    mov byte [rdi], 0
+    mov eax, r14d
+    call ex_dec
+    mov byte [rdi], ' '
+    inc rdi
+    mov byte [rdi], 0
+    lea ecx, [r13-1]
+    lea rsi, [s_mn_0]
+    call ex_str
+    call ex_cat
+    ; time
+    mov al, 4
+    call rtc_get
+    movzx ebx, al
+    cmp byte [SB_CLK12], 0
+    je .h
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, 12
+    div ecx
+    test edx, edx
+    jnz .h2
+    mov edx, 12
+.h2:
+    mov ebx, edx
+.h: lea rdi, [lk_tbuf]
+    mov eax, ebx
+    call lk_put2
+    mov byte [rdi], ':'
+    inc rdi
+    mov al, 2
+    call rtc_get
+    movzx eax, al
+    call lk_put2
+    POPA
+    ret
+
+; scrim : rows [ecx, ecx+edx) darkening from alpha eax (0..255) at the start row to the end (r8d = 1) or reverse (0)
+lk_scrim:
+    PUSHA
+    mov r12d, ecx
+    mov r13d, edx
+    mov r14d, eax
+    mov r15d, r8d
+    xor ebx, ebx                      ; row offset
+.l: mov eax, ebx
+    test r15d, r15d
+    jz .a
+    mov eax, r13d
+    sub eax, ebx
+.a: imul eax, r14d
+    xor edx, edx
+    div r13d                          ; alpha for this row
+    mov ecx, eax
+    xor ecx, 255
+    shl ecx, 24                       ; TT = 255 - alpha
+    push rbx
+    mov eax, ecx
+    xor ebx, ebx
+    lea ecx, [r12+rbx]
+    pop rbx
+    ; (rect : eax colour, ebx x, ecx y, esi w, edx h)
+    push rbx
+    lea ecx, [r12+rbx]
+    xor ebx, ebx
+    mov esi, [scr_w]
+    mov edx, 2
+    call rect_a
+    pop rbx
+    add ebx, 2
+    cmp ebx, r13d
+    jb .l
+    POPA
+    ret
+
+lk_scene:
+    PUSHA
+    call base_from_wall
+    mov esi, SI_BASE
+    call gfx_target
+    ; darken the top and the bottom a little so white text always reads
+    mov eax, 120
+    xor ecx, ecx
+    mov edx, [scr_h]
+    imul edx, 55
+    mov r8d, 100
+    xchg eax, edx
+    xor edx, edx
+    div r8d
+    mov edx, eax
+    mov eax, 110
+    xor ecx, ecx
+    mov r8d, 1
+    call lk_scrim
+    mov eax, 150
+    mov edx, [scr_h]
+    shr edx, 2
+    mov ecx, [scr_h]
+    sub ecx, edx
+    mov r8d, 0
+    call lk_scrim
+    cmp byte [lk_bare], 0
+    jne .fin
+    call lk_texts
+    mov r12d, [scr_w]
+    shr r12d, 1                       ; centre x
+    ; padlock
+    mov r10d, 0xFFFFFF
+    mov eax, r12d
+    mov ebx, [scr_h]
+    imul ebx, 7
+    shr ebx, 6
+    add ebx, 20
+    call gi_lock
+    ; date
+    lea rax, [font_uil]
+    mov [g_uf], rax
+    mov dword [g_fg], 0xFFFFFF
+    mov r13d, [scr_h]
+    shr r13d, 4                       ; date text height  (48 at 768)
+    cmp r13d, 28
+    jbe .dh
+    mov r13d, 28
+.dh:
+    lea rsi, [lk_buf]
+    call ui_width
+    imul eax, r13d
+    xor edx, edx
+    mov ecx, 39
+    div ecx
+    shr eax, 1
+    mov ebx, r12d
+    sub ebx, eax
+    mov ecx, [scr_h]
+    imul ecx, 15
+    shr ecx, 6
+    add ecx, 24
+    mov eax, r13d
+    lea rsi, [lk_buf]
+    call gl_bigtext
+    ; clock
+    mov r13d, [scr_h]
+    imul r13d, 23
+    xor edx, edx
+    mov eax, r13d
+    mov ecx, 100
+    div ecx
+    mov r13d, eax                     ; ~ 23 % of the screen height
+    lea rsi, [lk_tbuf]
+    call ui_width
+    imul eax, r13d
+    xor edx, edx
+    mov ecx, 39
+    div ecx
+    shr eax, 1
+    mov ebx, r12d
+    sub ebx, eax
+    mov ecx, [scr_h]
+    imul ecx, 20
+    shr ecx, 6
+    add ecx, 52
+    mov eax, r13d
+    lea rsi, [lk_tbuf]
+    call gl_bigtext
+    ; hint + home bar
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    mov dword [g_fg], 0xF2F2F7
+    lea rsi, [s_lk_hint]
+    mov ebx, r12d
+    mov ecx, [scr_h]
+    sub ecx, 104
+    call ui_text_c
+    mov eax, 0x1AFFFFFF
+    lea ebx, [r12-70]
+    mov ecx, [scr_h]
+    sub ecx, 64
+    mov esi, 140
+    mov edx, 6
+    mov r9d, 3
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+.fin:
+    call damage_all
+    call wm_flush
+    POPA
+    ret
+
+; show the scene and wait for a key or a click
+lk_wait:
+    PUSHA
+    call lk_scene
+    mov al, 2
+    call rtc_get
+    movzx eax, al
+    mov [lk_min], eax
+.w: call pollkey
+    test al, al
+    jnz .go
+    test byte [m_btn], 1
+    jnz .go
+    mov al, 2
+    call rtc_get
+    movzx eax, al
+    cmp eax, [lk_min]
+    je .w
+    mov [lk_min], eax
+    call lk_scene
+    jmp .w
+.go:
+.r: test byte [m_btn], 1
+    jz .d
+    call pollkey
+    jmp .r
+.d: mov byte [lk_bare], 1
+    call lk_scene
+    mov byte [lk_bare], 0
+    POPA
+    ret
+
+qp_off_col:                           ; icon colour on a plain (inactive) round button -> r10d
+    mov r10d, 0x4A4A52
+    cmp byte [SB_THEME], 0
+    je .r
+    mov r10d, 0xF2F2F7
+.r: ret
+
+; =============================================================================
+;  calculator in the search box : + - * / ( ) and decimals (3 digits), fixed point x1000
+; =============================================================================
+
+la_entp:                              ; eax = visible index -> r14 = table entry
+    movzx eax, byte [la_vis+rax]
+    cmp eax, 0xFF
+    jne .t
+    lea r14, [la_calc_ent]
+    ret
+.t: shl eax, 4
+    lea r14, [la_tab+rax]
+    ret
+
+cc_skip:                              ; -> al = next significant char
+    mov rdx, [cc_p]
+.l: cmp byte [rdx], ' '
+    jne .d
+    inc rdx
+    jmp .l
+.d: mov [cc_p], rdx
+    movzx edx, byte [rdx]
+    ret
+
+cc_expr:
+    call cc_term
+.l: call cc_skip
+    cmp dl, '+'
+    je .a
+    cmp dl, '-'
+    je .s
+    ret
+.a: inc qword [cc_p]
+    push rax
+    call cc_term
+    pop rcx
+    add rax, rcx
+    jmp .l
+.s: inc qword [cc_p]
+    push rax
+    call cc_term
+    mov rcx, rax
+    pop rax
+    sub rax, rcx
+    jmp .l
+
+cc_term:
+    call cc_fac
+.l: call cc_skip
+    cmp dl, '*'
+    je .m
+    cmp dl, '/'
+    je .d
+    ret
+.m: inc qword [cc_p]
+    push rax
+    call cc_fac
+    pop rcx
+    imul rax, rcx
+    cqo
+    mov rcx, 1000
+    idiv rcx
+    jmp .l
+.d: inc qword [cc_p]
+    push rax
+    call cc_fac
+    mov rcx, rax
+    pop rax
+    test rcx, rcx
+    jnz .ok
+    mov byte [cc_err], 1
+    xor eax, eax
+    ret
+.ok:
+    imul rax, 1000
+    cqo
+    idiv rcx
+    jmp .l
+
+cc_fac:
+    call cc_skip
+    mov eax, edx
+    cmp al, '-'
+    jne .p
+    inc qword [cc_p]
+    call cc_fac
+    neg rax
+    ret
+.p: cmp al, '('
+    jne .n
+    inc qword [cc_p]
+    call cc_expr
+    push rax
+    call cc_skip
+    cmp dl, ')'
+    je .cl
+    mov byte [cc_err], 1
+    pop rax
+    ret
+.cl:
+    inc qword [cc_p]
+    pop rax
+    ret
+.n: cmp al, '0'
+    jb .bad
+    cmp al, '9'
+    ja .bad
+    mov rsi, [cc_p]
+    xor eax, eax
+.dg:movzx ecx, byte [rsi]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .dot
+    imul rax, rax, 10
+    add rax, rcx
+    inc rsi
+    jmp .dg
+.dot:
+    imul rax, rax, 1000
+    cmp byte [rsi], '.'
+    jne .dn
+    inc rsi
+    mov r8d, 100
+.fr:movzx ecx, byte [rsi]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .dn
+    test r8d, r8d
+    jz .sk
+    imul ecx, r8d
+    add rax, rcx
+    push rax
+    mov eax, r8d
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    mov r8d, eax
+    pop rax
+.sk:inc rsi
+    jmp .fr
+.dn:mov [cc_p], rsi
+    ret
+.bad:
+    mov byte [cc_err], 1
+    xor eax, eax
+    ret
+
+; CF = 1 when the search text is an arithmetic expression; result text in cc_buf ("= 17.5")
+cc_try:
+    PUSHA
+    cmp dword [ov_ql], 0
+    je .no
+    ; needs an operator or a bracket (not just a number)
+    xor ecx, ecx
+    xor ebx, ebx
+.sc:movzx eax, byte [ov_q+rcx]
+    test eax, eax
+    jz .sd
+    cmp al, '+'
+    je .op
+    cmp al, '*'
+    je .op
+    cmp al, '/'
+    je .op
+    cmp al, '('
+    je .op
+    cmp al, '-'
+    jne .nx
+    test ecx, ecx
+    jz .nx
+.op:mov ebx, 1
+.nx:inc ecx
+    jmp .sc
+.sd:test ebx, ebx
+    jz .no
+    mov byte [cc_err], 0
+    lea rax, [ov_q]
+    mov [cc_p], rax
+    call cc_expr
+    mov r12, rax
+    call cc_skip
+    test dl, dl
+    jnz .no
+    cmp byte [cc_err], 0
+    jne .no
+    ; format
+    lea rdi, [cc_buf]
+    mov byte [rdi], '='
+    mov byte [rdi+1], ' '
+    add rdi, 2
+    mov rax, r12
+    test rax, rax
+    jns .pos
+    mov byte [rdi], '-'
+    inc rdi
+    neg rax
+.pos:
+    xor edx, edx
+    mov rcx, 1000
+    div rcx
+    mov r13, rdx                      ; fraction
+    xor ecx, ecx
+    mov r10d, 10
+.dv:xor edx, edx
+    div r10
+    push rdx
+    inc ecx
+    test rax, rax
+    jnz .dv
+.pp:pop rdx
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .pp
+    test r13, r13
+    jz .end
+    mov byte [rdi], '.'
+    inc rdi
+    mov rax, r13
+    mov ecx, 100
+    mov r8d, 3
+.fd:xor edx, edx
+    push rcx
+    div rcx
+    pop rcx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov rax, rdx
+    push rax
+    mov eax, ecx
+    xor edx, edx
+    div r10d
+    mov ecx, eax
+    pop rax
+    dec r8d
+    jnz .fd
+    ; trim trailing zeros
+.tr:cmp byte [rdi-1], '0'
+    jne .end
+    dec rdi
+    jmp .tr
+.end:
+    mov byte [rdi], 0
+    POPA
+    stc
+    ret
+.no:
+    POPA
+    clc
+    ret
+
+; =============================================================================
+;  WINDOW SWITCHER (Alt+Tab, Alt+Shift+Tab): glass strip with the open windows; release Alt to switch
+; =============================================================================
+SW_TW   equ 128
+
+sw_build:                             ; fills sw_task (top window first) -> sw_n
+    PUSHA
+    xor r12d, r12d
+    mov ecx, [zn]
+.l: test ecx, ecx
+    jz .d
+    dec ecx
+    movzx esi, byte [zlist+rcx]
+    mov r8d, esi
+    shl r8d, 7
+    add r8, SURFS
+    test dword [r8+SF_FLG], SFF_VIS
+    jz .l
+    mov eax, [r8+SF_TASK]
+    test eax, eax
+    jz .l
+    cmp r12d, 8
+    jae .d
+    mov [sw_task+r12], al
+    inc r12d
+    jmp .l
+.d: mov [sw_n], r12d
+    POPA
+    ret
+
+sw_tick:
+    PUSHA
+    movzx eax, byte [sw_req]
+    test eax, eax
+    jz .rel
+    mov byte [sw_req], 0
+    cmp byte [pm_open], 0
+    je .fresh
+    cmp byte [pm_kind], 7
+    je .adv
+.fresh:
+    call sw_build
+    cmp dword [sw_n], 2
+    jb .rel
+    cmp byte [pm_open], 0
+    je .nc
+    call pm_close
+.nc:
+    mov dword [sw_sel], 1
+    cmp eax, 2
+    jne .go
+    mov eax, [sw_n]
+    dec eax
+    mov [sw_sel], eax
+.go:
+    mov eax, [sw_n]
+    imul eax, SW_TW
+    add eax, 40
+    mov [pm_w], eax
+    mov dword [pm_h], 170
+    mov edx, [scr_w]
+    sub edx, eax
+    shr edx, 1
+    mov [pm_x], edx
+    mov eax, [scr_h]
+    sub eax, 170
+    shr eax, 1
+    mov [pm_y], eax
+    mov dword [pm_rad], 28
+    mov dword [pm_n], 0
+    mov dword [pm_hov], -1
+    mov byte [pm_kind], 7
+    mov byte [ov_force], 1
+    mov byte [pm_open], 1
+    call pm_draw
+    jmp .rel
+.adv:
+    mov ecx, [sw_sel]
+    cmp eax, 2
+    je .back
+    inc ecx
+    cmp ecx, [sw_n]
+    jb .set
+    xor ecx, ecx
+    jmp .set
+.back:
+    dec ecx
+    jns .set
+    mov ecx, [sw_n]
+    dec ecx
+.set:
+    mov [sw_sel], ecx
+    call pm_draw
+.rel:
+    cmp byte [sw_rel], 0
+    je .o
+    mov byte [sw_rel], 0
+    cmp byte [pm_open], 0
+    je .o
+    cmp byte [pm_kind], 7
+    jne .o
+    mov eax, [sw_sel]
+    call sw_finish
+.o: POPA
+    ret
+
+sw_finish:                            ; eax = index -> close the strip, focus that window
+    PUSHA
+    cmp eax, [sw_n]
+    jae .c
+    movzx r12d, byte [sw_task+rax]
+    call pm_close
+    mov eax, r12d
+    call focus_set
+    jmp .o
+.c: call pm_close
+.o: POPA
+    ret
+
+sw_pick:
+    PUSHA
+    cmp eax, 8
+    jae .o
+    call sw_finish
+.o: POPA
+    ret
+
+sw_hit:                               ; eax = mx, ebx = my -> eax
+    PUSHA
+    mov r15d, -1
+    mov ecx, [pm_x]
+    cmp eax, ecx
+    jl .o
+    add ecx, [pm_w]
+    cmp eax, ecx
+    jge .o
+    mov ecx, [pm_y]
+    cmp ebx, ecx
+    jl .o
+    add ecx, [pm_h]
+    cmp ebx, ecx
+    jge .o
+    mov r15d, 1000
+    sub eax, [pm_x]
+    sub eax, 20
+    js .o
+    xor edx, edx
+    mov ecx, SW_TW
+    div ecx
+    cmp eax, [sw_n]
+    jae .o
+    mov r15d, eax
+.o: mov [qp_res], r15d
+    POPA
+    mov eax, [qp_res]
+    ret
+
+sw_draw:
+    PUSHA
+    cmp byte [ov_force], 0
+    jne .remake
+    cmp byte [gl_ok], 0
+    je .remake
+    call gl_redraw
+    jmp .draw
+.remake:
+    mov esi, SI_CARD
+    call surf_damage
+    mov eax, [pm_x]
+    mov ebx, [pm_y]
+    mov ecx, [pm_w]
+    mov edx, [pm_h]
+    mov esi, 28
+    call gl_make
+    mov byte [ov_force], 0
+.draw:
+    mov esi, SI_CARD
+    call gfx_target
+    xor r15d, r15d
+.t: cmp r15d, [sw_n]
+    jae .done
+    mov eax, r15d
+    imul eax, SW_TW
+    add eax, [pm_x]
+    add eax, 20
+    mov r12d, eax                     ; tile x
+    mov r13d, [pm_y]
+    add r13d, 16                      ; tile y
+    movzx r14d, byte [sw_task+r15]
+    shl r14d, 7
+    add r14, TASKS
+    cmp r15d, [sw_sel]
+    jne .ns
+    mov eax, 0x78FFFFFF
+    cmp byte [SB_THEME], 0
+    je .hl
+    mov eax, 0xD0FFFFFF
+.hl:
+    lea ebx, [r12+4]
+    mov ecx, r13d
+    mov esi, SW_TW-8
+    mov edx, 138
+    mov r9d, 20
+    mov byte [rr_mode], 1
+    call rrect
+    mov byte [rr_mode], 0
+.ns:
+    ; icon : kind 1..8 -> atlas index kind-1 (the trash window is a Files window)
+    mov eax, [r14+T_KIND]
+    dec eax
+    cmp eax, 7
+    jne .ic
+    xor eax, eax
+.ic:
+    cmp eax, 7
+    jbe .ic2
+    xor eax, eax
+.ic2:
+    shl eax, 15
+    lea rsi, [ICA+rax]
+    mov eax, [dk_isz]
+    lea ebx, [r12+32]
+    lea ecx, [r13+14]
+    mov edx, 64
+    call gl_iblit
+    ; title (cut to 14 characters)
+    mov rsi, [r14+T_TITLE]
+    lea rdi, [sw_tb]
+    xor ecx, ecx
+.cp:
+    cmp ecx, 14
+    jae .ce
+    mov al, [rsi+rcx]
+    test al, al
+    jz .ce
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .cp
+.ce:
+    mov byte [rdi+rcx], 0
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    cmp r15d, [sw_sel]
+    jne .sub
+    call ov_main
+    jmp .col
+.sub:
+    call ov_sub
+.col:
+    mov [g_fg], eax
+    lea rsi, [sw_tb]
+    lea ebx, [r12+SW_TW/2]
+    lea ecx, [r13+14+64+14]
+    call ui_text_c
+    inc r15d
+    jmp .t
+.done:
+    POPA
+    ret
+
+; ---- end glassui.inc
+; ---- begin icons2.inc
+; =============================================================================
+;  ICONS v2 : every glyph is drawn as anti-aliased vector art (design grid 96 x 96, scaled to any size)
+;  tile = vertical gradient, soft gloss on the upper half, 1 px light rim ; glyph = white with a soft shadow
+; =============================================================================
+
+; ---- design units -> scaled floats ---------------------------------------------------------
+gv_x:                                 ; eax -> xmm0
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [gv_s]
+    addss xmm0, [gv_ox]
+    ret
+gv_y:
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [gv_s]
+    addss xmm0, [gv_oy]
+    ret
+gv_l:
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [gv_s]
+    ret
+gv_boxset:                            ; xmm4 min x, xmm5 max x, xmm6 min y, xmm7 max y
+    cvttss2si eax, xmm4
+    sub eax, 2
+    mov [gs_bx0], eax
+    cvttss2si eax, xmm5
+    add eax, 3
+    mov [gs_bx1], eax
+    cvttss2si eax, xmm6
+    sub eax, 2
+    mov [gs_by0], eax
+    cvttss2si eax, xmm7
+    add eax, 3
+    mov [gs_by1], eax
+    ret
+gv_go:                                ; colour / alpha / pass logic, then fill
+    cmp byte [gv_pass], 0
+    jne .main
+    cmp byte [gv_hole], 0
+    jne .r
+    xor r10d, r10d
+    mov eax, [gv_a]
+    imul eax, [gv_shA]
+    add eax, 127
+    xor edx, edx
+    mov ecx, 255
+    div ecx
+    mov [gs_A], eax
+    call gs_fill
+.r: ret
+.main:
+    mov r10d, [gv_c]
+    cmp byte [gv_hole], 0
+    je .c
+    mov r10d, [gv_tc]
+.c: mov eax, [gv_a]
+    mov [gs_A], eax
+    call gs_fill
+    ret
+
+gv_disc:                              ; eax cx, ebx cy, ecx r
+    PUSHA
+    mov dword [gs_mode], 0
+    mov dword [gs_mask], 0
+    call gv_x
+    movss [gs_cx], xmm0
+    movaps xmm4, xmm0
+    mov eax, ebx
+    call gv_y
+    movss [gs_cy], xmm0
+    movaps xmm6, xmm0
+    mov eax, ecx
+    call gv_l
+    movss [gs_r], xmm0
+    movaps xmm5, xmm4
+    subss xmm4, xmm0
+    addss xmm5, xmm0
+    movaps xmm7, xmm6
+    subss xmm6, xmm0
+    addss xmm7, xmm0
+    call gv_boxset
+    call gv_go
+    POPA
+    ret
+
+gv_ring:                              ; eax cx, ebx cy, ecx R, esi r0, edi mask
+    PUSHA
+    mov dword [gs_mode], 1
+    mov [gs_mask], edi
+    mov r12d, esi
+    call gv_x
+    movss [gs_cx], xmm0
+    movaps xmm4, xmm0
+    mov eax, ebx
+    call gv_y
+    movss [gs_cy], xmm0
+    movaps xmm6, xmm0
+    mov eax, r12d
+    call gv_l
+    movss [gs_r0], xmm0
+    mov eax, ecx
+    call gv_l
+    movss [gs_r], xmm0
+    movaps xmm5, xmm4
+    subss xmm4, xmm0
+    addss xmm5, xmm0
+    movaps xmm7, xmm6
+    subss xmm6, xmm0
+    addss xmm7, xmm0
+    call gv_boxset
+    call gv_go
+    POPA
+    ret
+
+gv_seg:                               ; eax x0, ebx y0, ecx x1, esi y1, edi thickness (design px)
+    PUSHA
+    mov dword [gs_mode], 2
+    mov dword [gs_mask], 0
+    mov r12d, ecx
+    mov r13d, esi
+    mov r14d, edi
+    call gv_x
+    movss [gs_cx], xmm0
+    movaps xmm4, xmm0
+    movaps xmm5, xmm0
+    mov eax, ebx
+    call gv_y
+    movss [gs_cy], xmm0
+    movaps xmm6, xmm0
+    movaps xmm7, xmm0
+    mov eax, r12d
+    call gv_x
+    movss [gs_x1], xmm0
+    minss xmm4, xmm0
+    maxss xmm5, xmm0
+    mov eax, r13d
+    call gv_y
+    movss [gs_y1], xmm0
+    minss xmm6, xmm0
+    maxss xmm7, xmm0
+    mov eax, r14d
+    call gv_l
+    mulss xmm0, [gs_half]
+    movss [gs_r], xmm0
+    subss xmm4, xmm0
+    addss xmm5, xmm0
+    subss xmm6, xmm0
+    addss xmm7, xmm0
+    call gv_boxset
+    movss xmm0, [gs_x1]
+    subss xmm0, [gs_cx]
+    mulss xmm0, xmm0
+    movss xmm1, [gs_y1]
+    subss xmm1, [gs_cy]
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    movss xmm1, [gs_one]
+    maxss xmm0, [gv_tiny]
+    movss [gs_len2], xmm0
+    call gv_go
+    POPA
+    ret
+
+gv_rr:                                ; eax cx, ebx cy, ecx hx, esi hy, edi r
+    PUSHA
+    mov dword [gs_mode], 4
+    mov dword [gs_mask], 0
+    mov r12d, ecx
+    mov r13d, esi
+    mov r14d, edi
+    call gv_x
+    movss [gs_cx], xmm0
+    movaps xmm4, xmm0
+    movaps xmm5, xmm0
+    mov eax, ebx
+    call gv_y
+    movss [gs_cy], xmm0
+    movaps xmm6, xmm0
+    movaps xmm7, xmm0
+    mov eax, r12d
+    call gv_l
+    movss [gs_x1], xmm0
+    subss xmm4, xmm0
+    addss xmm5, xmm0
+    mov eax, r13d
+    call gv_l
+    movss [gs_y1], xmm0
+    subss xmm6, xmm0
+    addss xmm7, xmm0
+    mov eax, r14d
+    call gv_l
+    movss [gs_r], xmm0
+    call gv_boxset
+    call gv_go
+    POPA
+    ret
+
+gv_tri:                               ; vertices in gv_ti
+    PUSHA
+    mov dword [gs_mode], 5
+    mov dword [gs_mask], 0
+    xor r12d, r12d
+.v: mov eax, [gv_ti+r12*8]
+    call gv_x
+    movss [gs_t+r12*8], xmm0
+    mov eax, [gv_ti+r12*8+4]
+    call gv_y
+    movss [gs_t+r12*8+4], xmm0
+    inc r12d
+    cmp r12d, 3
+    jb .v
+    movss xmm0, [gs_t]
+    movss [gs_t+24], xmm0
+    movss xmm0, [gs_t+4]
+    movss [gs_t+28], xmm0
+    ; orientation
+    movss xmm0, [gs_t+8]
+    subss xmm0, [gs_t]
+    movss xmm1, [gs_t+20]
+    subss xmm1, [gs_t+4]
+    mulss xmm0, xmm1
+    movss xmm1, [gs_t+12]
+    subss xmm1, [gs_t+4]
+    movss xmm2, [gs_t+16]
+    subss xmm2, [gs_t]
+    mulss xmm1, xmm2
+    subss xmm0, xmm1
+    movss xmm1, [gs_one]
+    xorps xmm2, xmm2
+    comiss xmm0, xmm2
+    jae .pos
+    mov eax, 0xBF800000
+    movd xmm1, eax
+.pos:
+    movss [gs_ts], xmm1
+    ; bounding box
+    movss xmm4, [gs_t]
+    movaps xmm5, xmm4
+    movss xmm6, [gs_t+4]
+    movaps xmm7, xmm6
+    movss xmm0, [gs_t+8]
+    minss xmm4, xmm0
+    maxss xmm5, xmm0
+    movss xmm0, [gs_t+16]
+    minss xmm4, xmm0
+    maxss xmm5, xmm0
+    movss xmm0, [gs_t+12]
+    minss xmm6, xmm0
+    maxss xmm7, xmm0
+    movss xmm0, [gs_t+20]
+    minss xmm6, xmm0
+    maxss xmm7, xmm0
+    call gv_boxset
+    call gv_go
+    POPA
+    ret
+
+; =============================================================================
+;  the glyphs (design grid 96 x 96, tile colour = hole colour)
+; =============================================================================
+glyph_tab:
+    dq gv_files, gv_term, gv_edit, gv_browser, gv_images, gv_paint, gv_gear, gv_trash
+    dq gv_about, gv_monitor, gv_keyboard, gv_person, gv_power, gv_lock, gv_appear, gv_home, gv_display
+
+gv_files:
+    ALPHA 150
+    RR 48,46,30,20,6
+    RR 33,29,13,6,4
+    ALPHA 255
+    RR 48,58,31,19,7
+    ret
+gv_term:
+    ALPHA 255
+    RR 48,48,31,24,8
+    HOLE 1
+    RR 48,48,28,21,6
+    HOLE 0
+    SEG 34,40,44,48,7
+    SEG 44,48,34,56,7
+    SEG 50,57,62,57,7
+    ret
+gv_edit:
+    ALPHA 255
+    RR 48,48,21,28,5
+    HOLE 1
+    SEG 36,37,60,37,5
+    SEG 36,47,60,47,5
+    SEG 36,57,52,57,5
+    HOLE 0
+    ret
+gv_browser:
+    ALPHA 255
+    RING 48,48,29,25,0
+    TRI 63,33,40,41,55,56
+    ALPHA 140
+    TRI 33,63,41,40,56,55
+    ALPHA 255
+    HOLE 1
+    DISC 48,48,3
+    HOLE 0
+    ret
+gv_images:
+    ALPHA 255
+    RR 48,48,29,24,6
+    HOLE 1
+    TRI 24,68,41,44,58,68
+    TRI 46,68,60,52,74,68
+    DISC 62,36,5
+    HOLE 0
+    ret
+gv_paint:
+    ALPHA 255
+    DISC 48,50,29
+    HOLE 1
+    DISC 34,44,5
+    DISC 46,33,5
+    DISC 61,37,5
+    DISC 67,52,5
+    DISC 56,66,8
+    HOLE 0
+    ret
+gv_gear:
+    ALPHA 255
+    RING 48,48,20,9,0
+    SEG 48,30,48,19,12
+    SEG 48,66,48,77,12
+    SEG 30,48,19,48,12
+    SEG 66,48,77,48,12
+    SEG 61,35,69,27,12
+    SEG 35,35,27,27,12
+    SEG 61,61,69,69,12
+    SEG 35,61,27,69,12
+    ret
+gv_trash:
+    ALPHA 255
+    RR 48,57,17,19,5
+    RR 48,35,23,4,2
+    RR 48,29,8,3,2
+    HOLE 1
+    SEG 40,49,40,65,4
+    SEG 48,49,48,65,4
+    SEG 56,49,56,65,4
+    HOLE 0
+    ret
+gv_about:
+    ALPHA 255
+    RING 48,48,29,25,0
+    DISC 48,35,4
+    SEG 48,46,48,63,8
+    ret
+gv_monitor:
+    ALPHA 255
+    RR 48,46,31,23,6
+    HOLE 1
+    RR 48,46,27,19,3
+    HOLE 0
+    SEG 30,54,39,44,5
+    SEG 39,44,48,52,5
+    SEG 48,52,58,38,5
+    SEG 58,38,66,46,5
+    SEG 48,69,48,75,6
+    SEG 38,77,58,77,5
+    ret
+gv_keyboard:
+    ALPHA 255
+    RR 48,50,32,21,6
+    HOLE 1
+    RR 31,41,3,3,1
+    RR 41,41,3,3,1
+    RR 51,41,3,3,1
+    RR 61,41,3,3,1
+    RR 31,50,3,3,1
+    RR 41,50,3,3,1
+    RR 51,50,3,3,1
+    RR 61,50,3,3,1
+    SEG 36,59,60,59,5
+    HOLE 0
+    ret
+gv_person:
+    ALPHA 255
+    DISC 48,37,13
+    RR 48,72,24,14,10
+    ret
+gv_power:
+    ALPHA 255
+    RING 48,50,27,22,4
+    SEG 48,20,48,46,8
+    ret
+gv_lock:
+    ALPHA 255
+    RING 48,40,15,9,2
+    SEG 36,40,36,50,6
+    SEG 60,40,60,50,6
+    RR 48,62,22,16,6
+    HOLE 1
+    DISC 48,60,4
+    SEG 48,60,48,68,4
+    HOLE 0
+    ret
+gv_appear:
+    ALPHA 255
+    RING 48,48,29,25,0
+    RING 48,48,21,0,5
+    ret
+gv_home:
+    ALPHA 255
+    TRI 48,19,17,48,79,48
+    RR 48,62,20,15,4
+    HOLE 1
+    RR 48,67,5,10,2
+    HOLE 0
+    ret
+gv_display:
+    ALPHA 255
+    RR 48,44,31,22,6
+    HOLE 1
+    RR 48,44,27,18,3
+    HOLE 0
+    ALPHA 230
+    TRI 28,58,42,42,56,58
+    DISC 62,36,5
+    ALPHA 255
+    SEG 48,67,48,74,6
+    SEG 38,76,58,76,5
+    ret
+
+; =============================================================================
+;  icon_render : eax = glyph index, ecx = size, rdi = destination (size*size ARGB)
+; =============================================================================
+icon_render:
+    PUSHA
+    mov [iv_idx], eax
+    mov [iv_sz], ecx
+    mov r12, rdi
+    cvtsi2ss xmm0, ecx
+    mov eax, 96
+    cvtsi2ss xmm1, eax
+    divss xmm0, xmm1
+    movss [gv_s], xmm0
+    ; colours from the table
+    mov eax, [iv_idx]
+    lea eax, [rax+rax*2]
+    add eax, eax
+    lea rsi, [icon_col+rax]
+    movzx eax, byte [rsi]
+    shl eax, 16
+    movzx ecx, byte [rsi+1]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [rsi+2]
+    or eax, ecx
+    mov [iv_top], eax
+    movzx eax, byte [rsi+3]
+    shl eax, 16
+    movzx ecx, byte [rsi+4]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [rsi+5]
+    or eax, ecx
+    mov [iv_bot], eax
+    movzx eax, byte [SB_ICST]
+    and eax, 3
+    mov [iv_sty], eax
+    ; scratch surface 14 over the destination
+    mov esi, 14
+    xor ebx, ebx
+    xor ecx, ecx
+    mov eax, [iv_sz]
+    mov edx, eax
+    mov rdi, r12
+    call surf_setup
+    mov esi, 14
+    call gfx_target
+    ; ---- tile
+    mov dword [gp_gloss], 40
+    mov dword [gp_rim], 110
+    mov dword [gp_alpha], 255
+    cmp dword [iv_sty], 1
+    jne .g0
+    mov dword [gp_gloss], 78
+    mov dword [gp_rim], 150
+.g0:
+    mov r9d, [iv_sz]
+    imul r9d, 22
+    mov eax, r9d
+    xor edx, edx
+    mov ecx, 96
+    div ecx
+    mov r9d, eax
+    cmp dword [iv_sty], 2
+    jne .g1
+    mov r9d, [iv_sz]
+    shr r9d, 1
+.g1:
+    mov eax, [iv_top]
+    mov r8d, [iv_bot]
+    cmp dword [iv_sty], 3
+    jne .g2
+    mov dword [gp_alpha], 40
+    mov dword [gp_gloss], 0
+    mov dword [gp_rim], 0
+    mov eax, [iv_bot]
+.g2:
+    xor ebx, ebx
+    xor ecx, ecx
+    mov esi, [iv_sz]
+    mov edx, [iv_sz]
+    call gl_pill
+    mov dword [gp_gloss], 0
+    mov dword [gp_rim], 0
+    mov dword [gp_alpha], 255
+    ; ---- glyph
+    mov dword [gv_c], 0xFFFFFF
+    mov eax, [iv_bot]
+    mov [gv_tc], eax
+    cmp dword [iv_sty], 3
+    jne .gl
+    mov [gv_c], eax
+.gl:
+    mov byte [gv_hole], 0
+    mov dword [gv_a], 255
+    mov eax, [iv_idx]
+    lea rsi, [glyph_tab]
+    mov rax, [rsi+rax*8]
+    mov [iv_fn], rax
+    ; shadow pass (not for the outline style)
+    cmp dword [iv_sty], 3
+    je .main
+    mov byte [gv_pass], 0
+    xorps xmm0, xmm0
+    movss [gv_ox], xmm0
+    mov eax, 3
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [gv_s]
+    movss [gv_oy], xmm0
+    call [iv_fn]
+    mov byte [gv_hole], 0
+    mov dword [gv_a], 255
+.main:
+    mov byte [gv_pass], 1
+    xorps xmm0, xmm0
+    movss [gv_oy], xmm0
+    call [iv_fn]
+    mov byte [gv_hole], 0
+    mov dword [gv_a], 255
+    mov dword [SURFS+14*128+SF_FLG], 0
+    POPA
+    ret
+
+; ---- end icons2.inc
 
 ; ================================================================ SYSTEM ====
 apply_theme:
     call apply_accent
+    movzx eax, byte [SB_PAL]
+    cmp eax, 2
+    jb .cl
+    call pal_apply
+    ret
+.cl:
     cmp byte [SB_THEME], 0
     jne .dk
     mov dword [th_win], 0xFFFFFF
@@ -16871,25 +39748,17 @@ rnd_ch:
     ret
 
 fs_stat:
-    push rax
-    push rcx
-    push rdi
+    PUSHA
     xor eax, eax
     mov [st_files], eax
     mov [st_bytes], eax
-    mov rdi, FSBUF
-    mov ecx, MAXF
-.l: cmp byte [rdi], 0
-    je .n
-    inc dword [st_files]
-    mov eax, [rdi+48]
-    add [st_bytes], eax
-.n: add rdi, SLOT
-    dec ecx
-    jnz .l
-    pop rdi
-    pop rcx
-    pop rax
+    call fs3_count
+    mov eax, [fs_nfiles]
+    add eax, [fs_ndirs]
+    mov [st_files], eax
+    mov eax, [fs_nbytes]
+    mov [st_bytes], eax
+    POPA
     ret
 
 ask_sudo:                           ; ZF=1 -> sudo granted
@@ -16967,7 +39836,8 @@ ex_fac:
     ret
 
 ex_term:
-    push rbx    call ex_fac
+    push rbx
+    call ex_fac
     mov ebx, eax
 .l: call skipsp
     mov al, [rsi]
@@ -17699,6 +40569,23 @@ app_files:
     je .run
     cmp al, 'u'
     je .restore
+    cmp al, K_CLICK
+    je .click
+    jmp .key
+.click:
+    mov eax, [clk_y]
+    test eax, eax
+    jz .back                        ; the path line goes up one folder
+    sub eax, 2
+    js .key
+    cmp eax, [f_cnt]
+    jae .key
+    cmp eax, 30
+    jae .key
+    cmp eax, [f_sel]
+    je .enter                       ; a second click opens it
+    mov [f_sel], eax
+    call files_draw
     jmp .key
 .up:
     mov eax, [f_sel]
@@ -17745,7 +40632,10 @@ app_files:
     mov dword [f_sel], 0
     jmp .refresh
 .open:
-    mov rax, rbx
+    mov rsi, rbx
+    call fs_find
+    test rax, rax
+    jz .refresh
     call editor_open
     lea rsi, [s_files_t]
     call draw_win
@@ -17803,26 +40693,37 @@ app_files:
     call strlen
     cmp byte [rbx+rax-1], '/'
     jne .delf
-    mov rax, rbx
+    mov rsi, rbx
+    call fs_find
+    test rax, rax
+    jz .refresh
+    mov r13, rax
+    mov rax, r13
     call folder_empty
     jne .refresh
-    mov byte [rbx], 0
-    mov rax, rbx
-    call fs_save
+    mov rax, r13
+    call fs3_del_id
     jmp .refresh
 .delf:
-    cmp dword [f_dir], 1
-    jne .mv
-    mov byte [rbx], 0
-    mov rax, rbx
-    call fs_save
+    mov rsi, rbx
+    call fs_find
+    test rax, rax
+    jz .refresh
+    mov r13, rax
+    mov rax, r13
+    call fs3_del_slot
     jmp .refresh
 .mv:
+    mov rsi, rbx
+    call fs_find
+    test rax, rax
+    jz .refresh
+    mov r13, rax
     mov rsi, rbx
     call basename
     mov ecx, 1
     call mkpath
-    mov rax, rbx
+    mov rax, r13
     call fs_move
     jmp .refresh
 .restore:
@@ -17833,10 +40734,15 @@ app_files:
     mov eax, [f_sel]
     mov rbx, [ITEMS+rax*8]
     mov rsi, rbx
+    call fs_find
+    test rax, rax
+    jz .refresh
+    mov r13, rax
+    mov rsi, rbx
     call basename
     mov ecx, 2
     call mkpath
-    mov rax, rbx
+    mov rax, r13
     call fs_move
     jmp .refresh
 .run:
@@ -17850,7 +40756,10 @@ app_files:
     call is_xep
     test eax, eax
     jz .key
-    mov rax, rbx
+    mov rsi, rbx
+    call fs_find
+    test rax, rax
+    jz .refresh
     call run_slot
     lea rsi, [s_files_t]
     call draw_win
@@ -17966,7 +40875,8 @@ ed_render:
     push r10
     push r11
     call ed_scroll
-    call clear_content    mov byte [g_tr], 0
+    call clear_content
+    mov byte [g_tr], 0
     SETC g_fg, C_TXT
     SETC g_bg, C_WIN
     xor r8d, r8d
@@ -18083,6 +40993,12 @@ ed_status:
     ret
 
 editor_open:                        ; rax=slot   (vim-like: normal / insert)
+    ; release the previous editor slot, pin the new one (no eviction while editing)
+    push rax
+    mov rax, [ed_slot]
+    call fs3_unpin
+    pop rax
+    call fs3_pin
     mov [ed_slot], rax
     mov ecx, [rax+48]
     cmp ecx, MAXSZ
@@ -18112,6 +41028,8 @@ editor_open:                        ; rax=slot   (vim-like: normal / insert)
     je .save
     cmp al, 0x12
     je .run
+    cmp al, K_CLICK
+    je .click
     cmp byte [ed_mode], 1
     je .ins
     cmp al, 'h'
@@ -18154,6 +41072,38 @@ editor_open:                        ; rax=slot   (vim-like: normal / insert)
     je .cmd
     cmp al, 27
     je .esc
+    jmp .loop
+.click:
+    mov ecx, [clk_y]                ; a click puts the cursor on that character
+    test ecx, ecx
+    js .loop
+    add ecx, [ed_top]
+    xor ebx, ebx
+.cl1:
+    test ecx, ecx
+    jz .cl2
+    cmp ebx, [ed_len]
+    jae .cl3
+    cmp byte [EDBUF+rbx], 10
+    jne .cl1n
+    dec ecx
+.cl1n:
+    inc ebx
+    jmp .cl1
+.cl2:
+    mov edx, [clk_x]
+.cl2a:
+    test edx, edx
+    jle .cl3
+    cmp ebx, [ed_len]
+    jae .cl3
+    cmp byte [EDBUF+rbx], 10
+    je .cl3
+    inc ebx
+    dec edx
+    jmp .cl2a
+.cl3:
+    mov [ed_pos], ebx
     jmp .loop
 .esc:
     cmp byte [ed_mod], 0
@@ -18410,6 +41360,10 @@ editor_open:                        ; rax=slot   (vim-like: normal / insert)
     call draw_win
     jmp .loop
 .exit:
+    ; unpin the editor slot so it can be evicted again
+    mov rax, [ed_slot]
+    call fs3_unpin
+    mov qword [ed_slot], 0
     ret
 
 app_editor:                         ; file picker: type a name or choose a file
@@ -18495,6 +41449,8 @@ app_editor:                         ; file picker: type a name or choose a file
     je .up
     cmp al, K_DN
     je .dn
+    cmp al, K_CLICK
+    je .click
     cmp al, 32
     jb .key
     cmp al, 0xDF
@@ -18507,6 +41463,22 @@ app_editor:                         ; file picker: type a name or choose a file
     mov [lf_len], ecx
     mov byte [NAMEB+rcx], 0
     jmp .draw
+.click:
+    mov eax, [clk_y]
+    sub eax, 7
+    js .key
+    cmp eax, [f_cnt]
+    jae .key
+    cmp eax, [f_sel]
+    je .enter2
+    mov [f_sel], eax
+    mov dword [lf_len], 0
+    mov byte [NAMEB], 0
+    jmp .draw
+.enter2:
+    mov dword [lf_len], 0
+    mov byte [NAMEB], 0
+    jmp .enter
 .bs:
     mov ecx, [lf_len]
     test ecx, ecx
@@ -18965,7 +41937,8 @@ xpl_run:                            ; rsi = NUL-terminated script
     pop rdi
     pop rdx
     pop rcx
-    pop rbx    ret
+    pop rbx
+    ret
 
 ; ================================================================ TERMINAL ==
 tnl:
@@ -19467,8 +42440,29 @@ term_exec:
     CMD c_ping, .ping
     CMD c_nslookup, .nsl
     CMD c_dhcp, .dhcp
+    CMD c_python, .py
+    CMD c_install, .inst
+    CMD c_battery, .batt
+    CMD c_biossave, .bsave
+    CMD c_df, .df
+    CMD c_py, .py
     lea rsi, [s_unk]
     call tput_s
+    jmp .out
+.py:
+    call term_python
+    jmp .out
+.inst:
+    call term_install
+    jmp .out
+.batt:
+    call term_battery
+    jmp .out
+.bsave:
+    call term_biossave
+    jmp .out
+.df:
+    call term_df
     jmp .out
 .help:
     lea rsi, [s_help]
@@ -19566,7 +42560,13 @@ term_exec:
     call find_any
     test rax, rax
     jz .nofile
+    xor r13d, r13d
     mov ecx, [rax+48]
+    cmp ecx, MAXSZ
+    jbe .cl0
+    mov ecx, MAXSZ
+    mov r13d, 1
+.cl0:
     lea rsi, [rax+64]
 .cl:
     test ecx, ecx
@@ -19577,8 +42577,13 @@ term_exec:
     jmp .cl
 .cd2:
     cmp dword [t_col], 0
-    je .out
+    je .cln
     call tnl
+.cln:
+    test r13d, r13d
+    jz .out
+    lea rsi, [s_catbig]
+    call tput_s
     jmp .out
 .edit:
     GUARD
@@ -19629,29 +42634,17 @@ term_exec:
     call strlen
     cmp byte [r13+rax-1], '/'
     jne .rmf
+    ; an empty folder is removed for good
     mov rax, r13
     call folder_empty
     jne .notempty
-    mov byte [r13], 0
     mov rax, r13
-    call fs_save
+    call fs3_del_id
     jmp .ok
 .rmf:
-    cmp dword [r13], 0x6D75642F
-    jne .rm1
-    cmp word [r13+4], 0x2F70
-    jne .rm1
-    mov byte [r13], 0
+    ; files: delete in the trash, move there from anywhere else
     mov rax, r13
-    call fs_save
-    jmp .ok
-.rm1:
-    mov rsi, r13
-    call basename
-    mov ecx, 1
-    call mkpath
-    mov rax, r13
-    call fs_move
+    call fs3_del_slot
     jmp .ok
 .mkdir:
     GUARD
@@ -19684,18 +42677,10 @@ term_exec:
     mov rsi, r12
     call resolve
     call ensure_ext
-    call fs_create
+    mov rax, r13
+    call fs3_chaincopy
     test rax, rax
     jz .badpath
-    cmp rax, r13
-    je .badpath
-    mov rdi, rax
-    mov ecx, [r13+48]
-    mov [rdi+48], ecx
-    add rdi, 64
-    lea rsi, [r13+64]
-    rep movsb
-    call fs_save
     jmp .ok
 .mv:
     GUARD
@@ -19714,41 +42699,31 @@ term_exec:
     call fs_move
     jmp .ok
 .empty:
-    mov r13, FSBUF
-    mov r14d, MAXF
-.el:
-    cmp byte [r13], 0
-    je .en
-    cmp dword [r13], 0x6D75642F
-    jne .en
-    cmp word [r13+4], 0x2F70
-    jne .en
-    mov byte [r13], 0
-    mov rax, r13
-    call fs_save
-.en:
-    add r13, SLOT
-    dec r14d
-    jnz .el
+    call fs3_empty_trash
     jmp .ok
 .ls0:
     cmp byte [sudo_on], 0
     je .denied
-    mov r13, FSBUF
-    mov r14d, MAXF
+    mov r13, DIRTAB
+    mov r14d, [fs_dlen]
 .l0:
-    cmp byte [r13], 0
+    cmp r14d, DIR_E
+    jb .out
+    cmp dword [r13+DE_ID], 0
     je .l0n
+    mov eax, [r13+DE_ID]
+    lea rdi, [fs_mvbuf]
+    call fs3_pathof
+    jc .l0n
     mov al, '0'
     call tput_c
-    mov rsi, r13
+    lea rsi, [fs_mvbuf]
     call tput_s
     call tnl
 .l0n:
-    add r13, SLOT
-    dec r14d
-    jnz .l0
-    jmp .out
+    add r13, DIR_E
+    sub r14d, DIR_E
+    jmp .l0
 .date:
     mov rdi, TMPB
     mov byte [rdi], '2'
@@ -19964,7 +42939,8 @@ term_exec:
 .denied:
     lea rsi, [s_denied]
     call tput_s
-    jmp .out.calc:
+    jmp .out
+.calc:
     mov byte [calc_err], 0
     mov rsi, r14
     call ex_expr
@@ -20224,22 +43200,43 @@ app_images:
     push r9
     mov dword [im_sel], 0
 .build:
+    push r13
+    push r14
     xor r9d, r9d                    ; count
-    mov rdi, FSBUF
-    mov ecx, MAXF
-.s: cmp byte [rdi], 0
+    mov r13, DIRTAB
+    mov r14d, [fs_dlen]
+.s: cmp r14d, DIR_E
+    jb .sd
+    cmp dword [r13+DE_ID], 0
     je .n
-    mov rsi, rdi
+    cmp byte [r13+DE_KIND], DE_DIR
+    je .n
+    cmp r9d, 20
+    jae .n
+    ; stub = full path of the entry, then the .bmp extension test
+    mov eax, r9d
+    shl eax, 7
+    lea rdi, [STUBS+rax]
+    mov eax, [r13+DE_ID]
+    call fs3_pathof
+    jc .n
+    mov eax, r9d
+    shl eax, 7
+    lea rsi, [STUBS+rax]
     call ext4
     cmp eax, 0x706D622E
     jne .n
-    cmp r9d, 20
-    jae .n
-    mov [ITEMS+r9*8], rdi
+    mov eax, r9d
+    shl eax, 7
+    lea rax, [STUBS+rax]
+    mov [ITEMS+r9*8], rax
     inc r9d
-.n: add rdi, SLOT
-    dec ecx
-    jnz .s
+.n: add r13, DIR_E
+    sub r14d, DIR_E
+    jmp .s
+.sd:
+    pop r14
+    pop r13
     mov [im_n], r9d
 .draw:
     lea rsi, [s_img_t]
@@ -20305,10 +43302,27 @@ app_images:
     dec dword [im_sel]
     jmp .draw
 .k2:
+    cmp al, K_CLICK
+    jne .k3
+    mov eax, [clk_y]
+    dec eax
+    js .key
+    cmp eax, [im_n]
+    jae .key
+    cmp eax, [im_sel]
+    je .k4
+    mov [im_sel], eax
+    jmp .draw
+.k3:
     cmp al, 13
     jne .key
+.k4:
     mov eax, [im_sel]
     mov rax, [ITEMS+rax*8]
+    mov rsi, rax
+    call fs_find
+    test rax, rax
+    jz .draw
     call viewer_show
     jmp .draw
 .exit:
@@ -20341,7 +43355,21 @@ viewer_show:                        ; rax = slot (.bmp)
     mov r15, rax
     lea rsi, [s_img_t]
     call draw_win
+    ; big files: pull the whole FAT chain into VBMP (3 MB), else the slot data
+    mov eax, [r15+48]
+    cmp eax, MAXSZ
+    jbe .small
+    mov ebx, [r15+52]
+    lea rdi, [VBMP]
+    mov ecx, 0x300000
+    call fs3_read_chain
+    test rax, rax
+    jz .bad
+    mov rbx, VBMP
+    jmp .hdr
+.small:
     lea rbx, [r15+64]
+.hdr:
     cmp word [rbx], 'BM'
     jne .bad
     mov eax, [rbx+14]
@@ -20518,7 +43546,10 @@ viewer_show:                        ; rax = slot (.bmp)
 .wait:
     call getkey
     cmp al, 27
+    je .wdone
+    cmp al, K_CLICK
     jne .wait
+.wdone:
     pop r15
     pop r14
     pop r13
@@ -20629,6 +43660,9 @@ sample_tab:
     dq p_w_xpl, d_w_xpl
     dq p_w_keys, d_w_keys
     dq p_w_net, d_w_net
+    dq p_w_html, d_w_html
+    dq p_s_py1, d_s_py1
+    dq p_s_py2, d_s_py2
     dq 0, 0
 
 bmp_hdr:
@@ -20657,6 +43691,7 @@ d_w_index:
     db "<li><a href=",34,"xpl.htm",34,">XPL language guide</a></li>",10
     db "<li><a href=",34,"keys.htm",34,">Editor and keys</a></li>",10
     db "<li><a href=",34,"net.htm",34,">About the internet</a></li>",10
+    db "<li><a href=",34,"html.htm",34,">HTML demo: styles, tables, forms</a></li>",10
     db "<li><a href=",34,"/base/readme.txt",34,">readme.txt</a></li>",10
     db "</ul>",10
     db "<hr>",10
@@ -20696,12 +43731,51 @@ d_w_keys:
     db "<li>Arrows move, Enter opens, Esc goes back</li>",10
     db "</ul>",10
     db "<p><a href=",34,"index.htm",34,">Back to index</a></p>",10,0
+d_s_py1:
+    db "# Centtrix Python demo: run it with   python hello.py",10
+    db "name = input('Your name? ')",10
+    db "print('Hello,', name)",10
+    db "def fib(n):",10
+    db "    return n if n < 2 else fib(n-1) + fib(n-2)",10
+    db "print([fib(i) for i in range(12)])",10
+    db "words = 'the quick brown fox jumps over the lazy dog'.split()",10
+    db "print(sorted(words, key=len), len(words))",10
+    db "print(f'{name!r} has {len(name)} letters')",10,0
+d_s_py2:
+    db "# primes below 100",10
+    db "def is_prime(n):",10
+    db "    if n < 2:",10
+    db "        return False",10
+    db "    i = 2",10
+    db "    while i * i <= n:",10
+    db "        if n % i == 0:",10
+    db "            return False",10
+    db "        i += 1",10
+    db "    return True",10
+    db "print([n for n in range(100) if is_prime(n)])",10,0
+d_w_html:
+    db "<title>HTML demo</title>",10
+    db "<style>body{background:#fffdf5} h1{color:#1a5fb4} .warn{background:#ffe0e0;color:#900} td.n{text-align:right} a.x{color:#b00}</style>",10
+    db "<h1 id=",34,"top",34,">HTML in Centtrix</h1>",10
+    db "<p>Text can be <b>bold</b>, <i>italic</i>, <u>underlined</u>, <s>struck</s>, <code>code</code>, <font color=",34,"green",34,">coloured</font>.</p>",10
+    db "<p class=",34,"warn",34,">A paragraph with a CSS class: background and text colour.</p>",10
+    db "<h2>Table</h2>",10
+    db "<table border=",34,"1",34,"><tr><th>Item</th><th>Qty</th><th>Price</th></tr>",10
+    db "<tr><td>Apples</td><td class=",34,"n",34,">3</td><td class=",34,"n",34,">1.20</td></tr>",10
+    db "<tr><td>Pears</td><td colspan=",34,"2",34,">sold out</td></tr></table>",10
+    db "<h2>Form</h2>",10
+    db "<form><p>Name: <input type=",34,"text",34," name=",34,"n",34," value=",34,"Centtrix",34,"></p>",10
+    db "<p><input type=",34,"checkbox",34," checked> Remember me &nbsp; <input type=",34,"radio",34," name=",34,"r",34," checked> A <input type=",34,"radio",34," name=",34,"r",34,"> B</p>",10
+    db "<p><button>Send</button></p></form>",10
+    db "<p>Tab selects a link or field, Enter opens a link or edits a field. Forms are sent to real sites (GET and POST).</p>",10
+    db "<p><a href=",34,"#bottom",34,">Jump to the end</a> | <a href=",34,"index.htm",34,">Back to index</a></p>",10
+    db "<hr><p id=",34,"bottom",34,">The end. <a href=",34,"#top",34,">Top</a></p>",10,0
 d_w_net:
     db "<title>Internet</title>",10
     db "<h1>About the internet</h1>",10
     db "<p>Centtrix has a driver for Intel e1000 network cards (the default card in QEMU, VirtualBox and VMware). It gets an address by DHCP and can look up names, ping and fetch web pages over http and https.</p>",10
     db "<p>https:// works with TLS 1.2 (X25519, AES-128-GCM). The connection is encrypted, but Centtrix does not check the server certificate, so it cannot tell a real site from an impostor: do not type passwords. Sites that only offer TLS 1.3 or other ciphers cannot be opened.</p>",10
-    db "<p>Pictures, scripts, styles and forms are not supported: pages are shown as text with clickable links.</p>",10
+    db "<p>Pages are drawn as HTML: headings, lists, tables, colours and CSS in the page, links, #anchors and forms (GET and POST). Not supported: pictures (the alt text is shown), JavaScript, external style sheets, frames.</p>",10
     db "<p><a href=",34,"http://example.com",34,">Try http://example.com</a></p>",10
 db "<p><a href=",34,"index.htm",34,">Back to index</a></p>",10,0
 
@@ -20963,7 +44037,8 @@ font_mono:
     db 10,176,0,0,10,176,0,0,10,176,0,0,10,255,255,244,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,143,112,10,245,141,192,29,229,140,195,106,229,140,136,181,229,140,45,208,229
     db 140,12,144,229,140,0,0,229,140,0,0,229,140,0,0,229,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-    db 0,0,0,0,0,0,0,0,0,0,0,0,63,176,5,224,63,227,5,224,63,169,5,224,63,78,21,224,63,58,133,224    db 63,52,213,224,63,48,202,224,63,48,111,224,63,48,14,224,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+    db 0,0,0,0,0,0,0,0,0,0,0,0,63,176,5,224,63,227,5,224,63,169,5,224,63,78,21,224,63,58,133,224
+    db 63,52,213,224,63,48,202,224,63,48,111,224,63,48,14,224,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,2,190,233,0,11,194,61,128,31,80,8,208,79,32,5,241,79,32,5,241
     db 79,32,5,241,31,80,8,208,11,194,61,128,2,190,234,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,12,255,235,48,12,144,43,209,12,144,3,243,12,144,3,243,12,144,43,209
@@ -21962,7 +45037,8 @@ font_uib:
     db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,206,217,16,46,234,207,144,110,128,47,208,0,0,63,192,0,2
     db 223,96,0,29,246,0,0,95,128,0,0,73,48,0,0,1,0,0,0,143,112,0,0,110,80,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-    db 0,0,0,0,0,0,0,0,0,0,0,1,155,238,201,32,0,0,94,234,135,173,231,0,2,236,48,0,1,159,64,11    db 226,26,237,190,12,192,15,144,174,137,254,7,241,63,113,248,0,158,5,244,95,83,245,0,142,4,244,63,97,248,0,174
+    db 0,0,0,0,0,0,0,0,0,0,0,1,155,238,201,32,0,0,94,234,135,173,231,0,2,236,48,0,1,159,64,11
+    db 226,26,237,190,12,192,15,144,174,137,254,7,241,63,113,248,0,158,5,244,95,83,245,0,142,4,244,63,97,248,0,174
     db 6,242,15,144,190,120,239,108,192,11,226,43,237,75,236,48,3,252,32,0,0,0,0,0,110,234,135,140,48,0,0,2
     db 156,239,219,48,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,5,255,96,0,0,10,254,176,0,0,14,203,241,0,0,95,151,246,0,0,159,83,251,0,0,238,16,223,16
@@ -22961,7 +46037,8 @@ font_uil:
     db 128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,239,255,255,255,253,0,0,239
+    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,239,255,255,255,253,0,0,239
     db 255,255,255,253,0,0,239,255,255,255,253,0,0,51,51,51,51,51,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
     db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
@@ -23960,7 +47037,8 @@ icon_masks:
     db 231,158,255,193,0,0,0,0,0,0,0,0,159,253,116,175,197,102,102,91,251,70,207,250,0,0,0,0,0,0,0,6
     db 255,233,136,223,184,152,137,138,254,152,141,255,112,0,0,0,0,0,0,30,255,255,255,255,255,255,255,255,255,255,255,255
     db 243,0,0,0,0,0,0,143,252,187,172,254,187,187,187,186,223,218,187,191,250,0,0,0,0,0,1,223,214,86,90,251
-    db 86,85,85,101,175,181,102,92,254,32,0,0,0,0,5,255,166,118,108,250,103,102,102,102,159,214,102,104,255,112,0,0    db 0,0,9,254,118,102,109,249,102,102,102,102,143,230,102,102,239,176,0,0,0,0,12,253,102,102,110,248,86,102,102,102
+    db 86,85,85,101,175,181,102,92,254,32,0,0,0,0,5,255,166,118,108,250,103,102,102,102,159,214,102,104,255,112,0,0
+    db 0,0,9,254,118,102,109,249,102,102,102,102,143,230,102,102,239,176,0,0,0,0,12,253,102,102,110,248,86,102,102,102
     db 127,231,102,101,207,208,0,0,0,0,13,252,103,119,126,248,103,119,119,119,127,248,119,118,191,226,0,0,0,0,46,255
     db 238,238,239,255,238,238,238,238,239,255,238,238,255,243,0,0,0,0,46,255,255,255,255,255,255,255,255,255,255,255,255,255
     db 255,243,0,0,0,0,29,252,120,135,142,249,120,136,136,135,143,249,120,135,191,226,0,0,0,0,12,252,86,102,110,248
@@ -24959,7 +48037,8 @@ logo_mono_64:
     dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000
     dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000
     dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000
-    dd 0xFB00003F,0xFF000000,0xEFBFBFBF,0x682F3039,0x000E101B,0x00030710,0x01030610,0x03050912,0x01060A12,0x00060A13,0x0002020E,0x00797A7E    dd 0x00717276,0x0001010B,0x00070A14,0x02060913,0x02030710,0x00020610,0x0111141E,0x7334363D,0xF5FFFFE5,0xFF000000,0xFB003F3F,0xFF000000
+    dd 0xFB00003F,0xFF000000,0xEFBFBFBF,0x682F3039,0x000E101B,0x00030710,0x01030610,0x03050912,0x01060A12,0x00060A13,0x0002020E,0x00797A7E
+    dd 0x00717276,0x0001010B,0x00070A14,0x02060913,0x02030710,0x00020610,0x0111141E,0x7334363D,0xF5FFFFE5,0xFF000000,0xFB003F3F,0xFF000000
     dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000
     dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000
     dd 0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000,0xFF000000
@@ -25834,6 +48913,12 @@ logo_monol_20:
 
 ; ---- variables: kept apart from code (own pages) ----------------------------
 times ((4096-((31744+$-$$)&4095))&4095) db 0
+d_notes   db "My first Centtrix note.",10,"Edit me!",10,0
+times ((4096-((31744+$-$$)&4095))&4095) db 0
+
+
+; ---- variables: kept apart from code (own pages) ----------------------------
+times ((4096-((31744+$-$$)&4095))&4095) db 0
 cur_fb    dq 0
 cur_pitch dq 0
 cur_surf  dd 0
@@ -25868,6 +48953,7 @@ bs_cnt dd 0
 bs_sy dd 0
 bs_fx0 dd 0
 bs_fx1 dd 0
+cur_skip db 0
 dith4 db 0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5
 wg_top dd 0
 wg_bot dd 0
@@ -25954,11 +49040,16 @@ ms_i     db 0
 ms_b0    db 0
 ms_b1    db 0
 m_btn    db 0
+clk_x    dd 0                   ; last click inside a window: text cell column / row and pixel offsets
+clk_y    dd 0
+clk_px   dd 0
+clk_py   dd 0
 m_btn_old db 0
 m_ev     dd 0
 drag_s   dd -1
 drag_gx  dd 0
-drag_gy  dd 0launch_req dd 0
+drag_gy  dd 0
+launch_req dd 0
 desk_click db 0
 dk_x     dd 0
 dk_y     dd 0
@@ -25984,6 +49075,8 @@ pm_h      dd 0
 pm_ent    times 16*16 db 0
 dk_hov    dd -1
 dk_hov_old dd -2
+dk_mag_idx dd -1
+dk_mag_sz  dd 0
 tb_lx1    dd 0
 tb_ax0    dd 0
 tb_ax1    dd 0
@@ -26081,6 +49174,7 @@ lk_dkw   dd 0
 lk_bad   db 0
 lg_sub dq 0
 lg_len dd 0
+lg_done db 0
 pt_tool  dd 0
 pt_col   dd 1
 pt_dc    dd 1
@@ -26114,7 +49208,7 @@ st_prev  db 0
 st_mon   dd -1
 st_cur_surf dd 0
 st_samples db 0,3,6
-st_tab_icon db 6,14,4,16,10,9,11,8
+st_tab_icon db 6,14,4,16,10,9,11,14,6,4,8
 s_th_l   db "Light",0
 s_th_d   db "Dark",0
 s_c24    db "24-hour",0
@@ -26185,7 +49279,7 @@ s_u_name  db "User name",0
 s_u_pw    db "Change password",0
 s_u_lock  db "Lock screen",0
 s_u_out   db "Log out (close all windows)",0
-s_ab_ver  db "Version 3.5  -  64-bit",0
+s_ab_ver  db "Version 4.0  -  64-bit",0
 s_ab_1    db "Written in NASM assembler, one source file.",0
 s_ab_2    db "x86-64 long mode, VBE linear framebuffer, PS/2 keyboard and mouse.",0
 s_ab_3    db "Window manager with alpha-blended compositing and anti-aliased text.",0
@@ -26273,7 +49367,15 @@ http_class db 1
 http_loc times 512 db 0
 s_hget   db "GET ", 0
 s_hhost  db " HTTP/1.0", 13, 10, "Host: ", 0
-s_htail  db 13, 10, "User-Agent: Centtrix/3.5", 13, 10, "Accept: text/html, text/plain;q=0.9, */*;q=0.1", 13, 10, "Connection: close", 13, 10, 13, 10, 0
+s_htail  db 13, 10, "User-Agent: Centtrix/3.6", 13, 10, "Accept: text/html, text/plain;q=0.9, */*;q=0.1", 13, 10, "Connection: close", 13, 10, 13, 10, 0
+s_hpost  db "POST ", 0
+s_htailp db 13, 10, "User-Agent: Centtrix/3.6", 13, 10, "Accept: text/html, text/plain;q=0.9, */*;q=0.1", 13, 10, "Connection: close", 13, 10, "Content-Type: application/x-www-form-urlencoded", 13, 10, "Content-Length: ", 0
+s_crlf2  db 13, 10, 13, 10, 0
+http_post db 0
+http_cs   db 0
+w_1251   db "1251", 0
+w_8859n  db "8859-1", 0
+http_body dq 0
 s_http   db "http:", 0
 s_https  db "https:", 0
 s_nethtm db "net.htm", 0
@@ -26333,50 +49435,42 @@ br_slot  dq 0
 br_tg    dq 0
 br_rp    dq 0
 br_end   dq 0
-br_stat  dq 0
-br_hn    dd 0
-br_top   dd 0
-br_sel   dd -1
-br_nlk   dd 0
-br_rows  dd 1
 br_row   dd 0
 br_col   dd 0
+br_lineh dd 1
+br_rtop  dd 0
+br_x0    dd 0
+br_x1    dd 96
+br_fg    dd 0
+br_bg    dd 0
+br_bbg   dd 0
+br_hid   dd 0
+br_lctr  dd 0
 br_tl    dd 0
-br_elen  dd 0
-br_att   db 0
-br_pend  db 0
+br_rows  dd 1
+br_nlk   dd 0
+br_fl    db 0
+br_al    db 0
 br_pre   db 0
 br_ttl   db 0
 br_plain db 0
-br_editing db 0
+br_pend  db 0
+br_gap   db 0
+br_lkind db 0
+br_lk    db 0
+br_form  db 0xFF
+br_bord  db 0
 br_title times 64 db 0
-br_loc   times 512 db 0
-br_edit  times 512 db 0
-br_msg   times 600 db 0
 n_cmt    db "-->", 0
 n_script db "</script", 0
 n_style  db "</style", 0
-n_noscript db "</noscript", 0
-n_svg    db "</svg", 0
-n_tpl    db "</template", 0
 n_href   db "href", 0
 n_alt    db "alt", 0
-s_http_s db "http://", 0
-s_br_loading db "Loading ", 0
-s_br_http db "HTTP ", 0
-s_br_trunc db "  (page was too big, cut off)", 0
-s_br_go  db "Go to: ", 0
-s_br_unsup db "This kind of link cannot be opened", 0
-s_br_hint db "g: address   Tab: next link   Enter: open   Backspace: back   r: reload   Esc: close", 0
-s_ep1    db "<h1>Cannot open this page</h1><p>", 0
-s_ep2    db "</p><p>Address: ", 0
-s_ep3    db "</p>", 0
-s_nf1    db "<h1>Page not found</h1><p>", 0
+cpm_tab  dw 0x401, 192, 0x451, 193, 0xE1, 194, 0xE9, 195, 0xED, 196, 0xF3, 197, 0xFA, 198, 0xFC, 199
+         dw 0xF1, 200, 0xC1, 201, 0xC9, 202, 0xCD, 203, 0xD3, 204, 0xDA, 205, 0xDC, 206, 0xD1, 207
+         dw 0xBF, 208, 0xA1, 209, 0x2026, 210, 0x2192, 211, 0x2190, 212, 0x2713, 213, 0xD7, 214
+         dw 0xB0, 215, 0x2191, 216, 0x2193, 217, 0x2022, 127, 0
 lat1_tab db "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty"
-cyr_tab  dd 'A', 'B', 'V', 'G', 'D', 'E', 'Zh', 'Z', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P'
-         dd 'R', 'S', 'T', 'U', 'F', 'Kh', 'Ts', 'Ch', 'Sh', 'Shch', 0, 'Y', 0, 'E', 'Yu', 'Ya'
-         dd 'a', 'b', 'v', 'g', 'd', 'e', 'zh', 'z', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p'
-         dd 'r', 's', 't', 'u', 'f', 'kh', 'ts', 'ch', 'sh', 'shch', 0, 'y', 0, 'e', 'yu', 'ya'
 misc_tab dw 0x2013, ms_dash-misc_str, 0x2014, ms_dd-misc_str, 0x2018, ms_sq-misc_str, 0x2019, ms_sq-misc_str
          dw 0x201C, ms_dq-misc_str, 0x201D, ms_dq-misc_str, 0x2022, ms_star-misc_str, 0x2026, ms_ell-misc_str
          dw 0xA9, ms_c-misc_str, 0xAE, ms_r-misc_str, 0xAB, ms_la-misc_str, 0xBB, ms_ra-misc_str
@@ -26393,18 +49487,18 @@ ent_tab  db "lt", 0, "<", 0
          db "reg", 0, "(R)", 0
          db "mdash", 0, "--", 0
          db "ndash", 0, "-", 0
-         db "hellip", 0, "...", 0
+         db "hellip", 0, 210, 0
          db "laquo", 0, "<<", 0
          db "raquo", 0, ">>", 0
-         db "middot", 0, ".", 0
-         db "bull", 0, "*", 0
-         db "rarr", 0, "->", 0
-         db "larr", 0, "<-", 0
-         db "times", 0, "x", 0
+         db "middot", 0, 127, 0
+         db "bull", 0, 127, 0
+         db "rarr", 0, 211, 0
+         db "larr", 0, 212, 0
+         db "times", 0, 214, 0
          db "trade", 0, "(TM)", 0
          db "euro", 0, "EUR", 0
          db "pound", 0, "GBP", 0
-         db "deg", 0, "deg", 0
+         db "deg", 0, 215, 0
          db "plusmn", 0, "+-", 0
          db "frac12", 0, "1/2", 0
          db "lsquo", 0, "'", 0
@@ -26429,6 +49523,517 @@ ent_tab  db "lt", 0, "<", 0
          db "Ouml", 0, "O", 0
          db "Auml", 0, "A", 0
          db 0
+cw_bold     db "bold", 0
+cw_bolder   db "bolder", 0
+cw_normal   db "normal", 0
+cw_lighter  db "lighter", 0
+cw_underl   db "underline", 0
+cw_linet    db "line-through", 0
+cw_none     db "none", 0
+cw_center   db "center", 0
+cw_right    db "right", 0
+cw_left     db "left", 0
+cw_start    db "start", 0
+cw_justify  db "justify", 0
+cw_hidden   db "hidden", 0
+cw_xxl      db "xx-large", 0
+cw_xl       db "x-large", 0
+cw_medium   db "medium", 0
+cw_small    db "small", 0
+cw_large    db "large", 0
+n_id        db "id", 0
+n_class     db "class", 0
+br_nrul     dd 0
+el_idh      dd 0
+el_ncls     dd 0
+el_bloom    dd 0
+el_cls      times 8 dd 0
+br_eind     dd 0
+br_eindset  dd 0
+br_ewidth   dd 0
+tag_unknown dq 0
+            dd 0, 0
+n_bgcolor   db "bgcolor", 0
+n_align     db "align", 0
+n_text      db "text", 0
+n_hidden    db "hidden", 0
+n_color     db "color", 0
+n_name      db "name", 0
+n_start     db "start", 0
+n_charset   db "charset", 0
+n_content   db "content", 0
+n_styleattr db "style", 0
+w_cp1251    db "1251", 0
+w_8859      db "8859-1", 0
+w_utf8      db "utf-8", 0
+w_latin1    db "latin1", 0
+w_cp1251b   db "cp-1251", 0
+br_isblk    dd 0
+br_nanc     dd 0
+br_nfrm     dd 0
+br_tbd      dd 0
+br_ctop     dd 0
+br_tbp      dq 0
+br_sp       dd 0
+br_fbase    dd 0
+br_pbg      dd 0
+br_isweb    db 0
+br_peek     dd 0
+br_rbp      dq 0
+br_tg2      dq 0
+br_mw_min   dd 0
+br_mw_max   dd 0
+n_colspan   db "colspan", 0
+n_capend    db "</caption", 0
+n_border    db "border", 0
+n_type      db "type", 0
+n_size      db "size", 0
+n_value     db "value", 0
+n_width     db "width", 0
+br_cs       db 0
+s_submit  db "Submit", 0
+n_action  db "action", 0
+n_method  db "method", 0
+n_placeh  db "placeholder", 0
+n_checked db "checked", 0
+n_cols    db "cols", 0
+n_btnend  db "</button", 0
+n_taend   db "</textarea", 0
+br_dst    dq 0
+br_optp   dd 0
+br_sidx   dd 0
+br_vfound db 0
+n_selend  db "</select", 0
+n_selected db "selected", 0
+br_dmax   dd 0
+br_editing db 0
+br_ctl_ph db 0
+br_eitem  dd 0
+br_stat  dq 0
+br_hn    dd 0
+br_top   dd 0
+br_sel   dd -1
+br_elen  dd 0
+br_frag  dd 0
+br_pgbg  dd 0
+br_islt  dd 1
+br_gq    db 0
+br_csin  db 0
+bl_mask  db 0, 3, 12, 10, 9, 6, 5, 14, 13, 0, 0, 0, 0, 0, 11, 7, 15
+br_loc   times 512 db 0
+br_edit  times 512 db 0
+br_msg   times 600 db 0
+s_http_s db "http://", 0
+s_br_loading db "Loading ", 0
+s_br_http db "HTTP ", 0
+s_br_trunc db "  (page was too big, cut off)", 0
+s_br_go  db "Go to: ", 0
+s_br_btns db "[<] [R]", 0
+s_br_unsup db "This kind of link cannot be opened", 0
+s_br_nosub db "This form cannot be sent", 0
+s_br_hint db "Mouse: click links, fields, [<] back, [R] reload, scrollbar.  Keys: g address, Tab next, Enter open, Backspace back, Esc close", 0
+s_ep1    db "<h1>Cannot open this page</h1><p>", 0
+s_ep2    db "</p><p>Address: ", 0
+s_ep3    db "</p>", 0
+s_nf1    db "<h1>Page not found</h1><p>", 0
+ps_func  db "<function>", 0
+ps_none  db "None", 0
+ps_false db "False", 0
+ps_true  db "True", 0
+ps_comma db ", ", 0
+ps_colon db ": ", 0
+ps_range db "range(", 0
+pe_mem   db "MemoryError: out of memory", 0
+pe_big   db "OverflowError: integers are limited to 62 bits here (no big numbers)", 0
+pe_vars  db "MemoryError: too many variables", 0
+kw_True  db "True", 0
+kw_False db "False", 0
+kw_None  db "None", 0
+kw_in    db "in", 0
+kw_not   db "not", 0
+kw_is    db "is", 0
+kw_and   db "and", 0
+kw_or    db "or", 0
+kw_else  db "else", 0
+kw_if    db "if", 0
+py_reserved db "and", 0, "or", 0, "not", 0, "if", 0, "else", 0, "elif", 0, "while", 0, "for", 0, "in", 0, "is", 0
+            db "def", 0, "return", 0, "break", 0, "continue", 0, "pass", 0, "import", 0, "from", 0
+            db "class", 0, "try", 0, "except", 0, "finally", 0, "with", 0, "lambda", 0, "global", 0
+            db "nonlocal", 0, "del", 0, "assert", 0, "raise", 0, "yield", 0, "as", 0, 0
+pe_float db "NotImplementedError: floating point numbers are not supported (use whole numbers and //)", 0
+pe_fdiv  db "NotImplementedError: / makes a float and floats are not supported; use // for whole-number division", 0
+pe_long  db "ValueError: text is too long", 0
+pe_unterm db "SyntaxError: unterminated string", 0
+pe_fstr  db "SyntaxError: bad f-string", 0
+pe_syntax db "SyntaxError: invalid syntax", 0
+pe_uop   db "TypeError: bad operand type for unary - or +", 0
+pe_name1 db "NameError: name '", 0
+pe_name2 db "' is not defined", 0
+pe_type  db "TypeError: unsupported operand types for this operator", 0
+pe_unord db "TypeError: these values cannot be ordered", 0
+pe_zero  db "ZeroDivisionError: division or modulo by zero", 0
+pe_idx   db "IndexError: index out of range", 0
+pe_key   db "KeyError: key not found", 0
+pe_negp  db "ValueError: negative exponents need floats, which are not supported", 0
+pe_slstep db "ValueError: slice step cannot be zero", 0
+pe_notit db "TypeError: this object is not iterable", 0
+pe_nolen db "TypeError: this object has no len()", 0
+pe_noidx db "TypeError: this object cannot be indexed or sliced", 0
+pe_idxt  db "TypeError: indices must be integers", 0
+pe_fmt   db "TypeError: bad % format or wrong number of arguments", 0
+pe_noset db "TypeError: this object does not support item assignment", 0
+k_if      db "if", 0
+k_elif    db "elif", 0
+k_while   db "while", 0
+k_for     db "for", 0
+k_def     db "def", 0
+k_return  db "return", 0
+k_break   db "break", 0
+k_continue db "continue", 0
+k_pass    db "pass", 0
+k_global  db "global", 0
+k_nonlocal db "nonlocal", 0
+k_del     db "del", 0
+k_assert  db "assert", 0
+k_try     db "try", 0
+k_except  db "except", 0
+k_finally db "finally", 0
+k_raise   db "raise", 0
+k_import  db "import", 0
+k_from    db "from", 0
+k_class   db "class", 0
+k_with    db "with", 0
+k_lambda  db "lambda", 0
+k_as      db "as", 0
+k_exception db "Exception", 0
+k_baseexc db "BaseException", 0
+k_else    db "else", 0
+pe_noblock db "IndentationError: expected an indented block", 0
+pe_indent db "IndentationError: unexpected indent", 0
+pe_dedent db "IndentationError: unindent does not match any outer indentation level", 0
+pe_unsup  db "NotImplementedError: this statement (class / with) is not available in this Python", 0
+pe_import db "ImportError: modules are not available in this Python (there is no import)", 0
+pe_intr   db "KeyboardInterrupt: stopped", 0
+pe_retout db "SyntaxError: 'return' outside function", 0
+pe_few    db "ValueError: not enough values to unpack", 0
+pe_many   db "ValueError: too many values to unpack", 0
+pe_target db "SyntaxError: cannot assign to this expression", 0
+pe_gnone  db "NameError: global name does not exist yet (create it at the top level first)", 0
+pe_args   db "TypeError: wrong number of arguments for this function", 0
+pe_kwmany db "TypeError: too many keyword arguments", 0
+pe_vsfull db "MemoryError: too many nested calls / arguments", 0
+pe_notcall db "TypeError: this object is not callable", 0
+pe_rec    db "RecursionError: maximum recursion depth exceeded", 0
+pe_missing db "TypeError: missing required argument", 0
+pe_toomany db "TypeError: too many arguments for this function", 0
+pe_needint db "TypeError: an integer is needed here", 0
+pe_rzero  db "ValueError: range() step must not be zero", 0
+pe_intarg db "TypeError: int() argument must be a string or a number", 0
+pe_intlit db "ValueError: invalid literal for int()", 0
+pe_base   db "ValueError: int() base must be between 2 and 36", 0
+pe_eof    db "EOFError: no more input", 0
+pe_chr    db "ValueError: chr() argument out of range", 0
+pe_ord    db "TypeError: ord() expects a string of length 1", 0
+pe_empty  db "ValueError: min()/max() of an empty sequence", 0
+pe_dictarg db "ValueError: dict() needs pairs", 0
+pe_exit   db "SystemExit: ", 0
+s_sep     db "sep", 0
+s_end     db "end", 0
+s_key     db "key", 0
+s_reverse db "reverse", 0
+s_assert  db "AssertionError", 0
+pe_nometh   db "AttributeError: this object has no such method", 0
+pe_needstr  db "TypeError: a string is needed here", 0
+pe_emptysep db "ValueError: empty separator", 0
+pe_joinstr  db "TypeError: join() needs a list of strings", 0
+pe_substr   db "ValueError: substring not found", 0
+pe_popempty db "IndexError: pop from empty list", 0
+pe_notinlist db "ValueError: value is not in the list", 0
+pe_fmtarg   db "IndexError: format() has too few arguments", 0
+pe_fmtbad   db "ValueError: bad format string", 0
+py_polls    dd 0
+s_py_banner db "Python (Centtrix subset): ints only, no classes/imports. exit() or Esc leaves.",10,0
+s_py_ps1    db ">>> ",0
+s_py_ps2    db "... ",0
+s_py_exit   db "exit()",0
+s_py_quit   db "quit()",0
+s_py_err    db "Error: ",0
+s_py_line   db "  (line ",0
+s_py_nofile db "python: file not found",0
+c_python    db "python",0
+c_py        db "py",0
+su_req  db 0                         ; 1 Super+X  2 Super+C  3 vol up  4 vol down
+k_super db 0
+ov_ring times 16 db 0                ; keys captured by an open launcher / panel
+ov_h    db 0
+ov_t    db 0
+ov_q    times 24 db 0                ; launcher search text
+ov_ql   dd 0
+tb_ix0  dd 0
+pal_dark db 0,1,1,1,1,1,0,0,0,1
+pal_names db "Light",0,"Dark",0,"Midnight",0,"Nord",0,"Dracula",0,"Forest",0,"Solarized",0,"Sepia",0,"Rose",0,"Contrast",0
+s_la_files db "Files",0
+s_la_term  db "Terminal",0
+s_la_py    db "Python (Terminal)",0
+s_la_ed    db "Editor",0
+s_la_br    db "Browser",0
+s_la_im    db "Images",0
+s_la_pa    db "Paint",0
+s_la_set   db "Settings",0
+s_la_th    db "Themes (Settings)",0
+s_la_snd   db "Sound and Network (Settings)",0
+s_la_mon   db "System Monitor",0
+s_la_lock  db "Lock Screen",0
+s_la_out   db "Log Out",0
+s_la_rest  db "Restart",0
+s_la_down  db "Shut Down",0
+s_la_search db "Search: ",0
+s_la_none  db "No matching apps",0
+s_la_cur   db "_",0
+s_q_wifi  db "Wi-Fi: ",0
+s_q_bt    db "Bluetooth: ",0
+s_q_on    db "On",0
+s_q_off   db "Off",0
+s_q_nodrv db "  (no driver yet)",0
+s_q_bat   db "Battery: not detected",0
+s_q_bat0  db "Battery: ",0
+s_q_ac    db "  (AC power)",0
+s_q_onbat db "  (on battery)",0
+s_q_vol   db "Volume: ",0
+s_q_muted db "muted",0
+s_q_up    db "Volume up      (Super + Up)",0
+s_q_dn    db "Volume down  (Super + Down)",0
+s_q_mute  db "Mute",0
+s_q_set   db "Sound and Network settings...",0
+s_q_empty db 0
+bi_buf times 40 db 0
+s_bi_wifi db "Wi-Fi",0
+s_bi_bt   db "BT",0
+s_bi_off  db " off",0
+s_bi_bat  db "Bat --",0
+s_bi_bat0 db "Bat ",0
+s_bi_vol  db "Vol ",0
+s_bi_mute db "Vol mute",0
+s_pt_note  db "Pick a theme. Accent colour in Appearance overrides the theme accent.",0
+s_pt_note2 db "(Blue = the theme's own accent.)",0
+s_tb_lay  db "Keyboard layout badge (EN / RU)",0
+s_tb_vol  db "Volume",0
+s_tb_wifi db "Wi-Fi",0
+s_tb_bt   db "Bluetooth",0
+s_tb_bat  db "Battery",0
+s_tb_note db "Shown items sit left of the clock. Click them to open the quick panel (Super + C).",0
+s_tb_note2 db "The clock stays; the menus on the left are always available.",0
+s_sn_vol  db "Volume",0
+s_sn_mute db "Mute",0
+s_sn_wifi db "Wi-Fi switch",0
+s_sn_bt   db "Bluetooth switch",0
+s_sn_net  db "Wi-Fi, Bluetooth, battery",0
+s_sn_n1   db "Hotkeys: Super + Up / Down = volume, Super + X = find apps, Super + C = quick panel.",0
+s_sn_n2   db "Honest note: no Wi-Fi, Bluetooth or sound-card drivers exist yet.",0
+s_sn_n3   db "The switches are saved settings; volume only sets the pitch of a PC-speaker beep.",0
+s_sn_n4   db "Battery: read through the BIOS (APM).",0
+s_sn_n4b  db "Battery: not read (turn BIOS services on; needs an APM BIOS).",0
+s_sn_bios db "BIOS services (experimental): battery + saving on USB/SATA",0
+s_sn_n5   db "BIOS services use int 13h/15h through a real-mode switch; untested on real hardware.",0
+s_sn_n6   db "They save files to the boot medium when the ATA ports can't reach it. Command: biossave.",0
+vol_lbl   db "0",0,"10",0,"20",0,"30",0,"40",0,"50",0,"60",0,"70",0,"80",0,"90",0,"100",0
+bat_ok  db 0                         ; 1 = values below are valid
+bat_pct db 0xFF
+bat_ac  db 0xFF                      ; 0 battery, 1 AC, 0xFF unknown
+bat_chg db 0
+in_drv   times 8 db 0
+in_sec   times 8 dq 0
+in_n     dd 0
+s_in_head   db "Disks the BIOS can see:",10,0
+s_in_drive  db "  drive 0x",0
+s_in_mb     db "  MB",0
+s_in_boot   db "  (boot medium, not offered)",0
+s_in_none   db "No other disk is reachable through the BIOS. (USB sticks and SATA disks show up here only",10
+            db "when the firmware boots in Legacy/CSM mode.)",10,0
+s_in_ask    db "Install to which number? (Enter = cancel) ",0
+s_in_bad    db "Cancelled.",10,0
+s_in_small  db "That disk is too small for the image.",10,0
+s_in_warn1  db "ALL DATA ON THIS DISK WILL BE ERASED, including its partition table:",10,0
+s_in_warn2  db "Type ERASE (capital letters) to continue: ",0
+s_in_cur    db "Copying boot code and kernel from the boot medium, then your files and settings.",10,0
+s_in_ok     db 10,"Installed and verified. Boot that disk in Legacy/CSM mode.",10,0
+s_in_rerr   db 10,"Read error from the boot medium.",10,0
+s_in_werr   db 10,"Write error on the target disk.",10,0
+s_in_verr   db 10,"Verification failed: the target does not hold what was written.",10,0
+s_in_erase  db "ERASE",0
+s_bt_none   db "Battery: no APM battery found (the BIOS gave no answer or has no battery).",10,0
+s_bt_val    db "Battery: ",0
+s_bt_pc     db "%  ",0
+s_bt_ac     db "on AC power",0
+s_bt_bat    db "on battery",0
+s_bt_unk    db "power source unknown",0
+s_bs_off    db "biossave: turn on 'BIOS services' in Settings > Sound and Network first.",10,0
+s_bs_ok     db "Everything was written to the boot medium.",10,0
+s_df_head   db "CNT3 filesystem",10,0
+s_df_disk   db "disk    : ",0
+s_df_mb     db " MB",10,0
+s_df_cl     db "clusters: ",0
+s_df_of     db " of ",0
+s_df_free   db ", free ",0
+s_df_files  db "files   : ",0
+s_df_dcom   db " files, ",0
+s_df_fcom   db " folders, ",0
+s_df_bend   db " bytes",10,0
+s_df_noata  db "disk    : unknown size",10,0
+s_bs_err    db "The BIOS refused a write; the boot medium may be read-only.",10,0
+c_install  db "install",0
+c_df       db "df",0
+c_battery  db "battery",0
+c_biossave db "biossave",0
+snd_ok    db 0
+snd_tried db 0
+snd_nam   dw 0
+snd_nabm  dw 0
+snd_busdev dd 0
+gl_x    dd 0                         ; glass rectangle (screen coordinates)
+gl_y    dd 0
+gl_w    dd 0
+gl_h    dd 0
+gl_rad  dd 18
+gl_sw   dd 0                         ; surface width  (w + 2*GLM)
+gl_sh   dd 0
+gl_ok   db 0                         ; GLB holds a finished panel
+gl_n    dd 0                         ; blur line length
+gl_ss   dq 4                         ; blur source stride
+gl_ds   dq 4                         ; blur destination stride
+gl_rc   dd 0
+gl_lo   dd 0                         ; tint alpha at the bottom / top (0..256)
+gl_hi   dd 0
+gl_tc   dd 0xFFFFFF                  ; tint colour
+gl_rimc dd 0xFFFFFF
+gl_rima dd 150
+gs_mode  dd 0                        ; 0 disc, 1 ring, 2 capsule, 3 crescent
+gs_mask  dd 0                        ; 0 none, 1 cone up, 2 half above, 3 cone right
+gs_cx    dd 0.0
+gs_cy    dd 0.0
+gs_r     dd 0.0                      ; outer radius / half thickness
+gs_r0    dd 0.0                      ; inner radius (ring)
+gs_x1    dd 0.0                      ; capsule end / second disc centre
+gs_y1    dd 0.0
+gs_r1    dd 0.0                      ; second disc radius (crescent)
+gs_len2  dd 0.0
+gs_A     dd 255
+gs_bx0   dd 0
+gs_by0   dd 0
+gs_bx1   dd 0
+gs_by1   dd 0
+gs_one   dd 1.0
+gs_half  dd 0.5
+gs_255   dd 255.0
+gs_big   dd 1000.0
+gs_ts    dd 1.0
+gs_t     times 8 dd 0.0
+sun_rays db 0,-8,0,-11, 0,8,0,11, -8,0,-11,0, 8,0,11,0, 6,-6,8,-8, -6,-6,-8,-8, 6,6,8,8, -6,6,-8,8
+gear_teeth db 0,-8,0,-11, 0,8,0,11, -8,0,-11,0, 8,0,11,0, 6,-6,8,-8, -6,-6,-8,-8, 6,6,8,8, -6,6,-8,8
+gl_ibt_sz   dd 0
+gl_ibt_step dd 0
+gl_ibt_x    dd 0
+gl_ibt_y    dd 0
+gl_ibt_d    dd 0
+gl_ibt_src  dq 0
+gl_ibt_ix   dd 0
+gl_ibt_fx   dd 0
+gl_ibt_row  dd 0
+gl_ibt_fy   dd 0
+gl_ibt_p11  dd 0
+gp_x   dd 0
+gp_y   dd 0
+gp_top dd 0
+gp_bot dd 0
+gp_sw  dd 0
+gp_sh  dd 0
+gp_sr  dd 0
+gp_gloss dd 0
+gp_rim dd 0
+gp_alpha dd 255
+gb_sc   dd 1.0
+gb_inv  dd 1.0
+gb_k    dd 1.0
+gb_bias dd 0.0
+gb_pen  dd 0.0
+gb_x    dd 0
+gb_y    dd 0
+gb_dh   dd 0
+gb_dw   dd 0
+gb_c    dd 0
+gb_u    dd 0.0
+gb_v    dd 0.0
+gb_tmp  dd 0
+gb_f15  dd 15.0
+gb_h    dd 0.5
+gb_o    dd 1.0
+gb_two  dd 2.0
+gb_one  dd 1.0
+gb_k255 dd 255.0
+gb_wsum dd 0
+ov_force db 0
+la_vis   times 20 db 0
+la_nvis  dd 0
+la_scr   dd 0
+la_rows  dd 1
+la_i     dd 0
+s_tag_app  db "App",0
+s_tag_sys  db "System",0
+s_tag_set  db "Settings",0
+s_tag_calc db "Calculator",0
+s_la_ph    db "Type to search",0
+la_res dd 0
+qp_drag db 0
+s_qp_wifi db "Wi-Fi",0
+s_qp_bt   db "Bluetooth",0
+s_qp_dark db "Dark mode",0
+s_qp_on   db "On",0
+s_qp_off  db "Off",0
+s_qp_ond  db "On (no driver)",0
+s_qp_vol  db "Volume",0
+s_qp_muted db "Muted",0
+s_qp_nobat db "No battery detected",0
+s_qp_pct  db 0,0,0,0,0,0,0,0
+qp_res dd 0
+lk_buf   times 48 db 0
+lk_tbuf  times 12 db 0
+lk_min   dd -1
+s_lk_hint db "Press any key to unlock",0
+s_dn_0 db "Sunday",0,"Monday",0,"Tuesday",0,"Wednesday",0,"Thursday",0,"Friday",0,"Saturday",0
+s_mn_0 db "January",0,"February",0,"March",0,"April",0,"May",0,"June",0,"July",0,"August",0,"September",0,"October",0,"November",0,"December",0
+lk_bare db 0
+cc_p   dq 0
+cc_err db 0
+cc_buf times 40 db 0
+la_calc_ent dq cc_buf
+            dd 0, 9 | (3 << 8)
+sw_req  db 0
+sw_rel  db 0
+sw_n    dd 0
+sw_sel  dd 0
+sw_task times 10 db 0
+sw_tb   times 20 db 0
+gv_s    dd 1.0
+gv_ox   dd 0.0
+gv_oy   dd 0.0
+gv_a    dd 255
+gv_c    dd 0xFFFFFF
+gv_tc   dd 0x808080
+gv_pass db 0
+gv_hole db 0
+gv_shA  dd 70
+gv_ti   times 6 dd 0
+iv_idx  dd 0
+iv_sz   dd 0
+iv_top  dd 0
+iv_bot  dd 0
+iv_sty  dd 0
+iv_fn   dq 0
+gv_tiny dd 0.01
+dead_acute:  db "aeiouAEIOU",0
+dead_acute_r: db 194,195,196,197,198,201,202,203,204,205
+dead_diaer:  db "uU",0
+dead_diaer_r: db 199,206
 mo_last  dd 0
 im_sel   dd 0
 im_n     dd 0
@@ -26442,6 +50047,9 @@ p_sbmp    db "/home/sample.bmp",0
 p_w_xpl   db "/base/www/xpl.htm",0
 p_w_keys  db "/base/www/keys.htm",0
 p_w_net   db "/base/www/net.htm",0
+p_w_html  db "/base/www/html.htm",0
+p_s_py1   db "/home/hello.py",0
+p_s_py2   db "/home/primes.py",0
 s_dothtm  db ".htm",0
 s_bnofile  db "Page not found",0
 s_untitled db "page",0
@@ -26529,9 +50137,9 @@ t_col     dd 0
 t_cwd     dd 2
 cd_len    dd 6
 curdir    db "/home/",0
-          times 56 db 0
+          times 120 db 0
 tpath     db "/home/",0
-          times 56 db 0
+          times 120 db 0
 t_inlen   dd 0
 t_pstart  dd 0
 t_init    db 0
@@ -26574,24 +50182,26 @@ s_xabort     db "stopped",0
 s_xstop      db "error",0
 s_xerr       db "error: unknown or bad command",0
 s_term_hint  db 0
-s_banner     db "Centtrix 3.5",10,10,0
+s_banner     db "Centtrix 4.0 glass",10,10,0
 s_ok         db "ok",10,0
 s_nofile     db "no such file",10,0
 s_notxep     db "only .xep files can be run",10,0
 s_bad        db "invalid name / path, or no free space",10,0
 s_unk        db "unknown command - try 'help'",10,0
 s_rootls     db "base/",10,"dump/",10,"home/",10,0
-s_ver        db "Centtrix OS 3.5  x86_64  |  XPL 1.0",10,0
+s_ver        db "Centtrix OS 4.0  x86_64  |  XPL 1.0",10,0
 s_help       db "files   ls [dir]  cd dir  cat f  edit f  new f  run f.xep  rm f  cp a b  mv a b  mkdir d  empty",10
              db "system  date  uptime  mem  ps  kill PID  whoami  sudo [-k]  sleep n  calc expr  reboot  shutdown",10
              db "screen  clear  cls  desktop (close this terminal)",10
              db "network ifconfig  ping host  nslookup name  dhcp",10
+             db "python  python (prompt)   python file.py (run a script; Esc stops)",10
+             db "disk    install (copy Centtrix to another disk)  battery  biossave",10
              db "fun     cowsay text   cmatrix (any key stops)   echo text",10
              db "folders: base (sudo only)  dump  home      'sudo' then 'ls 0' shows the hidden root",10,0
 s_about_hint db 0
 s_ab1        db "Version 3.1 - 64-bit long mode kernel, written in NASM assembler.",0
 s_ab2        db "Display : VBE linear framebuffer 1024x768x32, BIOS 8x16 font",0
-s_ab3        db "Disk    : ATA PIO, CNTX filesystem with /base, /dump and /home",0
+s_ab3        db "Disk    : ATA PIO, CNT3 filesystem - as many files as the disk holds",0
 s_ab4        db "Editor  : built-in text editor (.txt and .xep), Ctrl+S saves",0
 s_ab5        db "Language: XPL - scripts are .xep files, run with Ctrl+R or 'run'",0
 s_ab6        db "XPL: say print let add sub mul at color clear box wait repeat/next end",0
@@ -26715,7 +50325,7 @@ d_readme  db "Welcome to Centtrix!",10,10
           db "base - system files (sudo)   dump - deleted files   home - your files",10,10
           db "Files are .txt (text) or .xep (XPL programs).",10
           db "Editor is vim-like: i insert, Esc normal, :w save, :q quit, :r run .xep",10,0
-d_sys     db "Centtrix OS 3.5",10,"64-bit long mode, VBE 32bpp",10,"CNTX filesystem, XPL 1.0",10,0
+d_sys     db "Centtrix OS 4.0",10,"64-bit long mode, VBE 32bpp",10,"CNTX filesystem, XPL 1.0",10,0
 d_rainbow db "# rainbow bars",10
           db "clear",10
           db "let c 0",10
@@ -26742,11 +50352,6 @@ d_hello   db "# Centtrix XPL demo",10
           db "at 10 12",10
           db 'say "Done."',10
           db "box 10 14 30 2",10,0
-d_notes   db "My first Centtrix note.",10,"Edit me!",10,0
-dead_acute:  db "aeiouAEIOU",0
-dead_acute_r: db 194,195,196,197,198,201,202,203,204,205
-dead_diaer:  db "uU",0
-dead_diaer_r: db 199,206
 times ((4096-((31744+$-$$)&4095))&4095) db 0
 
 times (KSECT+1)*512-($-$$) db 0
