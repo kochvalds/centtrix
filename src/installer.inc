@@ -7,14 +7,27 @@ ins_tgt     dd 0
 ins_pct     dd 0
 ins_drv     times 16 db 0
 ins_sec     times 16 dq 0
-ins_buf     times 64 db 0
+ins_buf     times 96 db 0
 set_hex     db "0123456789ABCDEF",0
+ins_along   db 0
+ins_pslot   dd 0
+ins_part    dd 0
+ins_err     dd 0
+ins_dsz     dd 0
 
 s_setup_t    db "Setup",0
 s_setup_run  db "setup: opening the disk installer",10,0
 s_set_h      db "Install Centtrix 4.0",0
 s_set_pick   db "Choose a disk. Everything on it will be replaced.",0
-s_set_foot   db "Up/Down - select    Enter - continue    R - rescan    Esc - close",0
+s_set_foot   db "Up/Down - select   A - alongside   Enter - continue   Esc - close",0
+s_set_pick2  db "Choose a disk. The other systems stay in place.",0
+s_set_free1  db "Installing next to the existing system.",0
+s_set_free2  db "Free space starts at sector ",0
+s_set_free3  db ", ",0
+s_set_free4  db " MB available",0
+s_set_nofree db "No free space on this disk for a second system.",0
+s_set_gpt    db "This disk uses GPT. Choose a disk with an MBR table.",0
+s_set_small2 db "The disk is too small for Centtrix.",0
 s_set_conf1  db "Install Centtrix to this disk?",0
 s_set_conf2  db "All data on the disk will be erased.",0
 s_set_conf3  db "Enter - install    Esc - back",0
@@ -142,6 +155,10 @@ set_draw:
     mov eax, C_DIM
     mov [g_fg], eax
     lea rsi, [s_set_pick]
+    cmp byte [ins_along], 0
+    je .pick
+    lea rsi, [s_set_pick2]
+.pick:
     mov ebx, WX+28
     mov ecx, WY+HDRH+66
     call ui_text
@@ -197,6 +214,42 @@ set_draw:
 .conf:
     cmp byte [ins_state], 1
     jne near .prog
+    cmp byte [ins_along], 0
+    je .confp
+    mov eax, C_TXT
+    mov [g_fg], eax
+    lea rsi, [s_set_free1]
+    mov ebx, WX+28
+    mov ecx, WY+HDRH+90
+    call ui_text
+    lea rdi, [ins_buf]
+    lea rsi, [s_set_free2]
+    call sappend
+    mov eax, [ins_part]
+    call set_utoa
+    lea rsi, [s_set_free3]
+    call sappend
+    mov eax, [ins_dsz]
+    sub eax, [ins_part]
+    shr eax, 11
+    call set_utoa
+    lea rsi, [s_set_free4]
+    call sappend
+    mov byte [rdi], 0
+    mov eax, C_TXT
+    mov [g_fg], eax
+    lea rsi, [ins_buf]
+    mov ebx, WX+28
+    mov ecx, WY+HDRH+126
+    call ui_text
+    mov eax, C_DIM
+    mov [g_fg], eax
+    lea rsi, [s_set_conf3]
+    mov ebx, WX+28
+    mov ecx, WY+HDRH+226
+    call ui_text
+    jmp .out
+.confp:
     mov eax, C_TXT
     mov [g_fg], eax
     lea rsi, [s_set_conf1]
@@ -260,15 +313,32 @@ set_draw:
     mov eax, C_TXT
     mov [g_fg], eax
     lea rsi, [s_set_fail]
+    cmp byte [ins_err], 1
+    jne .e2
+    lea rsi, [s_set_nofree]
+    jmp .ehead
+.e2:
+    cmp byte [ins_err], 2
+    jne .e3
+    lea rsi, [s_set_gpt]
+    jmp .ehead
+.e3:
+    cmp byte [ins_err], 3
+    jne .ehead
+    lea rsi, [s_set_small2]
+.ehead:
     mov ebx, WX+28
     mov ecx, WY+HDRH+90
     call ui_text
     mov eax, C_DIM
     mov [g_fg], eax
+    cmp byte [ins_err], 0
+    jne .enof2
     lea rsi, [s_set_fail2]
     mov ebx, WX+28
     mov ecx, WY+HDRH+130
     call ui_text
+.enof2:
     lea rsi, [s_set_fail3]
     mov ebx, WX+28
     mov ecx, WY+HDRH+180
@@ -320,27 +390,174 @@ set_progress:
     POPA
     ret
 
+io_abs_rd:
+    push r11
+    mov r11, [boot+BOOT_PART]
+    mov qword [boot+BOOT_PART], 0
+    call bios_rd
+    mov [boot+BOOT_PART], r11
+    pop r11
+    ret
+
+io_abs_wr:
+    push r11
+    mov r11, [boot+BOOT_PART]
+    mov qword [boot+BOOT_PART], 0
+    call bios_wr
+    mov [boot+BOOT_PART], r11
+    pop r11
+    ret
+
+set_free:
+    PUSHA
+    mov byte [ins_err], 0
+    xor eax, eax
+    mov edx, [ins_tgt]
+    lea rdi, [IBUF2]
+    mov ecx, 1
+    call io_abs_rd
+    jc .no
+    cmp word [IBUF2+510], 0xAA55
+    jne .no
+    lea r14, [IBUF2+446]
+    mov ecx, 4
+.gpt:
+    cmp byte [r14+4], 0xEE
+    je .gptbad
+    add r14, 16
+    loop .gpt
+    mov eax, [ins_sel]
+    mov eax, [ins_sec+rax*8]
+    mov [ins_dsz], eax
+    mov r12d, 0x800
+    xor r15d, r15d
+    lea r14, [IBUF2+446]
+    mov ecx, 4
+.slot:
+    cmp byte [r14+4], 0
+    jne .sn
+    test r15d, r15d
+    jnz .sn
+    mov rax, r14
+    sub rax, IBUF2+446
+    shr eax, 4
+    inc eax
+    mov r15d, eax
+.sn:
+    add r14, 16
+    loop .slot
+    mov r13d, 0
+.iter:
+    mov ebx, 0xFFFFFFFF
+    lea r14, [IBUF2+446]
+    mov ecx, 4
+.chk:
+    cmp byte [r14+4], 0
+    je .cn
+    mov eax, [r14+8]
+    cmp eax, r12d
+    jb .cn
+    cmp eax, ebx
+    jae .cn
+    mov ebx, eax
+.cn:
+    add r14, 16
+    loop .chk
+    cmp ebx, 0xFFFFFFFF
+    je .tail
+    mov eax, ebx
+    sub eax, r12d
+    cmp eax, IMG_FS+1
+    jae .found
+    lea r14, [IBUF2+446]
+    mov ecx, 4
+.find:
+    cmp byte [r14+4], 0
+    je .fn
+    mov eax, [r14+8]
+    cmp eax, ebx
+    jne .fn
+    mov eax, [r14+12]
+    add eax, ebx
+    mov r12d, eax
+.fn:
+    add r14, 16
+    loop .find
+    jmp .adv
+.tail:
+    mov eax, [ins_dsz]
+    sub eax, r12d
+    cmp eax, IMG_FS+1
+    jae .found
+    jmp .no
+.adv:
+    inc r13d
+    cmp r13d, 8
+    jb .iter
+    jmp .no
+.found:
+    test r15d, r15d
+    jz .no
+    mov eax, [ins_dsz]
+    sub eax, r12d
+    cmp eax, IMG_FS+1
+    jb .no
+    mov [ins_part], r12d
+    mov [ins_pslot], r15d
+    POPA
+    clc
+    ret
+.gptbad:
+    mov byte [ins_err], 2
+    jmp .fail
+.no:
+    mov byte [ins_err], 1
+.fail:
+    POPA
+    stc
+    ret
+
 set_install:
     PUSHA
     mov eax, [ins_sel]
     movzx eax, byte [ins_drv+rax]
     mov [ins_tgt], eax
-
+    mov byte [ins_err], 0
+    xor r14d, r14d
+    cmp byte [ins_along], 0
+    je .size
+    call set_free
+    jc .fail
+    mov r14d, [ins_part]
+.size:
+    cmp byte [ins_along], 0
+    jne .go
     mov eax, [ins_sel]
     mov rbx, [ins_sec+rax*8]
     cmp rbx, IMG_FS
-    jb near .small
+    jb .toosmall
+.go:
     mov byte [ins_state], 2
     mov dword [ins_pct], 0
     call set_draw
+    cmp byte [ins_along], 0
+    je .copy
+    mov eax, r14d
+    add eax, IMG_FS
+    lea rsi, [IBUF2]
+    mov edx, [ins_tgt]
+    mov ecx, 1
+    call io_abs_wr
+    jc .fail
+.copy:
     xor r12d, r12d
 .cp:
     cmp r12d, IMG_FS
-    jae near .ok
+    jae .ok
     mov ecx, IMG_FS
     sub ecx, r12d
     cmp ecx, 8
-    jbe near .c1
+    jbe .c1
     mov ecx, 8
 .c1:
     mov r13d, ecx
@@ -348,15 +565,62 @@ set_install:
     mov eax, r12d
     mov rdi, IBUF
     call bios_rd
-    jc near .fail
+    jc .fail
+    test r12d, r12d
+    jnz .wr
+    mov byte [IBUF+BOOT_ISO], 0
+    cmp byte [ins_along], 0
+    je .eraset
+    mov byte [IBUF+BOOT_MENU], 1
+    mov eax, r14d
+    mov [IBUF+BOOT_PART], eax
+    mov dword [IBUF+BOOT_PART+4], 0
+    lea rsi, [IBUF2+440]
+    lea rdi, [IBUF+440]
+    mov ecx, 72
+    rep movsb
+    mov eax, [ins_pslot]
+    dec eax
+    imul eax, eax, 16
+    lea rdi, [IBUF+446+rax]
+    mov dword [rdi], 0
+    mov word [rdi+4], 0x0C
+    mov word [rdi+6], 0
+    mov eax, r14d
+    mov [rdi+8], eax
+    mov dword [rdi+12], IMG_FS+1
+    mov byte [IBUF+BOOT_ISO], 0
+    mov byte [IBUF+BOOT_MENU], 1
+    mov eax, r14d
+    mov [IBUF+BOOT_PART], eax
+    mov dword [IBUF+BOOT_PART+4], 0
+    jmp .wr
+.eraset:
+    lea rdi, [IBUF+440]
+    mov ecx, 70
+    xor eax, eax
+    rep stosb
+    mov word [IBUF+510], 0xAA55
+.wr:
     mov rsi, IBUF
     mov edx, [ins_tgt]
     mov eax, r12d
+    add eax, r14d
     mov ecx, r13d
-    call bios_wr
-    jc near .fail
+    call io_abs_wr
+    jc .fail
+    cmp byte [ins_along], 0
+    je .noadd
+    test r12d, r12d
+    jnz .noadd
+    mov rsi, IBUF
+    mov edx, [ins_tgt]
+    xor eax, eax
+    mov ecx, 1
+    call io_abs_wr
+    jc .fail
+.noadd:
     add r12d, r13d
-
     mov eax, r12d
     imul rax, rax, 100
     xor edx, edx
@@ -374,10 +638,8 @@ set_install:
     mov byte [ins_state], 3
     call set_draw
     jmp .out
-.small:
-    mov byte [ins_state], 4
-    call set_draw
-    jmp .out
+.toosmall:
+    mov byte [ins_err], 3
 .fail:
     mov byte [ins_state], 4
     call set_draw
@@ -407,6 +669,12 @@ set_key:
     je near .go
     cmp al, 'r'
     je near .rescan
+    cmp al, 'a'
+    je near .along
+    ret
+.along:
+    xor byte [ins_along], 1
+    call set_draw
     ret
 .up:
     cmp dword [ins_sel], 0
@@ -425,7 +693,19 @@ set_key:
 .go:
     cmp dword [ins_n], 0
     je near .ret
+    cmp byte [ins_along], 0
+    je near .go2
+    mov eax, [ins_sel]
+    movzx eax, byte [ins_drv+rax]
+    mov [ins_tgt], eax
+    call set_free
+    jc near .goerr
+.go2:
     mov byte [ins_state], 1
+    call set_draw
+    ret
+.goerr:
+    mov byte [ins_state], 4
     call set_draw
     ret
 .rescan:

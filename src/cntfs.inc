@@ -88,6 +88,7 @@ fs_rdepth  dd 0                     ; recursion guard for tree deletes
 fs_nfiles  dd 0                     ; fs3_count results
 fs_ndirs   dd 0
 fs_nbytes  dq 0
+fs_fid     dd 0
 fs_dirmap  times DIRC_CLMAX dd 0    ; dir cluster -> ordinal map
 fs_ps      times 64 dq 0            ; path building stack (entry pointers)
 fs_wa      times 96 db 0            ; walk scratch: one component
@@ -1095,9 +1096,11 @@ fs3_find:                            ; rsi = path -> rax = slot or 0 (keeps rsi/
     PUSHA
     call fs3_walk
     jc .no
+    mov [fs_fid], eax
     call fs3_cfind
     test rax, rax
     jnz .out
+    mov eax, [fs_fid]
     call fs3_calloc
     jmp .out
 .no: xor eax, eax
@@ -2058,7 +2061,9 @@ fs3_init:
 .fmt:
     call fs3_format
     call fs3_seed
+    call native_seed
 .chek:
+    call native_seed
     ; remember the /dump entry id
     mov eax, 1
     lea rsi, [s_dumpnm]

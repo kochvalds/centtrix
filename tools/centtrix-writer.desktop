@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Centtrix USB writer
+Comment=Write the Centtrix ISO to a USB drive
+Exec=centtrix-writer
+Icon=centtrix-writer
+Categories=Utility;System;
+Terminal=false

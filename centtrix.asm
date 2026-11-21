@@ -35005,6 +35005,7 @@ term_install:
     mov [fs_tgt], r14d
     call fs3_format
     call fs3_seed
+    call native_seed
     mov dword [fs_tgt], 0
     movzx eax, byte [bootdrv]
     mov [fs_tgt], eax

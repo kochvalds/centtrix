@@ -11,3 +11,5 @@ selftest.img
 __pycache__/
 *.pyc
 
+
+*.AppImage

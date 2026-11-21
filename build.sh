@@ -1,11 +1,21 @@
 #!/bin/sh
 # Build Centtrix+ :  ./build.sh          (needs nasm and python3)
 #                    ./build.sh lite     (without BIGFS, smaller kernel)
+#                    ./build.sh iso      (plus Centtrix-4.0.iso)
+#                    ./build.sh all      (plus the ISO and the AppImage writer)
 set -e
 cd "$(dirname "$0")"
+MODE="$1"
 OPT=""; [ "$1" = lite ] && OPT="--lite"
+mkdir -p build
+if ! sh tools/mkbin.sh > build/mkbin.log 2>&1; then
+    printf 'nat_btab:\n    dq 0\n' > build/native_tab.inc
+    echo "warning: native C/Rust programs were not built (see build/mkbin.log)" >&2
+elif grep -q skipped build/mkbin.log; then
+    echo "warning: $(grep skipped build/mkbin.log)" >&2
+fi
 try() {
-    python3 src/patch.py $1 centtrix.asm centtrix_plus.asm
+    python3 src/patch.py $1 centtrix.asm centtrix_plus.asm || return 1
     nasm -f bin -w-label-redef -I src/ centtrix_plus.asm -o centtrix.new 2> build.log
 }
 if ! try "$OPT"; then
@@ -33,3 +43,8 @@ truncate -s 64M centtrix.img
 # NOTE: the disk keeps its filesystem and the user account between builds.
 # For a factory-fresh disk run tools/newdisk.sh
 echo "OK: centtrix.img ($(wc -c < centtrix.img) bytes)"
+
+case "$MODE" in
+    iso) sh tools/makeiso.sh ;;
+    all) sh tools/makeiso.sh; sh tools/makeappimage.sh ;;
+esac
