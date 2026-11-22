@@ -22,7 +22,7 @@ exec "$HERE/usr/bin/centtrix-writer" "$@"
 EOF
 chmod +x "$A/AppRun"
 
-tool=${APPIMAGETOOL:-build/appimagetool}
+tool=${APPIMAGETOOL:-build/appimagetool.AppImage}
 if [ ! -x "$tool" ]; then
     curl -fsSL -o "$tool" \
         "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-$ARCH.AppImage"
