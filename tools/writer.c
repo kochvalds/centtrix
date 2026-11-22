@@ -150,7 +150,7 @@ static void on_confirm(GtkMessageDialog *d, gint r, gpointer data)
 static void on_write(GtkWidget *w, gpointer data)
 {
     GtkWidget *d;
-    char msg[1024];
+    char msg[8192];
     const char *lbl = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(dev_combo));
     if (!lbl) { set_status("Choose a disk."); return; }
     sscanf(lbl, "%255s", dev_path);

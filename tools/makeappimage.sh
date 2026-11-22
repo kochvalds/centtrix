@@ -22,19 +22,30 @@ exec "$HERE/usr/bin/centtrix-writer" "$@"
 EOF
 chmod +x "$A/AppRun"
 
-tool=$(command -v appimagetool || true)
-if [ -z "$tool" ]; then
-    tool=build/appimagetool
-    if [ ! -x "$tool" ]; then
-        curl -fsSL -o "$tool" \
-            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-$ARCH.AppImage"
-        chmod +x "$tool"
-    fi
+tool=${APPIMAGETOOL:-build/appimagetool}
+if [ ! -x "$tool" ]; then
+    curl -fsSL -o "$tool" \
+        "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-$ARCH.AppImage"
+    chmod +x "$tool"
 fi
 
 case "$tool" in
-    *.AppImage) ARCH=$ARCH "$tool" --appimage-extract-and-run "$A" "$OUT" ;;
-    *) ARCH=$ARCH "$tool" "$A" "$OUT" ;;
+    *.AppImage)
+        abs=$(readlink -f "$tool")
+        ext=build/appimagetool.dir
+        if [ ! -x "$ext/AppRun" ]; then
+            rm -rf build/ai-extract
+            mkdir -p build/ai-extract
+            ( cd build/ai-extract && "$abs" --appimage-extract >/dev/null )
+            rm -rf "$ext"
+            mv build/ai-extract/squashfs-root "$ext"
+            rm -rf build/ai-extract
+        fi
+        ARCH=$ARCH "$ext/AppRun" "$A" "$OUT"
+        ;;
+    *)
+        ARCH=$ARCH "$tool" "$A" "$OUT"
+        ;;
 esac
 chmod +x "$OUT"
 ls -l "$OUT"
