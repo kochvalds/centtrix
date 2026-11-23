@@ -51,7 +51,7 @@ rep("\n.body:\n    ; destination slot\n",
 
 rep('Backspace back, Esc close", 0', 'Backspace back, s save file, Esc close", 0', "browser hint")
 
-inc = '%include "anim.inc"\n%include "' + ('bigfs_stub.inc' if lite else 'bigfs.inc') + '"\n%include "download.inc"\n%include "cntfs.inc"\n%include "testland.inc"\n%include "installer.inc"\n%include "pkg.inc"\n\n'
+inc = '%include "anim.inc"\n%include "' + ('bigfs_stub.inc' if lite else 'bigfs.inc') + '"\n%include "download.inc"\n%include "cntfs.inc"\n%include "testland.inc"\n%include "installer.inc"\n%include "pkg.inc"\n%include "sys.inc"\n\n'
 i = t.rfind("times ((4096-((31744")
 if i < 0 or t.find("times (KSECT+1)*512", i) < 0:
     sys.exit("end-of-image anchor not found")
@@ -72,7 +72,7 @@ rep('c_bigfs    db "bigfs",0\n',
     "testland command name")
 rep('    db "disk    install (copy Centtrix to another disk)  battery  biossave  df",10\n',
     '    db "disk    install (copy Centtrix to another disk)  battery  biossave  df",10\n'
-    '    db "testland  tiling window manager (Super+1..4 workspaces, off = stop)",10\n',
+    '    db "testland  tiling WM: testland on|off|main|default (Super+1..4)",10\n',
     "testland help")
 rep(".su_x:\n    mov byte [su_req], 1\n    jmp .out\n.su_c:\n    mov byte [su_req], 2\n    jmp .out\n",
     ".su_x:\n    cmp byte [tl_on], 0\n    jne .out\n    mov byte [su_req], 1\n    jmp .out\n"
@@ -103,18 +103,105 @@ rep('c_testland db "testland",0\n',
     'c_testland db "testland",0\nc_setup    db "setup",0\nc_pkg      db "cenpkg",0\n',
     "setup command name")
 rep("    CMD c_testland, .testland\n    lea rsi, [s_unk]\n",
-    "    CMD c_testland, .testland\n    CMD c_setup, .setup\n    CMD c_pkg, .pkg\n    lea rsi, [s_unk]\n",
+    "    CMD c_testland, .testland\n    CMD c_setup, .setup\n    CMD c_pkg, .pkg\n"
+    "    CMD c_uname, .uname\n    CMD c_hostname, .hostname\n"
+    "    CMD c_usb, .usb\n    CMD c_sysinfo, .sysinfo\n    lea rsi, [s_unk]\n",
     "setup command")
 rep(".testland:\n    mov rsi, r14\n    call tl_cmd\n    jmp .out\n",
     ".testland:\n    mov rsi, r14\n    call tl_cmd\n    jmp .out\n"
+    ".uname:\n    call term_uname\n    jmp .out\n"
+    ".hostname:\n    call term_hostname\n    jmp .out\n"
+    ".usb:\n    call term_usb\n    jmp .out\n"
+    ".sysinfo:\n    call term_sysinfo\n    jmp .out\n"
     ".setup:\n    mov dword [launch_req], 9\n    lea rsi, [s_setup_run]\n    call tput_s\n    jmp .out\n"
     ".pkg:\n    mov rsi, r14\n    call term_pkg\n    jmp .out\n",
     "setup handler")
-rep('    db "testland  tiling window manager (Super+1..4 workspaces, off = stop)",10\n',
-    '    db "testland  tiling window manager (Super+1..4 workspaces, off = stop)",10\n'
+rep('    db "testland  tiling WM: testland on|off|main|default (Super+1..4)",10\n',
+    '    db "testland  tiling WM: testland on|off|main|default (Super+1..4)",10\n'
     '    db "setup     graphical installer: copy Centtrix to another disk",10\n'
-    '    db "cenpkg    packages: cenpkg list, cenpkg install NAME",10\n',
+    '    db "cenpkg    packages: cenpkg list, cenpkg install NAME, cenpkg remove NAME",10\n'
+    '    db "system    uname  hostname  sysinfo  usb (firmware disks and USB media)",10\n',
     "setup help")
+rep('s_help       db "files   ls [dir]  cd dir  cat f  edit f  new f  run f.xep  rm f  cp a b  mv a b  mkdir d  empty",10\n',
+    's_help       db "files   ls [dir]  cd dir  cat f  edit f  new f  run f(.c .py .rs .xep)  rm f  cp a b  mv a b",10\n',
+    "files help")
+rep('s_ver        db "Centtrix OS 4.0  x86_64  |  XPL 1.0",10,0\n',
+    's_ver        db "Centtrix 4.0  x86_64  |  CNT3  |  XPL 1.0  |  C, Python, Rust",10,0\n',
+    "version line")
+rep('s_ps1        db "centtrix:",0\n',
+    's_ps1        db "centtrix@centtrix:",0\n',
+    "shell prompt")
+rep('s_rootls     db "base/",10,"dump/",10,"home/",10,0\n',
+    's_rootls     db "base/",10,"dump/",10,"etc/",10,"home/",10,"opt/",10,"tmp/",10,"usr/",10,"var/",10,0\n',
+    "root listing")
+
+rep(""".lsz:
+    mov eax, [r13+48]
+    mov rdi, TMPB
+""",
+""".lsz:
+    mov rsi, r13
+    call fs_find
+    test rax, rax
+    jz .lsz0
+    mov eax, [rax+48]
+    jmp .lsz1
+.lsz0:
+    xor eax, eax
+.lsz1:
+    mov rdi, TMPB
+""",
+    "ls size")
+
+rep("""term_prompt:
+    lea rsi, [s_ps1]
+    call tput_s
+    lea rsi, [tpath]
+    call tput_s
+    lea rsi, [s_ps2]
+    call tput_s
+    mov eax, [t_col]
+    mov [t_pstart], eax
+    mov dword [t_inlen], 0
+    ret
+""",
+"""term_prompt:
+    lea rsi, [SB_USER]
+    cmp byte [rsi], 0
+    jne .u
+    lea rsi, [s_user_def]
+.u: call tput_s
+    mov al, '@'
+    call tput_c
+    lea rsi, [p_etc_hostname]
+    call sys_read_small
+    test eax, eax
+    jz .hdef
+    lea rsi, [sess_buf]
+    call tput_s
+    jmp .h
+.hdef:
+    lea rsi, [s_hostname]
+    call tput_s
+.h: mov al, ':'
+    call tput_c
+    lea rsi, [tpath]
+    call tput_s
+    lea rsi, [s_ps2]
+    call tput_s
+    mov eax, [t_col]
+    mov [t_pstart], eax
+    mov dword [t_inlen], 0
+    ret
+""",
+    "dynamic prompt")
+
+
+rep("    call desk_draw\n    call login_screen\n.idle:\n",
+    "    call desk_draw\n    call login_screen\n    call session_apply\n.idle:\n",
+    "session apply")
+
+
 rep("    dq app_settings\n    dd 7, 0\n    dq s_set_t\n",
     "    dq app_settings\n    dd 7, 0\n    dq s_set_t\n"
     "    dq app_settings\n    dd 10, 0\n    dq s_set_t\n"
@@ -229,6 +316,15 @@ rep("""    mov r13, rax
     jmp .out
 .ixb:
     mov rsi, r13
+    call is_py
+    test eax, eax
+    jz .ipy
+    mov rsi, r15
+    call term_python
+    call term_redraw
+    jmp .out
+.ipy:
+    mov rsi, r13
     call is_xep
     test eax, eax
     jz .notxep
@@ -236,15 +332,27 @@ rep("""    mov r13, rax
     "term run bin")
 rep("""is_xep:                             ; rsi=name -> eax=1 if ends with .xep
 """,
-"""is_bin:                             ; rsi=name -> eax=1 if ends with .bin
+"""is_bin:                             ; rsi=name -> eax=1 if ends with .bin/.c/.rs
     push rsi
     push rcx
     call strlen
     xor ecx, ecx
+    cmp eax, 2
+    jb .no
+    cmp word [rsi+rax-2], 0x632E
+    je .yes
+    cmp eax, 3
+    jb .no
+    cmp word [rsi+rax-2], 0x7372
+    jne .bin
+    cmp byte [rsi+rax-3], '.'
+    je .yes
+.bin:
     cmp eax, 4
     jb .no
     cmp dword [rsi+rax-4], 0x6E69622E
     jne .no
+.yes:
     mov ecx, 1
 .no:
     mov eax, ecx

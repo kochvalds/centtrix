@@ -137,6 +137,23 @@ nat_api:
     dq nat_yield
     dq nat_exit
     dq nat_sleep
+    dq nat_session
+
+nat_session:
+    cmp edi, 0
+    je .off
+    mov byte [tl_on], 1
+    mov dword [tl_ws], 1
+    mov byte [tl_req], 40
+    xor eax, eax
+    ret
+.off:
+    cmp byte [tl_on], 0
+    je .done
+    mov byte [tl_req], 41
+.done:
+    xor eax, eax
+    ret
 
 native_seed:
     PUSHA
@@ -170,5 +187,36 @@ native_seed:
     ret
 
 nat_ptr dq 0
+
+native_pkgseed:
+    PUSHA
+    lea rsi, [p_pkg_cache]
+    call fs3_mk
+    lea rbx, [nat_pkgtab]
+.l: mov rsi, [rbx]
+    test rsi, rsi
+    jz .o
+    mov [nat_ptr], rbx
+    call fs3_find
+    mov rbx, [nat_ptr]
+    test rax, rax
+    jz .save
+    mov ecx, [rbx+16]
+    cmp [rax+48], ecx
+    jne .save
+    lea rsi, [rax+64]
+    mov rdi, [rbx+8]
+    repe cmpsb
+    je .n
+.save:
+    mov rsi, [rbx]
+    mov rdx, [rbx+8]
+    mov ecx, [rbx+16]
+    call fs3_bigsave
+    mov rbx, [nat_ptr]
+.n: add rbx, 24
+    jmp .l
+.o: POPA
+    ret
 
 %include "build/native_tab.inc"

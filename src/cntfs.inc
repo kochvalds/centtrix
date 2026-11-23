@@ -2033,6 +2033,26 @@ fs3_dtab:
     dq p_rainbow, d_rainbow
     dq p_hello,  d_hello
     dq p_notes,  d_notes
+    dq p_etc,       d_nil
+    dq p_etc_hostname, d_etc_hostname
+    dq p_etc_release,  d_etc_release
+    dq p_etc_session,  d_etc_session
+    dq p_etc_system,   d_etc_system
+    dq p_etc_network,  d_etc_network
+    dq p_etc_fstab,    d_etc_fstab
+    dq p_etc_motd,     d_etc_motd
+    dq p_usr,       d_nil
+    dq p_usr_bin,   d_nil
+    dq p_usr_share, d_nil
+    dq p_var,       d_nil
+    dq p_var_log,   d_nil
+    dq p_tmp,       d_nil
+    dq p_opt,       d_nil
+    dq p_src,       d_nil
+    dq p_src_c,     d_src_c
+    dq p_src_rs,    d_src_rs
+    dq p_src_py,    d_src_py
+    dq p_src_conf,  d_src_conf
     dq 0
 
 ; fs3_init: bring the filesystem up (called once at boot)
@@ -2060,10 +2080,10 @@ fs3_init:
     jnc .chek
 .fmt:
     call fs3_format
+.chek:
     call fs3_seed
     call native_seed
-.chek:
-    call native_seed
+    call native_pkgseed
     ; remember the /dump entry id
     mov eax, 1
     lea rsi, [s_dumpnm]

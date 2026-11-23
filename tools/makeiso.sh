@@ -39,6 +39,7 @@ need() {
 cp "$(need isolinux.bin)" "$B/tree/boot/isolinux/isolinux.bin"
 cp "$(need ldlinux.c32)" "$B/tree/boot/isolinux/ldlinux.c32"
 cp "$(need memdisk)" "$B/tree/boot/isolinux/memdisk"
+MBR=$(need isohdpfx.bin)
 
 cat > "$B/tree/boot/isolinux/isolinux.cfg" <<'EOF'
 DEFAULT centtrix
@@ -51,6 +52,8 @@ LABEL centtrix
 EOF
 
 xorriso -as mkisofs -quiet -o "$OUT" \
+    -isohybrid-mbr "$MBR" \
     -b boot/isolinux/isolinux.bin -c boot/isolinux/boot.cat \
-    -no-emul-boot -boot-load-size 4 -boot-info-table "$B/tree"
+    -no-emul-boot -boot-load-size 4 -boot-info-table \
+    -isohybrid-gpt-basdat "$B/tree"
 ls -l "$OUT"

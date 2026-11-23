@@ -29,26 +29,34 @@ TL_BARH   equ TOPH                  ; bar height (reuses the top surface slot)
 TL_TABH   equ 24                    ; tab strip under the bar
 TL_OVL    equ 0x2500000             ; transparent full-screen overlay buffer
 
-TL_C_BG   equ 0x001E1E1E            ; workspace background
-TL_C_BAR  equ 0x00222222            ; bar
-TL_C_ON   equ 0x00285577            ; focused workspace / tab
-TL_C_BRD  equ 0x004C7899            ; focused window border
-TL_C_FG   equ 0x00D8D8D8
-TL_C_DIM  equ 0x00808080
-TL_C_TAB  equ 0x00181818
-TL_C_HDR  equ 0x002C2C2C
+TL_C_BG   equ 0x0014101C            ; workspace background
+TL_C_BAR  equ 0x0020182E            ; bar
+TL_C_ON   equ 0x00C86A9A            ; focused workspace / tab
+TL_C_BRD  equ 0x00C86A9A            ; focused window border
+TL_C_FG   equ 0x00E8E0F0
+TL_C_DIM  equ 0x009080A0
+TL_C_TAB  equ 0x00161020
+TL_C_HDR  equ 0x00261A36
+TL_C_CYAN equ 0x005FD7D7
+TL_C_PINK equ 0x00C86A9A
 
 ; ---- strings (first, so their offsets never depend on code size) ---
-s_tl_on      db "testland: tiling window manager on",10
+s_tl_on      db "testland: tiling session on",10
              db "  Super+Enter terminal        Super+E files     Super+Q close",10
              db "  Super+H/L or arrows         previous / next window",10
              db "  Super+1..4 workspace        Super+Shift+1..4 send window",10
-             db "  Super+Shift+Q leaves testland",10,0
+             db "  Super+Shift+Q leaves        testland main = start after login",10,0
 s_tl_off     db "testland: back to the desktop",10,0
 s_tl_already db "testland is already running",10,0
-s_tl_use     db "usage: testland [off]",10,0
+s_tl_use     db "usage: testland [on|off|main|default]",10,0
 s_tl_onw     db "on",0
 s_tl_offw    db "off",0
+s_tl_mainw   db "main",0
+s_tl_defw    db "default",0
+s_tl_default db "testland disabled for the next login",10,0
+s_tl_pkg     db "testland: package missing",10,0
+s_tl_logo    db "CENTTRIX",0
+s_tl_ver     db "4.0",0
 
 tl_on     db 0                      ; mode active
 tl_ws     dd 1                      ; current workspace
@@ -630,15 +638,17 @@ tl_bar:
     mov ebx, r12d
     dec ebx
     imul ebx, ebx, 40
+    add ebx, 4
     mov eax, TL_C_BAR
     cmp r12d, [tl_ws]
     jne near .bg
     mov eax, TL_C_ON
 .bg:
-    xor ecx, ecx
-    mov esi, 40
-    mov edx, TL_BARH
-    call rect
+    mov ecx, 4
+    mov esi, 32
+    mov edx, TL_BARH-8
+    mov r9d, 7
+    call rrect
     mov eax, r12d
     add eax, '0'
     mov [tl_num], al
@@ -660,6 +670,19 @@ tl_bar:
     inc r12d
     jmp .ws
 .wsd:
+    ; logo block after the workspace pills
+    lea rax, [font_ui]
+    mov [g_uf], rax
+    mov dword [g_fg], TL_C_PINK
+    lea rsi, [s_tl_logo]
+    mov ebx, 170
+    mov ecx, 9
+    call ui_text
+    mov dword [g_fg], TL_C_DIM
+    lea rsi, [s_tl_ver]
+    mov ebx, 244
+    mov ecx, 9
+    call ui_text
     ; subtle separator under the bar
     xor ebx, ebx
     mov ecx, TL_BARH-1
@@ -827,6 +850,14 @@ tl_decore:
     mov edx, HDRH
     mov eax, TL_C_HDR
     call rect
+    ; cyan underline separates the flat title bar from the application
+    mov ebx, r10d
+    mov ecx, r11d
+    add ecx, HDRH-1
+    mov esi, WW
+    mov edx, 1
+    mov eax, TL_C_CYAN
+    call rect
     lea rax, [font_ui]
     mov [g_uf], rax
     mov dword [g_fg], TL_C_FG
@@ -902,6 +933,35 @@ tl_on_now:
     mov esi, [scr_w]
     mov edx, [scr_h]
     mov eax, TL_C_BG
+    call rect
+    ; depth bands and the accent rails from the reference layout
+    xor ebx, ebx
+    xor ecx, ecx
+    mov esi, [scr_w]
+    mov edx, [scr_h]
+    shr edx, 2
+    mov eax, 0x001A142A
+    call rect
+    xor ebx, ebx
+    mov ecx, [scr_h]
+    shr ecx, 1
+    mov esi, [scr_w]
+    mov edx, [scr_h]
+    sub edx, ecx
+    mov eax, 0x00100C16
+    call rect
+    xor ebx, ebx
+    xor ecx, ecx
+    mov esi, 3
+    mov edx, [scr_h]
+    mov eax, TL_C_PINK
+    call rect
+    xor ebx, ebx
+    mov ecx, [scr_h]
+    sub ecx, 3
+    mov esi, [scr_w]
+    mov edx, 3
+    mov eax, TL_C_CYAN
     call rect
     call tl_arrange
     call damage_all
@@ -984,20 +1044,63 @@ tl_cmd:                             ; rsi = arguments
     call strcmp
     pop rsi
     je near .on
+    push rsi
+    lea rdi, [s_tl_mainw]
+    call strcmp
+    pop rsi
+    je near .main
+    push rsi
+    lea rdi, [s_tl_defw]
+    call strcmp
+    pop rsi
+    je near .default
     lea rsi, [s_tl_use]
     call tput_s
     pop rsi
+    ret
+.main:
+    pop rsi
+    call sys_tl_installed
+    test eax, eax
+    jz near .missing
+    lea rsi, [p_etc_session]
+    lea rdx, [s_sess_tl]
+    mov ecx, 17
+    call sys_write_file
+    mov byte [tl_on], 1
+    mov dword [tl_ws], 1
+    mov byte [tl_req], 40
+    lea rsi, [s_tl_main]
+    call tput_s
+    ret
+.default:
+    pop rsi
+    lea rsi, [p_etc_session]
+    lea rdx, [s_sess_dt]
+    mov ecx, 16
+    call sys_write_file
+    cmp byte [tl_on], 0
+    je .defdone
+    mov byte [tl_req], 41
+.defdone:
+    lea rsi, [s_tl_default]
+    call tput_s
     ret
 .on:
     pop rsi
     cmp byte [tl_on], 0
     jne near .already
-    ; the mode itself is switched on by tl_service in the shell loop: drawing
-    ; functions must never run in the caller's (terminal) task context
-    mov byte [tl_on], 1
-    mov dword [tl_ws], 1
-    mov byte [tl_req], 40
-    lea rsi, [s_tl_on]
+    call sys_tl_installed
+    test eax, eax
+    jz near .missing
+    lea rsi, [p_tl_pkg]
+    call fs_find
+    test rax, rax
+    jz near .missing
+    call native_run_slot
+    ret
+.missing:
+    lea rsi, [s_tl_missing]
     call tput_s
     ret
 .already:

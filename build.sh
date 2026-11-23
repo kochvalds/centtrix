@@ -9,7 +9,7 @@ MODE="$1"
 OPT=""; [ "$1" = lite ] && OPT="--lite"
 mkdir -p build
 if ! sh tools/mkbin.sh > build/mkbin.log 2>&1; then
-    printf 'nat_btab:\n    dq 0\n' > build/native_tab.inc
+    printf 'nat_btab:\n    dq 0\nnat_pkgtab:\n    dq 0\n' > build/native_tab.inc
     echo "warning: native C/Rust programs were not built (see build/mkbin.log)" >&2
 elif grep -q skipped build/mkbin.log; then
     echo "warning: $(grep skipped build/mkbin.log)" >&2
